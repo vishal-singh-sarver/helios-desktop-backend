@@ -1,0 +1,3 @@
+-- Migration 001 — initial schema
+-- Applies: projects, project_versions, project_objects
+-- TODO: implement in Step 2

@@ -1,0 +1,14 @@
+-r requirements.txt
+
+# ── Testing ───────────────────────────────────
+pytest>=9.0.0
+anyio>=4.0.0
+pytest-anyio>=0.0.0
+httpx>=0.28.0                 # async test client for FastAPI
+pytest-cov>=4.0.0             # coverage reports
+
+# ── Linting / formatting ──────────────────────
+ruff>=0.4.0                   # linter + formatter (replaces flake8 + black)
+
+# ── Type checking ─────────────────────────────
+mypy>=1.8.0

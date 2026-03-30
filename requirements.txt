@@ -1,0 +1,21 @@
+# ── Web framework ─────────────────────────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# ── Data / validation ─────────────────────────
+pydantic>=2.5.0
+pydantic-settings>=2.0.0      # Settings from .env / environment variables
+numpy>=1.26.0
+
+# ── Database ──────────────────────────────────
+sqlalchemy>=2.0.0             # ORM + query builder for SQLite
+
+# ── PyHelios ──────────────────────────────────
+# Uncomment ONE of the following:
+# pyhelios3d                  # pip wheel (set PYHELIOS_USE_PIP=true)
+# (source submodule is used by default — see app/core/config.py)
+
+# ── Compression (stdlib — no install needed) ──
+# gzip   → current snapshot  (stdlib)
+# lzma   → version archive   (stdlib)

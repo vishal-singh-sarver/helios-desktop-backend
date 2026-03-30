@@ -1,28 +1,25 @@
 """
-SQLite database connection and session management.
-
-Usage in endpoints (dependency injection):
-    from app.db.database import get_db
-    from sqlalchemy.orm import Session
-
-    @router.get("/example")
-    def example(db: Session = Depends(get_db)):
-        ...
+SQLite database connection, session management, and migrations.
 """
-from sqlalchemy import create_engine, event
+from pathlib import Path
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from app.core.config import settings
 
-# SQLite URL — file-based, one DB per installation
+
+class Base(DeclarativeBase):
+    pass
+
+
 _db_url = f"sqlite:///{settings.resolved_db_path}"
 
 engine = create_engine(
     _db_url,
     echo=settings.db_echo,
-    connect_args={"check_same_thread": False},  # required for SQLite + FastAPI
+    connect_args={"check_same_thread": False},
 )
 
-# Enable WAL mode for better concurrent read performance
+
 @event.listens_for(engine, "connect")
 def set_sqlite_pragma(dbapi_conn, _):
     cursor = dbapi_conn.cursor()
@@ -32,10 +29,6 @@ def set_sqlite_pragma(dbapi_conn, _):
 
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-class Base(DeclarativeBase):
-    pass
 
 
 def get_db():
@@ -49,8 +42,47 @@ def get_db():
 
 def run_migrations() -> None:
     """
-    Apply all SQL migration scripts in db/migrations/ in order.
+    Apply all .sql migration files in db/migrations/ in version order.
+    Skips migrations already recorded in schema_migrations.
     Called once at startup from lifespan.py.
     """
-    # TODO: implement in Step 2
-    pass
+    migrations_dir = Path(__file__).parent / "migrations"
+    sql_files = sorted(migrations_dir.glob("*.sql"))
+
+    with engine.begin() as conn:
+        # Ensure tracking table exists before querying it
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """))
+
+        applied = {
+            row[0] for row in conn.execute(text("SELECT version FROM schema_migrations"))
+        }
+
+        for sql_file in sql_files:
+            # Extract version number from filename prefix, e.g. 001_initial.sql → 1
+            try:
+                version = int(sql_file.stem.split("_")[0])
+            except ValueError:
+                continue
+
+            if version in applied:
+                continue
+
+            raw_sql = sql_file.read_text(encoding="utf-8")
+            # Strip -- line comments before splitting on ; to avoid
+            # false splits on semicolons inside comment text
+            lines = [
+                line for line in raw_sql.splitlines()
+                if not line.strip().startswith("--")
+            ]
+            sql = "\n".join(lines)
+            for statement in sql.split(";"):
+                stmt = statement.strip()
+                if stmt:
+                    conn.execute(text(stmt))
+
+            print(f"[db] applied migration {sql_file.name}")

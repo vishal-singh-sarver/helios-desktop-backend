@@ -24,9 +24,9 @@ async def lifespan(app: FastAPI):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.resolved_projects_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Database migrations — TODO: implement in Step 2
-    # from app.db.database import run_migrations
-    # run_migrations()
+    # 3. Database migrations
+    from app.db.database import run_migrations
+    run_migrations()
 
     # 4. PyHelios availability check — TODO: implement in Step 3
     # from app.helios.context import init_pyhelios

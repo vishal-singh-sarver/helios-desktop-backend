@@ -34,7 +34,16 @@ class Settings(BaseSettings):
 
     # PyHelios
     pyhelios_use_pip: bool = False
+    # Override source path; if blank, auto-detected as <project_root>/pyhelios
     pyhelios_source_path: str | None = None
+
+    @property
+    def pyhelios_auto_source_path(self) -> Path:
+        """Absolute path to the PyHelios submodule directory."""
+        if self.pyhelios_source_path:
+            return Path(self.pyhelios_source_path)
+        # app/core/config.py → app/core → app → project_root
+        return Path(__file__).resolve().parent.parent.parent / "pyhelios"
 
     # Security
     secret_key: str = "change-me"

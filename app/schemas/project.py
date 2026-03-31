@@ -1,4 +1,19 @@
 from pydantic import BaseModel
 
-# TODO: implement in Step 3
-# Move Pydantic models from backend-api/main.py lines 254–372
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    latitude: float = 0.0
+    longitude: float = 0.0
+
+
+class ProjectSaveRequest(BaseModel):
+    label: str = ""          # optional human label for the version snapshot
+
+
+class ProjectLoadRequest(BaseModel):
+    project_id: str
+
+
+class ProjectRestoreVersionRequest(BaseModel):
+    version_id: int

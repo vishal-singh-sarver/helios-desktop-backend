@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
@@ -9,7 +9,6 @@ from app.routers import (
     geometry,
     objects,
     tree,
-    canopy,
     plantarch,
     materials,
     transforms,
@@ -32,16 +31,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Stale build warning header (added after middleware setup to avoid import-time issues)
+@app.middleware("http")
+async def stale_pyhelios_header(request: Request, call_next):
+    response = await call_next(request)
+    from app.helios.context import _PYHELIOS_STALE
+    if _PYHELIOS_STALE:
+        response.headers["X-PyHelios-Stale"] = "true"
+    return response
+
 # ── Routers ────────────────────────────────────────────────────────────────
 app.include_router(system.router)
-app.include_router(project.router,      prefix="/api/project",      tags=["project"])
-app.include_router(geometry.router,     prefix="/api/geometry",     tags=["geometry"])
-app.include_router(objects.router,      prefix="/api/objects",      tags=["objects"])
-app.include_router(tree.router,         prefix="/api/tree",         tags=["tree"])
-app.include_router(canopy.router,       prefix="/api/canopy",       tags=["canopy"])
-app.include_router(plantarch.router,    prefix="/api/plantarch",    tags=["plantarch"])
-app.include_router(materials.router,    prefix="/api/materials",    tags=["materials"])
-app.include_router(transforms.router,   prefix="/api/geometry",     tags=["transforms"])
-app.include_router(timeseries.router,   prefix="/api/timeseries",   tags=["timeseries"])
-app.include_router(import_export.router,prefix="/api",              tags=["import_export"])
-app.include_router(scripting.router,    prefix="/api/script",       tags=["scripting"])
+app.include_router(project.router,       prefix="/api/project",    tags=["project"])
+app.include_router(geometry.router,      prefix="/api/geometry",   tags=["geometry"])
+app.include_router(objects.router,       prefix="/api/objects",    tags=["objects"])
+app.include_router(tree.router,          prefix="/api/tree",       tags=["tree"])
+app.include_router(plantarch.router,     prefix="/api/plantarch",  tags=["plantarch"])
+app.include_router(materials.router,     prefix="/api/materials",  tags=["materials"])
+app.include_router(transforms.router,    prefix="/api/geometry",   tags=["transforms"])
+app.include_router(timeseries.router,    prefix="/api/timeseries", tags=["timeseries"])
+app.include_router(import_export.router, prefix="/api",            tags=["import"])
+app.include_router(scripting.router,     prefix="/api/script",     tags=["scripting"])

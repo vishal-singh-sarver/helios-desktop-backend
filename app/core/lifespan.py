@@ -28,9 +28,9 @@ async def lifespan(app: FastAPI):
     from app.db.database import run_migrations
     run_migrations()
 
-    # 4. PyHelios availability check — TODO: implement in Step 3
-    # from app.helios.context import init_pyhelios
-    # init_pyhelios()
+    # 4. PyHelios availability check
+    from app.helios.context import init_pyhelios
+    init_pyhelios()
 
     yield
 

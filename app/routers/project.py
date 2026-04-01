@@ -1,7 +1,7 @@
 import time
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
-
+from sqlalchemy import func
 from app.db.database import get_db
 from app.db.models import Project
 from app.core.timezone import utc_offset_from_coords
@@ -16,39 +16,56 @@ from app.schemas.project import (
 router = APIRouter()
 
 
-@router.post("/create")
+@router.post("/create", status_code=201)
 async def create_project(req: ProjectCreateRequest, db: Session = Depends(get_db)):
-    helios_ctx.reset_context()
-    reg.reset_registry()
+    clean_name = req.name.strip()
 
-    utc_offset = utc_offset_from_coords(req.latitude, req.longitude)
-    metadata = {
-        "name": req.name,
-        "latitude": req.latitude,
-        "longitude": req.longitude,
-        "utc_offset": utc_offset,
-    }
+    # ---- Duplicate check (case-insensitive) ----
+    existing = db.query(Project).filter(
+        func.lower(Project.name) == clean_name.lower()
+    ).first()
 
-    # Upsert project row in DB
-    project = db.query(Project).filter(Project.name == req.name).first()
-    if not project:
-        project = Project(
-            name=req.name,
-            latitude=req.latitude,
-            longitude=req.longitude,
-            utc_offset=utc_offset,
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="A project with this name already exists"
         )
+
+    # ---- Reset active runtime state ----
+    if helios_ctx.PYHELIOS_AVAILABLE:
+        helios_ctx.reset_context()
+        reg.reset_registry()
+
+    # ---- Compute timezone offset ----
+    utc_offset = utc_offset_from_coords(req.latitude, req.longitude)
+
+    # ---- Create project row ----
+    project = Project(
+        name=clean_name,
+        latitude=req.latitude,
+        longitude=req.longitude,
+        utc_offset=utc_offset,
+    )
+
+    try:
         db.add(project)
         db.commit()
         db.refresh(project)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to create project")
 
+    # ---- Initialize fresh Helios context ----
     if helios_ctx.PYHELIOS_AVAILABLE:
         helios_ctx.get_context()
 
     return {
         "success": True,
-        "project": metadata,
         "project_id": project.id,
+        "name": clean_name,
+        "latitude": req.latitude,
+        "longitude": req.longitude,
+        "utc_offset": utc_offset,
         "session_id": helios_ctx.session_id,
     }
 
@@ -114,8 +131,9 @@ async def restore_version(project_id: str, req: ProjectRestoreVersionRequest,
     if not helios_ctx.PYHELIOS_AVAILABLE:
         raise HTTPException(503, "PyHelios not available")
 
-    helios_ctx.reset_context()
-    reg.reset_registry()
+    if helios_ctx.PYHELIOS_AVAILABLE:
+        helios_ctx.reset_context()
+        reg.reset_registry()
 
     ctx = helios_ctx.get_context()
     data = persistence.restore_version(project_id, req.version_id, ctx, db)

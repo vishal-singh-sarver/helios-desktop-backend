@@ -1,10 +1,11 @@
 # TODO: implement tests in Step 3
 import pytest
+from uuid import uuid4
 
 
 def test_create_project_success(client):
     payload = {
-        "name": "TestProject1",
+        "name": f"TestProject_{uuid4().hex[:8]}",
         "latitude": 28.6,
         "longitude": 77.2
     }
@@ -15,7 +16,7 @@ def test_create_project_success(client):
     data = r.json()
 
     assert data["success"] is True
-    assert data["name"] == "TestProject1"
+    assert data["name"] == payload["name"]
     assert data["latitude"] == 28.6
     assert data["longitude"] == 77.2
     assert "project_id" in data
@@ -49,8 +50,10 @@ def test_project_name_max_length(client):
 
 
 def test_duplicate_project_case_insensitive(client):
+    unique_name = f"DuplicateTest_{uuid4().hex[:8]}"
+
     payload = {
-        "name": "DuplicateTest",
+        "name": unique_name,
         "latitude": 28.6,
         "longitude": 77.2
     }
@@ -59,7 +62,7 @@ def test_duplicate_project_case_insensitive(client):
     assert r1.status_code == 201
 
     payload2 = {
-        "name": "duplicatetest",
+        "name": unique_name.lower(),
         "latitude": 28.6,
         "longitude": 77.2
     }
@@ -72,7 +75,7 @@ def test_duplicate_project_case_insensitive(client):
 
 def test_latitude_out_of_range(client):
     payload = {
-        "name": "LatTest",
+        "name": f"LatTest_{uuid4().hex[:8]}",
         "latitude": 100,
         "longitude": 77.2
     }
@@ -85,7 +88,7 @@ def test_latitude_out_of_range(client):
 
 def test_longitude_out_of_range(client):
     payload = {
-        "name": "LngTest",
+        "name": f"LngTest_{uuid4().hex[:8]}",
         "latitude": 28.6,
         "longitude": 200
     }
@@ -98,7 +101,7 @@ def test_longitude_out_of_range(client):
 
 def test_invalid_numeric_input(client):
     payload = {
-        "name": "InvalidInput",
+        "name": f"InvalidInput_{uuid4().hex[:8]}",
         "latitude": "abc",
         "longitude": "5:30"
     }

@@ -10,25 +10,25 @@ from app.helios import persistence
 
 
 def create_project(name: str, latitude: float, longitude: float, db: Session) -> dict:
-    clean_name = name.strip()
+    project_clean_name = name.strip()
 
-    existing = db.query(Project).filter(
-        func.lower(Project.name) == clean_name.lower()
+    existing_project = db.query(Project).filter(
+        func.lower(Project.name) == project_clean_name.lower()
     ).first()
-    if existing:
+    if existing_project:
         raise HTTPException(409, "A project with this name already exists")
 
     if helios_ctx.PYHELIOS_AVAILABLE:
         helios_ctx.reset_context()
         reg.reset_registry()
 
-    utc_offset = utc_offset_from_coords(latitude, longitude)
+    project_utc_offset = utc_offset_from_coords(latitude, longitude)
 
     project = Project(
-        name=clean_name,
+        name=project_clean_name,
         latitude=latitude,
         longitude=longitude,
-        utc_offset=utc_offset,
+        utc_offset=project_utc_offset,
     )
     try:
         db.add(project)
@@ -44,10 +44,10 @@ def create_project(name: str, latitude: float, longitude: float, db: Session) ->
     return {
         "success": True,
         "project_id": project.id,
-        "name": clean_name,
+        "name": project_clean_name,
         "latitude": latitude,
         "longitude": longitude,
-        "utc_offset": utc_offset,
+        "utc_offset": project_utc_offset,
         "session_id": helios_ctx.session_id,
     }
 

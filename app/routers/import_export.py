@@ -1,61 +1,23 @@
 import asyncio
-import os
 from fastapi import APIRouter, HTTPException
-from app.helios.context import get_context
-from app.helios.context import vec3
-from app.helios import registry as reg
+
 from app.schemas.geometry import ImportRequest
+from app.services import import_service
 
 router = APIRouter()
 
 
 @router.post("/import/obj")
 async def import_obj(req: ImportRequest):
-    def _do():
-        import math, logging
-        ctx = get_context()
-        uuids = ctx.loadOBJ(req.file_path)
-        if req.scale and (req.scale.x != 1 or req.scale.y != 1 or req.scale.z != 1):
-            ctx.scalePrimitive(uuids, vec3(req.scale.x, req.scale.y, req.scale.z))
-        if req.rotation:
-            for axis, deg in [("x", req.rotation.x), ("y", req.rotation.y), ("z", req.rotation.z)]:
-                if deg != 0:
-                    ctx.rotatePrimitive(uuids, math.radians(deg), axis)
-        if req.origin and (req.origin.x != 0 or req.origin.y != 0 or req.origin.z != 0):
-            ctx.translatePrimitive(uuids, vec3(req.origin.x, req.origin.y, req.origin.z))
-        if uuids:
-            labels = ctx.getPrimitiveMaterialLabel(uuids)
-            unassigned = [uuids[j] for j, lbl in enumerate(labels) if not lbl or lbl in ("__default__", "")]
-            if unassigned:
-                reg.ensure_default_material(ctx, unassigned)
-        base_name = os.path.splitext(os.path.basename(req.file_path))[0]
-        obj_id = reg.register_object(base_name, "import", uuids, unique_name=True)
-        return {"uuids": uuids, "object_id": obj_id, "name": reg.get_object(obj_id)["name"]}
     try:
-        return await asyncio.to_thread(_do)
+        return await asyncio.to_thread(import_service.import_obj, req)
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
 @router.post("/import/ply")
 async def import_ply(req: ImportRequest):
-    def _do():
-        import math
-        ctx = get_context()
-        uuids = ctx.loadPLY(req.file_path)
-        if req.scale and (req.scale.x != 1 or req.scale.y != 1 or req.scale.z != 1):
-            ctx.scalePrimitive(uuids, vec3(req.scale.x, req.scale.y, req.scale.z))
-        if req.rotation:
-            for axis, deg in [("x", req.rotation.x), ("y", req.rotation.y), ("z", req.rotation.z)]:
-                if deg != 0:
-                    ctx.rotatePrimitive(uuids, math.radians(deg), axis)
-        if req.origin and (req.origin.x != 0 or req.origin.y != 0 or req.origin.z != 0):
-            ctx.translatePrimitive(uuids, vec3(req.origin.x, req.origin.y, req.origin.z))
-        reg.ensure_default_material(ctx, uuids)
-        base_name = os.path.splitext(os.path.basename(req.file_path))[0]
-        obj_id = reg.register_object(base_name, "import", uuids, unique_name=True)
-        return {"uuids": uuids, "object_id": obj_id, "name": reg.get_object(obj_id)["name"]}
     try:
-        return await asyncio.to_thread(_do)
+        return await asyncio.to_thread(import_service.import_ply, req)
     except Exception as e:
         raise HTTPException(500, str(e))

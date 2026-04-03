@@ -6,30 +6,36 @@ they never touch the module-level variables directly.
 """
 import time
 import threading
+from app.core import session_store
 
 # ── Object registry ───────────────────────────────────────────────────────────
-_object_registry: dict = {}
-_next_object_id: int = int(time.time() * 1000) % 1_000_000
+#_object_registry: dict = {}
+#_next_object_id: int = int(time.time() * 1000) % 1_000_000
 _object_lock = threading.Lock()
 
 # ── Geometry caches (consumed on first read, pre-packed by canopy/stream) ─────
-_geometry_cache: dict = {}       # object_id -> bytes  (binary wire format)
-_gpu_geometry_cache: dict = {}   # object_id -> bytes  (GPU-ready buffer)
-_gpu_children_cache: dict = {}   # object_id -> bytes  (per-child GPU buffers)
+#_geometry_cache: dict = {}       # object_id -> bytes  (binary wire format)
+#_gpu_geometry_cache: dict = {}   # object_id -> bytes  (GPU-ready buffer)
+#_gpu_children_cache: dict = {}   # object_id -> bytes  (per-child GPU buffers)
 
 # ── Material helpers ──────────────────────────────────────────────────────────
 DEFAULT_MATERIAL_COLOR = (0.2, 0.4, 0.8, 1.0)
-_default_material_label: str | None = None
+#_default_material_label: str | None = None
 
-_script_object_counter: int = 0
+#_script_object_counter: int = 0
 
 
 # ── Registry accessors ────────────────────────────────────────────────────────
-
+def _get_active_registry_state() -> dict:
+    session = session_store.get_active_session()
+    if session is None:
+        raise RuntimeError("No active session")
+    return session
 def _unique_object_name(base_name: str) -> str:
     """Return a unique display name, appending ' 1', ' 2', ... if needed.
     Caller must hold _object_lock."""
-    existing = [obj["name"] for obj in _object_registry.values()]
+    state = _get_active_registry_state()
+    existing = [obj["name"] for obj in state["registry"].values()]
     if base_name not in existing:
         return base_name
     n = 1
@@ -40,43 +46,51 @@ def _unique_object_name(base_name: str) -> str:
 
 def register_object(name: str, obj_type: str, primitive_uuids: list,
                     unique_name: bool = False, **extra) -> int:
-    global _next_object_id
+    state = _get_active_registry_state()
+
     with _object_lock:
         display_name = _unique_object_name(name) if unique_name else name
-        obj_id = _next_object_id
-        _next_object_id += 1
-        _object_registry[obj_id] = {
+
+        if state["next_object_id"] is None:
+            state["next_object_id"] = int(time.time() * 1000) % 1_000_000
+
+        obj_id = state["next_object_id"]
+        state["next_object_id"] += 1
+
+        state["registry"][obj_id] = {
             "name": display_name,
             "type": obj_type,
             "primitive_uuids": primitive_uuids,
             **extra,
         }
+
     return obj_id
 
 
 def get_object(object_id: int) -> dict:
-    return _object_registry[object_id]
+    state = _get_active_registry_state()
+    return state["registry"][object_id]
 
 
 def get_all_objects() -> dict:
-    return _object_registry
+    state = _get_active_registry_state()
+    return state["registry"]
 
 
 def delete_object(object_id: int) -> None:
-    del _object_registry[object_id]
+    state = _get_active_registry_state()
+    del state["registry"][object_id]
 
 
 def reset_registry() -> None:
-    global _object_registry, _next_object_id, _default_material_label
-    global _geometry_cache, _gpu_geometry_cache, _gpu_children_cache
-    global _script_object_counter
-    _object_registry = {}
-    _next_object_id = int(time.time() * 1000) % 1_000_000
-    _default_material_label = None
-    _geometry_cache = {}
-    _gpu_geometry_cache = {}
-    _gpu_children_cache = {}
-    _script_object_counter = 0
+    state = _get_active_registry_state()
+    state["registry"] = {}
+    state["next_object_id"] = int(time.time() * 1000) % 1_000_000
+    state["default_material_label"] = None
+    state["geometry_cache"] = {}
+    state["gpu_geometry_cache"] = {}
+    state["gpu_children_cache"] = {}
+    state["script_object_counter"] = 0
 
 
 # ── Material helpers ──────────────────────────────────────────────────────────
@@ -93,26 +107,29 @@ def next_material_name(ctx) -> str:
 
 def ensure_default_material(ctx, uuids: list) -> None:
     """Create the default material if absent, then assign it to uuids."""
-    global _default_material_label
-    if _default_material_label is None or not ctx.doesMaterialExist(_default_material_label):
+    state = _get_active_registry_state()
+
+    if state["default_material_label"] is None or not ctx.doesMaterialExist(state["default_material_label"]):
         from pyhelios.types import RGBAcolor
-        _default_material_label = next_material_name(ctx)
-        ctx.addMaterial(_default_material_label)
-        ctx.setMaterialColor(_default_material_label, RGBAcolor(*DEFAULT_MATERIAL_COLOR))
+        state["default_material_label"] = next_material_name(ctx)
+        ctx.addMaterial(state["default_material_label"])
+        ctx.setMaterialColor(state["default_material_label"], RGBAcolor(*DEFAULT_MATERIAL_COLOR))
+
     if uuids:
-        ctx.assignMaterialToPrimitive(uuids, _default_material_label)
+        ctx.assignMaterialToPrimitive(uuids, state["default_material_label"])
 
 
 def cleanup_orphaned_materials(ctx, material_labels: set) -> None:
     """Delete any material in the set that no longer has primitives using it."""
-    global _default_material_label
+    state = _get_active_registry_state()
+
     for label in material_labels:
         if label in ("__default__", ""):
             continue
         try:
             if ctx.doesMaterialExist(label) and not ctx.getPrimitivesUsingMaterial(label):
                 ctx.deleteMaterial(label)
-                if label == _default_material_label:
-                    _default_material_label = None
+                if label == state["default_material_label"]:
+                    state["default_material_label"] = None
         except Exception:
             pass

@@ -11,6 +11,8 @@ from fastapi import HTTPException
 
 from app.core.config import settings
 
+from app.core import session_store
+
 # ── Session ID ────────────────────────────────────────────────────────────────
 # Changes on every backend restart. Frontend uses this to detect stale state.
 session_id: str = _uuid_mod.uuid4().hex
@@ -92,46 +94,58 @@ except Exception:
     PLANTARCH_AVAILABLE = False
     PlantArchitecture = None
 
-# ── Singletons ────────────────────────────────────────────────────────────────
-_context = None
-_wpt = None
-_plantarch = None
+
 
 
 def get_context():
-    """Return the active Context singleton, creating it on first call."""
-    global _context
-    if _context is None:
+    """Return the active session's Context singleton, creating it on first call."""
+    session = session_store.get_active_session()
+    if session is None:
+        raise HTTPException(400, "No active session")
+
+    if session["context"] is None:
         if not PYHELIOS_AVAILABLE:
             raise HTTPException(503, "PyHelios not available")
-        _context = Context()
-    return _context
+        session["context"] = Context()
+
+    return session["context"]
 
 
 def get_wpt():
-    """Return the active WeberPennTree singleton."""
-    global _wpt
-    if _wpt is None:
-        _wpt = WeberPennTree(get_context())
-    return _wpt
+    """Return the active session's WeberPennTree singleton."""
+    session = session_store.get_active_session()
+    if session is None:
+        raise HTTPException(400, "No active session")
+
+    if session["wpt"] is None:
+        session["wpt"] = WeberPennTree(get_context())
+
+    return session["wpt"]
 
 
 def get_plantarch():
-    """Return the active PlantArchitecture singleton."""
-    global _plantarch
-    if _plantarch is None:
+    """Return the active session's PlantArchitecture singleton."""
+    session = session_store.get_active_session()
+    if session is None:
+        raise HTTPException(400, "No active session")
+
+    if session["plantarch"] is None:
         if not PLANTARCH_AVAILABLE:
             raise HTTPException(503, "PlantArchitecture plugin not available")
-        _plantarch = PlantArchitecture(get_context())
-    return _plantarch
+        session["plantarch"] = PlantArchitecture(get_context())
+
+    return session["plantarch"]
 
 
 def reset_context() -> None:
-    """Destroy all singletons. Called by project create/load."""
-    global _context, _wpt, _plantarch
-    _context = None
-    _wpt = None
-    _plantarch = None
+    """Destroy active session's context singletons."""
+    session = session_store.get_active_session()
+    if session is None:
+        return
+
+    session["context"] = None
+    session["wpt"] = None
+    session["plantarch"] = None
 
 
 def init_pyhelios() -> None:

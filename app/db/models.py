@@ -23,6 +23,7 @@ class Project(Base):
     __tablename__ = "projects"
 
     id                 = Column(Text, primary_key=True, default=_new_id)
+    session_id         = Column(Text, nullable=False, index=True)
     name               = Column(Text, nullable=False)
     latitude           = Column(Float, nullable=False, default=0.0)
     longitude          = Column(Float, nullable=False, default=0.0)

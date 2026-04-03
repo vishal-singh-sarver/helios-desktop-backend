@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Header
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -13,9 +13,21 @@ router = APIRouter()
 
 
 @router.post("/create", status_code=201)
-async def create_project(req: ProjectCreateRequest, db: Session = Depends(get_db)):
+async def create_project(
+    req: ProjectCreateRequest,
+    db: Session = Depends(get_db),
+    session_id: str | None = Header(default=None, alias="session_id"),
+):
     try:
-        return project_service.create_project(req.name, req.latitude, req.longitude, db)
+        if session_id is None or not session_id.strip():
+            raise HTTPException(400, "Session ID is required")
+        return project_service.create_project(
+            session_id,
+            req.name,
+            req.latitude,
+            req.longitude,
+            db
+        )
     except HTTPException:
         raise
     except Exception as e:

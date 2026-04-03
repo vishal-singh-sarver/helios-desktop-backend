@@ -8,23 +8,38 @@ from app.helios import context as helios_ctx
 from app.helios import registry as reg
 from app.helios import persistence
 
+from app.core import session_store
 
-def create_project(name: str, latitude: float, longitude: float, db: Session) -> dict:
+
+def create_project(session_id: str, name: str, latitude: float, longitude: float, db: Session) -> dict:
+    project_session_id = session_id.strip()
+    session_store.set_active_session(project_session_id)
     project_clean_name = name.strip()
 
     existing_project = db.query(Project).filter(
-        func.lower(Project.name) == project_clean_name.lower()
+        func.lower(Project.name) == project_clean_name.lower(),
+        Project.session_id == project_session_id,
     ).first()
     if existing_project:
         raise HTTPException(409, "A project with this name already exists")
 
-    if helios_ctx.PYHELIOS_AVAILABLE:
+    # Ensure session exists
+    if not session_store.session_exists(project_session_id):
+        session_store.create_session(project_session_id)
+
+    # Only initialize once per session
+    session = session_store.get_session(project_session_id)
+
+    if helios_ctx.PYHELIOS_AVAILABLE and not session["initialized"]:
         helios_ctx.reset_context()
         reg.reset_registry()
+        helios_ctx.get_context()
+        session["initialized"] = True
 
     project_utc_offset = utc_offset_from_coords(latitude, longitude)
 
     project = Project(
+        session_id=project_session_id,
         name=project_clean_name,
         latitude=latitude,
         longitude=longitude,
@@ -48,7 +63,7 @@ def create_project(name: str, latitude: float, longitude: float, db: Session) ->
         "latitude": latitude,
         "longitude": longitude,
         "utc_offset": project_utc_offset,
-        "session_id": helios_ctx.session_id,
+        "session_id": project_session_id,
     }
 
 

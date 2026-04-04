@@ -13,13 +13,14 @@ dist/
 build/
 .eggs/
 .Python
+*.spec
 
 # Virtual environments
 venv/
 .venv/
 env/
 
-# Runtime data (DB, project files, compressed snapshots)
+# Runtime data
 data/heliosgui.db
 data/heliosgui.db-shm
 data/heliosgui.db-wal
@@ -37,11 +38,21 @@ data/projects/
 htmlcov/
 coverage.xml
 
-# Type checking
+# Type checking / tooling
 .mypy_cache/
+.ruff_cache/
+.pyre/
 
-# IDE
+# Logs / temp
+*.log
+tmp/
+temp/
+.cache/
+
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
+.DS_Store
+**/.DS_Store

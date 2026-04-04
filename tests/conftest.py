@@ -1,12 +1,12 @@
 """
 Shared pytest fixtures.
-
-Fixtures added here:
-  client       — TestClient with in-memory SQLite, no PyHelios required
-  db_session   — isolated DB session per test
-  mock_context — stub PyHelios context for unit tests
 """
+import os
 import pytest
+
+# Tell PyHelios not to attempt a source build during tests
+os.environ.setdefault("PYHELIOS_USE_PIP", "0")
+
 from fastapi.testclient import TestClient
 from app.main import app
 
@@ -15,5 +15,3 @@ from app.main import app
 def client():
     with TestClient(app) as c:
         yield c
-
-# TODO: add db_session and mock_context fixtures in Step 2 / Step 3

@@ -4,7 +4,7 @@ SQLAlchemy ORM models — mirrors 001_initial.sql exactly.
 import uuid as _uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
-    Column, Integer, Text, Real, LargeBinary,
+    Column, Integer, Text, Float, LargeBinary,
     ForeignKey, UniqueConstraint, Index,
     func,
 )
@@ -24,8 +24,9 @@ class Project(Base):
 
     id                 = Column(Text, primary_key=True, default=_new_id)
     name               = Column(Text, nullable=False)
-    latitude           = Column(Real, nullable=False, default=0.0)
-    longitude          = Column(Real, nullable=False, default=0.0)
+    latitude           = Column(Float, nullable=False, default=0.0)
+    longitude          = Column(Float, nullable=False, default=0.0)
+    utc_offset         = Column(Float, nullable=False, default=0.0)
     created_at         = Column(Text, nullable=False, default=_now)
     updated_at         = Column(Text, nullable=False, default=_now, onupdate=_now)
     current_version_id = Column(Integer, ForeignKey("project_versions.id", ondelete="SET NULL"), nullable=True)

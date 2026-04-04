@@ -1,6 +1,3 @@
-from fastapi import APIRouter
-
-router = APIRouter()
-
-# TODO: implement in Step 3
-# Move /api/canopy/* endpoints from backend-api/main.py
+# Canopy endpoints are handled in plantarch.py (same plugin)
+# This file re-exports the router so main.py can include it separately if needed.
+from app.routers.plantarch import router

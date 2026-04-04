@@ -1,37 +1,147 @@
 """
-PyHelios singleton management.
+PyHelios singleton management — path setup, imports, and accessors.
 
-Holds the three PyHelios singletons (_context, _wpt, _plantarch) and exposes
-typed accessors. All other modules import from here — never instantiate directly.
+Module-level code runs once on first import (at startup via lifespan).
+All routers import get_context() / get_wpt() / get_plantarch() from here.
 """
-# TODO: implement in Step 3
-# Move PyHelios path setup and import logic from current main.py lines 44–138
-# Move _context, _wpt, _plantarch globals from main.py lines 141–162
+import sys
+import uuid as _uuid_mod
+from pathlib import Path
+from fastapi import HTTPException
 
-PYHELIOS_AVAILABLE: bool = False
-PLANTARCH_AVAILABLE: bool = False
+from app.core.config import settings
+
+# ── Session ID ────────────────────────────────────────────────────────────────
+# Changes on every backend restart. Frontend uses this to detect stale state.
+session_id: str = _uuid_mod.uuid4().hex
+
+# ── PyHelios path setup ───────────────────────────────────────────────────────
+_PYHELIOS_USE_SOURCE = not settings.pyhelios_use_pip
+_PYHELIOS_SOURCE_PATH: str | None = None
+_PYHELIOS_STALE: bool = False
+
+if _PYHELIOS_USE_SOURCE:
+    _pyhelios_src = settings.pyhelios_auto_source_path
+    if (_pyhelios_src / "pyhelios" / "__init__.py").exists():
+        _PYHELIOS_SOURCE_PATH = str(_pyhelios_src)
+        if _PYHELIOS_SOURCE_PATH not in sys.path:
+            sys.path.insert(0, _PYHELIOS_SOURCE_PATH)
+        print(f"[pyhelios] Using source: {_PYHELIOS_SOURCE_PATH}")
+
+        _platform = sys.platform
+        _lib_name = (
+            "libhelios.dylib" if _platform == "darwin"
+            else "libhelios.dll" if _platform == "win32"
+            else "libhelios.so"
+        )
+        _lib_path = _pyhelios_src / "pyhelios_build" / "build" / "lib" / _lib_name
+
+        _needs_build = False
+        if not _lib_path.exists():
+            print(f"[pyhelios] Native library not found at {_lib_path}")
+            _needs_build = True
+        else:
+            _lib_mtime = _lib_path.stat().st_mtime
+            _newest_source = 0.0
+            for _src_dir in [_pyhelios_src / "helios-core", _pyhelios_src / "native"]:
+                if _src_dir.exists():
+                    for _f in _src_dir.rglob("*.[ch]pp"):
+                        _newest_source = max(_newest_source, _f.stat().st_mtime)
+                    for _f in _src_dir.rglob("*.h"):
+                        _newest_source = max(_newest_source, _f.stat().st_mtime)
+            if _newest_source > _lib_mtime:
+                _needs_build = True
+                print("[pyhelios] Native library is stale (source files are newer).")
+
+        if _needs_build:
+            import subprocess
+            _build_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "build_pyhelios.sh"
+            if _build_script.exists():
+                print("[pyhelios] Building from source (this may take a few minutes)...")
+                _result = subprocess.run([str(_build_script)], cwd=str(_pyhelios_src.parent), timeout=600)
+                if _result.returncode == 0 and _lib_path.exists():
+                    print("[pyhelios] Build complete.")
+                else:
+                    print("[pyhelios] WARNING: Build failed. Native features unavailable.")
+                    _PYHELIOS_STALE = True
+            else:
+                print(f"[pyhelios] WARNING: Build script not found at {_build_script}")
+                _PYHELIOS_STALE = True
+    else:
+        print(f"[pyhelios] WARNING: Submodule not found at {_pyhelios_src}")
+        print("  Run: git submodule update --init --recursive")
+        _PYHELIOS_USE_SOURCE = False
+else:
+    print("[pyhelios] Using pip wheel (pyhelios3d)")
+
+# ── PyHelios imports ──────────────────────────────────────────────────────────
+try:
+    from pyhelios import Context, WeberPennTree, WPTType
+    from pyhelios.types import vec2, vec3, int2, RGBcolor, RGBAcolor, SphericalCoord, Date, Time
+    PYHELIOS_AVAILABLE: bool = True
+except Exception as e:
+    PYHELIOS_AVAILABLE = False
+    Context = WeberPennTree = WPTType = None
+    vec2 = vec3 = int2 = RGBcolor = RGBAcolor = SphericalCoord = Date = Time = None
+    print(f"[pyhelios] WARNING: Not available — {e}")
+
+try:
+    from pyhelios import PlantArchitecture
+    PLANTARCH_AVAILABLE: bool = True
+except Exception:
+    PLANTARCH_AVAILABLE = False
+    PlantArchitecture = None
+
+# ── Singletons ────────────────────────────────────────────────────────────────
+_context = None
+_wpt = None
+_plantarch = None
 
 
 def get_context():
-    """Return the active Context, raising 503 if PyHelios is unavailable."""
-    raise NotImplementedError("Implement in Step 3")
+    """Return the active Context singleton, creating it on first call."""
+    global _context
+    if _context is None:
+        if not PYHELIOS_AVAILABLE:
+            raise HTTPException(503, "PyHelios not available")
+        _context = Context()
+    return _context
 
 
 def get_wpt():
-    """Return the active WeberPennTree instance."""
-    raise NotImplementedError("Implement in Step 3")
+    """Return the active WeberPennTree singleton."""
+    global _wpt
+    if _wpt is None:
+        _wpt = WeberPennTree(get_context())
+    return _wpt
 
 
 def get_plantarch():
-    """Return the active PlantArchitecture instance."""
-    raise NotImplementedError("Implement in Step 3")
+    """Return the active PlantArchitecture singleton."""
+    global _plantarch
+    if _plantarch is None:
+        if not PLANTARCH_AVAILABLE:
+            raise HTTPException(503, "PlantArchitecture plugin not available")
+        _plantarch = PlantArchitecture(get_context())
+    return _plantarch
 
 
 def reset_context() -> None:
-    """Destroy all singletons — called by project create/load."""
-    raise NotImplementedError("Implement in Step 3")
+    """Destroy all singletons. Called by project create/load."""
+    global _context, _wpt, _plantarch
+    _context = None
+    _wpt = None
+    _plantarch = None
 
 
 def init_pyhelios() -> None:
-    """Called at startup to validate PyHelios availability."""
-    raise NotImplementedError("Implement in Step 3")
+    """Called at startup to log PyHelios availability."""
+    if PYHELIOS_AVAILABLE:
+        try:
+            import pyhelios
+            ver = getattr(pyhelios, "__version__", "unknown")
+            print(f"[pyhelios] Available — version {ver}")
+        except Exception:
+            print("[pyhelios] Available")
+    else:
+        print("[pyhelios] Not available — geometry endpoints will return 503")

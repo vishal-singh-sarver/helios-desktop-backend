@@ -16,6 +16,9 @@ sqlalchemy>=2.0.0             # ORM + query builder for SQLite
 # pyhelios3d                  # pip wheel (set PYHELIOS_USE_PIP=true)
 # (source submodule is used by default — see app/core/config.py)
 
+# ── Timezone ──────────────────────────────────
+timezonefinder>=6.2.0         # resolve timezone name from lat/long
+
 # ── Compression (stdlib — no install needed) ──
 # gzip   → current snapshot  (stdlib)
 # lzma   → version archive   (stdlib)

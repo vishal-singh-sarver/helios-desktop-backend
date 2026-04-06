@@ -1,13 +1,13 @@
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.helios import registry as reg
 from app.schemas.project import (
     ProjectCreateRequest, ProjectSaveRequest,
     ProjectLoadRequest, ProjectRestoreVersionRequest,
 )
 from app.services import project_service
+from app.core.dependencies import require_session
 
 router = APIRouter()
 
@@ -16,13 +16,11 @@ router = APIRouter()
 async def create_project(
     req: ProjectCreateRequest,
     db: Session = Depends(get_db),
-    session_id: str | None = Header(default=None, alias="session_id"),
+    session: dict = Depends(require_session),
 ):
     try:
-        if session_id is None or not session_id.strip():
-            raise HTTPException(400, "Session ID is required")
         return project_service.create_project(
-            session_id,
+            session,
             req.name,
             req.latitude,
             req.longitude,
@@ -34,9 +32,25 @@ async def create_project(
         raise HTTPException(500, str(e))
 
 
+@router.get("/recent")
+async def list_recent_projects(
+    db: Session = Depends(get_db),
+    session: dict = Depends(require_session),
+):
+    try:
+        return project_service.list_recent_projects(session, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @router.get("/info")
 async def project_info():
-    return {"project": reg._object_registry and "active" or None}
+    try:
+        return {"project": "active" if reg.get_all_objects() else None}
+    except Exception:
+        return {"project": None}
 
 
 @router.post("/save")
@@ -69,6 +83,20 @@ async def restore_version(project_id: str, req: ProjectRestoreVersionRequest,
                           db: Session = Depends(get_db)):
     try:
         return project_service.restore_version(project_id, req.version_id, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.delete("/{project_id}")
+async def delete_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    session: dict = Depends(require_session),
+):
+    try:
+        return project_service.delete_project(session, project_id, db)
     except HTTPException:
         raise
     except Exception as e:

@@ -11,8 +11,6 @@ from fastapi import HTTPException
 
 from app.core.config import settings
 
-from app.core import session_store
-
 # ── Session ID ────────────────────────────────────────────────────────────────
 # Changes on every backend restart. Frontend uses this to detect stale state.
 session_id: str = _uuid_mod.uuid4().hex
@@ -95,54 +93,33 @@ except Exception:
     PlantArchitecture = None
 
 
-
-
-def get_context():
-    """Return the active session's Context singleton, creating it on first call."""
-    session = session_store.get_active_session()
-    if session is None:
-        raise HTTPException(400, "No active session")
-
+def get_context(session: dict):
+    """Return the session's Context singleton, creating it on first call."""
     if session["context"] is None:
         if not PYHELIOS_AVAILABLE:
             raise HTTPException(503, "PyHelios not available")
         session["context"] = Context()
-
     return session["context"]
 
 
-def get_wpt():
-    """Return the active session's WeberPennTree singleton."""
-    session = session_store.get_active_session()
-    if session is None:
-        raise HTTPException(400, "No active session")
-
+def get_wpt(session: dict):
+    """Return the session's WeberPennTree singleton."""
     if session["wpt"] is None:
-        session["wpt"] = WeberPennTree(get_context())
-
+        session["wpt"] = WeberPennTree(get_context(session))
     return session["wpt"]
 
 
-def get_plantarch():
-    """Return the active session's PlantArchitecture singleton."""
-    session = session_store.get_active_session()
-    if session is None:
-        raise HTTPException(400, "No active session")
-
+def get_plantarch(session: dict):
+    """Return the session's PlantArchitecture singleton."""
     if session["plantarch"] is None:
         if not PLANTARCH_AVAILABLE:
             raise HTTPException(503, "PlantArchitecture plugin not available")
-        session["plantarch"] = PlantArchitecture(get_context())
-
+        session["plantarch"] = PlantArchitecture(get_context(session))
     return session["plantarch"]
 
 
-def reset_context() -> None:
-    """Destroy active session's context singletons."""
-    session = session_store.get_active_session()
-    if session is None:
-        return
-
+def reset_context(session: dict) -> None:
+    """Destroy the session's context singletons."""
     session["context"] = None
     session["wpt"] = None
     session["plantarch"] = None

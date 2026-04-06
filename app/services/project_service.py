@@ -1,19 +1,19 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from fastapi import HTTPException
+import shutil
 
 from app.db.models import Project
 from app.core.timezone import utc_offset_from_coords
 from app.helios import context as helios_ctx
 from app.helios import registry as reg
 from app.helios import persistence
-
+from app.core.config import settings
 from app.core import session_store
 
 
-def create_project(session_id: str, name: str, latitude: float, longitude: float, db: Session) -> dict:
-    project_session_id = session_id.strip()
-    session_store.set_active_session(project_session_id)
+def create_project(session: dict, name: str, latitude: float, longitude: float, db: Session) -> dict:
+    project_session_id = session["session_id"]
     project_clean_name = name.strip()
 
     existing_project = db.query(Project).filter(
@@ -22,19 +22,6 @@ def create_project(session_id: str, name: str, latitude: float, longitude: float
     ).first()
     if existing_project:
         raise HTTPException(409, "A project with this name already exists")
-
-    # Ensure session exists
-    if not session_store.session_exists(project_session_id):
-        session_store.create_session(project_session_id)
-
-    # Only initialize once per session
-    session = session_store.get_session(project_session_id)
-
-    if helios_ctx.PYHELIOS_AVAILABLE and not session["initialized"]:
-        helios_ctx.reset_context()
-        reg.reset_registry()
-        helios_ctx.get_context()
-        session["initialized"] = True
 
     project_utc_offset = utc_offset_from_coords(latitude, longitude)
 
@@ -53,8 +40,15 @@ def create_project(session_id: str, name: str, latitude: float, longitude: float
         db.rollback()
         raise HTTPException(500, "Failed to create project")
 
+    # Initialize per-project state (context, registry, caches) in the session
+    project_state = session_store.create_project_state(session, project.id)
+
     if helios_ctx.PYHELIOS_AVAILABLE:
-        helios_ctx.get_context()
+        helios_ctx.reset_context(project_state)
+        reg.reset_registry(project_state)
+        helios_ctx.get_context(project_state)
+
+    project_state["initialized"] = True
 
     return {
         "success": True,
@@ -97,8 +91,9 @@ def load_project(project_id: str, db: Session) -> dict:
     ctx = helios_ctx.get_context()
     data = persistence.load_snapshot(project_id, ctx)
 
+    session_objects = reg.get_all_objects()
     for obj_id_str, obj in data.get("objects", {}).items():
-        reg._object_registry[int(obj_id_str)] = obj
+        session_objects[int(obj_id_str)] = obj
 
     return {
         "success": True,
@@ -121,11 +116,70 @@ def restore_version(project_id: str, version_id: str, db: Session) -> dict:
     ctx = helios_ctx.get_context()
     data = persistence.restore_version(project_id, version_id, ctx, db)
 
+    session_objects = reg.get_all_objects()
     for obj_id_str, obj in data.get("objects", {}).items():
-        reg._object_registry[int(obj_id_str)] = obj
+        session_objects[int(obj_id_str)] = obj
 
     return {
         "success": True,
         "project": data.get("metadata", {}),
         "session_id": helios_ctx.session_id,
     }
+
+
+def list_recent_projects(session: dict, db: Session) -> dict:
+    project_session_id = session["session_id"]
+
+    projects = (
+        db.query(Project)
+        .filter(Project.session_id == project_session_id)
+        .order_by(Project.updated_at.desc())
+        .all()
+    )
+
+    recent = []
+    for project in projects:
+        snapshot_path = settings.resolved_projects_dir / project.id / "current.xml.gz"
+        project_size = snapshot_path.stat().st_size if snapshot_path.exists() else 0
+        recent.append(
+            {
+                "id": project.id,
+                "name": project.name,
+                "last_updated": project.updated_at,
+                "size": project_size,
+            }
+        )
+
+    return {"projects": recent}
+
+
+def delete_project(session: dict, project_id: str, db: Session) -> dict:
+    project_session_id = session["session_id"]
+
+    project = (
+        db.query(Project)
+        .filter(
+            Project.id == project_id,
+            Project.session_id == project_session_id,
+        )
+        .first()
+    )
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    try:
+        db.delete(project)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Failed to delete project")
+
+    # Clean up in-memory project state if it is loaded
+    if project_id in session["projects"]:
+        del session["projects"][project_id]
+
+    # Clean up project snapshot files from disk
+    project_dir = settings.resolved_projects_dir / project_id
+    shutil.rmtree(project_dir, ignore_errors=True)
+
+    return {"success": True, "project_id": project_id}

@@ -22,6 +22,7 @@ set -eu
 
 # Change to backend-api directory
 cd "$(dirname "$0")/.."
+BACKEND_DIR="$(pwd)"
 
 echo "=========================================="
 echo "Building HeliosGUI Backend Executable"
@@ -31,12 +32,15 @@ echo "=========================================="
 if [[ "$OSTYPE" == "darwin"* ]]; then
     OS="mac"
     BINARY_NAME="heliosgui_backend"
+    LIBHELIOS_NAME="libhelios.dylib"
 elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     OS="linux"
     BINARY_NAME="heliosgui_backend"
+    LIBHELIOS_NAME="libhelios.so"
 elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
     OS="win"
     BINARY_NAME="heliosgui_backend.exe"
+    LIBHELIOS_NAME="libhelios.dll"
 else
     echo "Error: Unsupported OS: $OSTYPE"
     exit 1
@@ -129,6 +133,15 @@ done
 # NOTE: Using --onedir instead of --onefile for significantly faster startup:
 #   --onefile: Extracts entire binary to temp directory on each run (5-30s overhead)
 #   --onedir:  Directory structure, no extraction needed on subsequent runs (~0.5s startup)
+LIBHELIOS_PATH="$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/$LIBHELIOS_NAME"
+
+PYHELIOS_ADD_BINARY=""
+if [ -f "$LIBHELIOS_PATH" ]; then
+    PYHELIOS_ADD_BINARY="--add-binary $LIBHELIOS_PATH:pyhelios/pyhelios_build/build/lib/"
+else
+    echo "[!] WARNING: $LIBHELIOS_PATH not found — pyhelios native library will not be bundled"
+fi
+
 pyinstaller \
     --onedir \
     --name "$BINARY_NAME" \
@@ -141,6 +154,8 @@ pyinstaller \
     --collect-all fastapi \
     --collect-all pydantic \
     --collect-all sqlalchemy \
+    --add-data "$BACKEND_DIR/pyhelios:pyhelios" \
+    $PYHELIOS_ADD_BINARY \
     $HIDDEN_IMPORTS_STR \
     backend_wrapper.py
 

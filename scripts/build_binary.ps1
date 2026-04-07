@@ -160,6 +160,21 @@ $pyInstallerArgs = @(
   '--collect-all', 'sqlalchemy'
 )
 
+# Bundle pyhelios submodule (Windows uses ';' as PyInstaller path separator)
+$pyheliosSrc = Join-Path $backendApiDir 'pyhelios'
+if (Test-Path $pyheliosSrc) {
+  $pyInstallerArgs += @('--add-data', "$pyheliosSrc;pyhelios")
+} else {
+  Write-Host "[!] WARNING: pyhelios submodule not found at $pyheliosSrc — pyhelios will not be bundled"
+}
+
+$libheliosPath = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\libhelios.dll'
+if (Test-Path $libheliosPath) {
+  $pyInstallerArgs += @('--add-binary', "$libheliosPath;pyhelios\pyhelios_build\build\lib\")
+} else {
+  Write-Host "[!] WARNING: libhelios.dll not found at $libheliosPath — native library will not be bundled"
+}
+
 foreach ($hiddenImport in $hiddenImports) {
   $pyInstallerArgs += @('--hidden-import', $hiddenImport)
 }

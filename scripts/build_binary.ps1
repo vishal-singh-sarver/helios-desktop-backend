@@ -160,19 +160,46 @@ $pyInstallerArgs = @(
   '--collect-all', 'sqlalchemy'
 )
 
-# Bundle pyhelios submodule (Windows uses ';' as PyInstaller path separator)
-$pyheliosSrc = Join-Path $backendApiDir 'pyhelios'
-if (Test-Path $pyheliosSrc) {
-  $pyInstallerArgs += @('--add-data', "$pyheliosSrc;pyhelios")
-} else {
-  Write-Host "[!] WARNING: pyhelios submodule not found at $pyheliosSrc — pyhelios will not be bundled"
+# Selectively bundle only runtime-needed parts of pyhelios instead of the entire
+# directory (~719 MB). Excludes helios-core/ C++ source, build artifacts, docs, tests.
+# Windows uses ';' as PyInstaller path separator.
+
+# 1. Python package (the actual importable code, ~3.4 MB)
+$pyheliosPkg = Join-Path $backendApiDir 'pyhelios\pyhelios'
+if (Test-Path $pyheliosPkg) {
+  $pyInstallerArgs += @('--add-data', "$pyheliosPkg;pyhelios\pyhelios")
 }
 
+# 2. Top-level pyhelios .py files
+$pyheliosSrc = Join-Path $backendApiDir 'pyhelios'
+foreach ($pyFile in (Get-ChildItem -Path $pyheliosSrc -Filter '*.py' -File -ErrorAction SilentlyContinue)) {
+  $pyInstallerArgs += @('--add-data', "$($pyFile.FullName);pyhelios\")
+}
+
+# 3. Native library (.dll)
 $libheliosPath = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\libhelios.dll'
 if (Test-Path $libheliosPath) {
   $pyInstallerArgs += @('--add-binary', "$libheliosPath;pyhelios\pyhelios_build\build\lib\")
 } else {
   Write-Host "[!] WARNING: libhelios.dll not found at $libheliosPath — native library will not be bundled"
+}
+
+# 4. Runtime asset images (textures needed by C++ core)
+$imagesDir = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\images'
+if (Test-Path $imagesDir) {
+  $pyInstallerArgs += @('--add-data', "$imagesDir;pyhelios\pyhelios_build\build\lib\images")
+}
+
+# 5. Plugin assets (shaders, textures, spectral data)
+$pluginsDir = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\plugins'
+if (Test-Path $pluginsDir) {
+  $pyInstallerArgs += @('--add-data', "$pluginsDir;pyhelios\pyhelios_build\build\plugins")
+}
+
+# 6. Built binaries in bin/ (if any)
+$binDir = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\bin'
+if (Test-Path $binDir) {
+  $pyInstallerArgs += @('--add-data', "$binDir;pyhelios\pyhelios_build\build\bin")
 }
 
 foreach ($hiddenImport in $hiddenImports) {

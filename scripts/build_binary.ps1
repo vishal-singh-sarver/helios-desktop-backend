@@ -128,6 +128,34 @@ if ($LASTEXITCODE -ne 0) {
   throw "Failed to install PyInstaller."
 }
 
+# Build pyhelios native library if missing
+$libheliosPath = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\libhelios.dll'
+if (-not (Test-Path $libheliosPath)) {
+  $buildScript = Join-Path $backendApiDir 'scripts\build_pyhelios.sh'
+  $buildScriptPs1 = Join-Path $backendApiDir 'scripts\build_pyhelios.ps1'
+  if (Test-Path $buildScriptPs1) {
+    Write-Host "[*] Native library (libhelios.dll) not found - building pyhelios from source..."
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $buildScriptPs1
+    if (Test-Path $libheliosPath) {
+      Write-Host "[*] pyhelios native library built successfully"
+    } else {
+      Write-Host "[!] WARNING: pyhelios build completed but libhelios.dll not found - pyhelios will be unavailable"
+    }
+  } elseif (Test-Path $buildScript) {
+    Write-Host "[*] Native library (libhelios.dll) not found - building pyhelios from source..."
+    & bash $buildScript
+    if (Test-Path $libheliosPath) {
+      Write-Host "[*] pyhelios native library built successfully"
+    } else {
+      Write-Host "[!] WARNING: pyhelios build completed but libhelios.dll not found - pyhelios will be unavailable"
+    }
+  } else {
+    Write-Host "[!] WARNING: libhelios.dll not found and build script missing - pyhelios will be unavailable"
+  }
+} else {
+  Write-Host "[*] Native library found: $libheliosPath"
+}
+
 if (Test-Path 'dist') {
   Write-Host "[*] Removing old build artifacts..."
   Remove-DirectoryRobust 'dist'

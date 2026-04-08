@@ -100,6 +100,25 @@ pip install -r requirements.txt >/dev/null
 echo "[*] Installing PyInstaller..."
 pip install pyinstaller >/dev/null
 
+# Step 4.5: Build pyhelios native library if missing
+LIBHELIOS_PATH="$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/$LIBHELIOS_NAME"
+if [ ! -f "$LIBHELIOS_PATH" ]; then
+    BUILD_SCRIPT="$BACKEND_DIR/scripts/build_pyhelios.sh"
+    if [ -f "$BUILD_SCRIPT" ]; then
+        echo "[*] Native library ($LIBHELIOS_NAME) not found — building pyhelios from source..."
+        bash "$BUILD_SCRIPT"
+        if [ -f "$LIBHELIOS_PATH" ]; then
+            echo "[*] pyhelios native library built successfully"
+        else
+            echo "[!] WARNING: pyhelios build completed but $LIBHELIOS_NAME not found — pyhelios will be unavailable"
+        fi
+    else
+        echo "[!] WARNING: $LIBHELIOS_NAME not found and build script missing — pyhelios will be unavailable"
+    fi
+else
+    echo "[*] Native library found: $LIBHELIOS_PATH"
+fi
+
 # Step 5: Clean old dist directory
 if [ -d "dist" ]; then
     echo "[*] Removing old build artifacts..."

@@ -4,7 +4,7 @@ from app.core.project_context import ProjectContext
 
 
 def get_session_id(
-    session_id: str | None = Header(default=None, alias="session_id"),
+    session_id: str | None = Header(default=None, alias="session_id", convert_underscores=False),
 ) -> str:
     """
     Validate and return the session_id string.
@@ -20,8 +20,8 @@ def get_session_id(
 
 
 def get_project_context(
-    session_id: str | None = Header(default=None, alias="session_id"),
-    project_id: str | None = Header(default=None, alias="project_id"),
+    session_id: str | None = Header(default=None, alias="session_id", convert_underscores=False),
+    project_id: str | None = Header(default=None, alias="project_id", convert_underscores=False),
 ) -> ProjectContext:
     """
     Look up and return the live ProjectContext.

@@ -92,46 +92,37 @@ except Exception:
     PLANTARCH_AVAILABLE = False
     PlantArchitecture = None
 
-# ── Singletons ────────────────────────────────────────────────────────────────
-_context = None
-_wpt = None
-_plantarch = None
 
-
-def get_context():
-    """Return the active Context singleton, creating it on first call."""
-    global _context
-    if _context is None:
+def get_context(pctx):
+    """Return the project's Context singleton, creating it on first call."""
+    if pctx.context is None:
         if not PYHELIOS_AVAILABLE:
             raise HTTPException(503, "PyHelios not available")
-        _context = Context()
-    return _context
+        pctx.context = Context()
+    return pctx.context
 
 
-def get_wpt():
-    """Return the active WeberPennTree singleton."""
-    global _wpt
-    if _wpt is None:
-        _wpt = WeberPennTree(get_context())
-    return _wpt
+def get_wpt(pctx):
+    """Return the project's WeberPennTree singleton."""
+    if pctx.wpt is None:
+        pctx.wpt = WeberPennTree(get_context(pctx))
+    return pctx.wpt
 
 
-def get_plantarch():
-    """Return the active PlantArchitecture singleton."""
-    global _plantarch
-    if _plantarch is None:
+def get_plantarch(pctx):
+    """Return the project's PlantArchitecture singleton."""
+    if pctx.plantarch is None:
         if not PLANTARCH_AVAILABLE:
             raise HTTPException(503, "PlantArchitecture plugin not available")
-        _plantarch = PlantArchitecture(get_context())
-    return _plantarch
+        pctx.plantarch = PlantArchitecture(get_context(pctx))
+    return pctx.plantarch
 
 
-def reset_context() -> None:
-    """Destroy all singletons. Called by project create/load."""
-    global _context, _wpt, _plantarch
-    _context = None
-    _wpt = None
-    _plantarch = None
+def reset_context(pctx) -> None:
+    """Destroy the project's context singletons."""
+    pctx.context = None
+    pctx.wpt = None
+    pctx.plantarch = None
 
 
 def init_pyhelios() -> None:

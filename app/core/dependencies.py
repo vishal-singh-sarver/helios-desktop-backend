@@ -1,32 +1,33 @@
 from fastapi import Header, HTTPException
-from app.core import session_store
+from app.core.session_store import registry
+from app.core.project_context import ProjectContext
 
 
-def require_session(
+def get_session_id(
     session_id: str | None = Header(default=None, alias="session_id"),
-) -> dict:
+) -> str:
     """
-    Resolves the caller's session dict from the session_id header.
-    Creates a new session if this is the first request from this client.
-    Use this for endpoints that only need to know WHO the user is
-    (e.g. list projects, create project).
+    Validate and return the session_id string.
+    Ensures the session exists in the store (creates if new).
+
+    Use for: create project, list projects, delete project.
     """
     if not session_id or not session_id.strip():
         raise HTTPException(400, "session_id header is required")
     sid = session_id.strip()
-    if not session_store.session_exists(sid):
-        session_store.create_session(sid)
-    return session_store.get_session(sid)
+    registry.get_or_create_session(sid)
+    return sid
 
 
-def require_project(
+def get_project_context(
     session_id: str | None = Header(default=None, alias="session_id"),
     project_id: str | None = Header(default=None, alias="project_id"),
-) -> dict:
+) -> ProjectContext:
     """
-    Resolves the caller's per-project state dict from session_id + project_id headers.
-    Use this for endpoints that touch PyHelios — geometry, materials, transforms, etc.
-    Returns the project state dict which contains context, registry, and caches.
+    Look up and return the live ProjectContext.
+
+    Use for: any endpoint that touches the PyHelios context
+    (geometry, materials, transforms, save, etc.)
     """
     if not session_id or not session_id.strip():
         raise HTTPException(400, "session_id header is required")
@@ -36,12 +37,7 @@ def require_project(
     sid = session_id.strip()
     pid = project_id.strip()
 
-    if not session_store.session_exists(sid):
-        session_store.create_session(sid)
-
-    session = session_store.get_session(sid)
-
-    if not session_store.project_state_exists(session, pid):
-        raise HTTPException(404, f"Project {pid} is not loaded. Call /load first.")
-
-    return session_store.get_project_state(session, pid)
+    pctx = registry.get_context(sid, pid)
+    if pctx is None:
+        raise HTTPException(404, f"Project {pid} is not loaded")
+    return pctx

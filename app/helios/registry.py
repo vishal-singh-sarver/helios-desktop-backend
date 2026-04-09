@@ -1,23 +1,19 @@
 """
 In-memory object registry and material helpers.
 
-All mutable state lives in the session dict.
-Functions receive the session dict explicitly — no global lookups.
+All mutable state lives in the ProjectContext object.
+Functions receive the ProjectContext explicitly — no global lookups.
 """
 import time
-import threading
-
-_object_lock = threading.Lock()
 
 DEFAULT_MATERIAL_COLOR = (0.2, 0.4, 0.8, 1.0)
 
 
 # ── Registry accessors ────────────────────────────────────────────────────────
 
-def _unique_object_name(session: dict, base_name: str) -> str:
-    """Return a unique display name, appending ' 1', ' 2', ... if needed.
-    Caller must hold _object_lock."""
-    existing = [obj["name"] for obj in session["registry"].values()]
+def _unique_object_name(pctx, base_name: str) -> str:
+    """Return a unique display name, appending ' 1', ' 2', ... if needed."""
+    existing = [obj["name"] for obj in pctx.registry.values()]
     if base_name not in existing:
         return base_name
     n = 1
@@ -26,47 +22,43 @@ def _unique_object_name(session: dict, base_name: str) -> str:
     return f"{base_name} {n}"
 
 
-def register_object(session: dict, name: str, obj_type: str, primitive_uuids: list,
+def register_object(pctx, name: str, obj_type: str, primitive_uuids: list,
                     unique_name: bool = False, **extra) -> int:
-    with _object_lock:
-        display_name = _unique_object_name(session, name) if unique_name else name
+    display_name = _unique_object_name(pctx, name) if unique_name else name
 
-        if session["next_object_id"] is None:
-            session["next_object_id"] = int(time.time() * 1000) % 1_000_000
+    obj_id = pctx.next_object_id
+    pctx.next_object_id += 1
 
-        obj_id = session["next_object_id"]
-        session["next_object_id"] += 1
-
-        session["registry"][obj_id] = {
-            "name": display_name,
-            "type": obj_type,
-            "primitive_uuids": primitive_uuids,
-            **extra,
-        }
+    pctx.registry[obj_id] = {
+        "name": display_name,
+        "type": obj_type,
+        "primitive_uuids": primitive_uuids,
+        **extra,
+    }
 
     return obj_id
 
 
-def get_object(session: dict, object_id: int) -> dict:
-    return session["registry"][object_id]
+def get_object(pctx, object_id: int) -> dict:
+    return pctx.registry[object_id]
 
 
-def get_all_objects(session: dict) -> dict:
-    return session["registry"]
+def get_all_objects(pctx) -> dict:
+    return pctx.registry
 
 
-def delete_object(session: dict, object_id: int) -> None:
-    del session["registry"][object_id]
+def delete_object(pctx, object_id: int) -> None:
+    del pctx.registry[object_id]
 
 
-def reset_registry(session: dict) -> None:
-    session["registry"] = {}
-    session["next_object_id"] = int(time.time() * 1000) % 1_000_000
-    session["default_material_label"] = None
-    session["geometry_cache"] = {}
-    session["gpu_geometry_cache"] = {}
-    session["gpu_children_cache"] = {}
-    session["script_object_counter"] = 0
+def reset_registry(pctx) -> None:
+    pctx.registry = {}
+    pctx.next_object_id = int(time.time() * 1000) % 1_000_000
+    pctx.default_material_label = None
+    pctx.geometry_cache = {}
+    pctx.gpu_geometry_cache = {}
+    pctx.gpu_children_cache = {}
+    pctx.script_object_counter = 0
 
 
 # ── Material helpers ──────────────────────────────────────────────────────────
@@ -81,20 +73,20 @@ def next_material_name(ctx) -> str:
     return name
 
 
-def ensure_default_material(session: dict, ctx, uuids: list) -> None:
+def ensure_default_material(pctx, ctx, uuids: list) -> None:
     """Create the default material if absent, then assign it to uuids."""
-    if (session["default_material_label"] is None
-            or not ctx.doesMaterialExist(session["default_material_label"])):
+    if (pctx.default_material_label is None
+            or not ctx.doesMaterialExist(pctx.default_material_label)):
         from pyhelios.types import RGBAcolor
-        session["default_material_label"] = next_material_name(ctx)
-        ctx.addMaterial(session["default_material_label"])
-        ctx.setMaterialColor(session["default_material_label"], RGBAcolor(*DEFAULT_MATERIAL_COLOR))
+        pctx.default_material_label = next_material_name(ctx)
+        ctx.addMaterial(pctx.default_material_label)
+        ctx.setMaterialColor(pctx.default_material_label, RGBAcolor(*DEFAULT_MATERIAL_COLOR))
 
     if uuids:
-        ctx.assignMaterialToPrimitive(uuids, session["default_material_label"])
+        ctx.assignMaterialToPrimitive(uuids, pctx.default_material_label)
 
 
-def cleanup_orphaned_materials(session: dict, ctx, material_labels: set) -> None:
+def cleanup_orphaned_materials(pctx, ctx, material_labels: set) -> None:
     """Delete any material in the set that no longer has primitives using it."""
     for label in material_labels:
         if label in ("__default__", ""):
@@ -102,7 +94,7 @@ def cleanup_orphaned_materials(session: dict, ctx, material_labels: set) -> None
         try:
             if ctx.doesMaterialExist(label) and not ctx.getPrimitivesUsingMaterial(label):
                 ctx.deleteMaterial(label)
-                if label == session["default_material_label"]:
-                    session["default_material_label"] = None
+                if label == pctx.default_material_label:
+                    pctx.default_material_label = None
         except Exception:
             pass

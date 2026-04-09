@@ -1,8 +1,7 @@
-# TODO: implement tests in Step 3
 import pytest
 from uuid import uuid4
 from app.core.config import settings
-from app.core import session_store
+from app.core.session_store import registry
 
 
 def test_create_project_success(client):
@@ -27,16 +26,14 @@ def test_create_project_success(client):
 
     # Project state must be initialized in memory under the correct session
     project_id = data["project_id"]
-    session = session_store.get_session(session_id)
-    assert session is not None
-    assert project_id in session["projects"]
-    project_state = session["projects"][project_id]
-    assert project_state["project_id"] == project_id
-    assert project_state["initialized"] is True
+    pctx = registry.get_context(session_id, project_id)
+    assert pctx is not None
+    assert pctx.project_id == project_id
+    assert pctx.initialized is True
 
 
 def test_two_projects_same_user_have_separate_states(client):
-    """Same user, two projects — each gets its own isolated project state dict."""
+    """Same user, two projects — each gets its own isolated ProjectContext."""
     session_id = f"session_{uuid4().hex[:8]}"
 
     r1 = client.post("/api/project/create", json={
@@ -52,18 +49,19 @@ def test_two_projects_same_user_have_separate_states(client):
     pid1 = r1.json()["project_id"]
     pid2 = r2.json()["project_id"]
 
-    session = session_store.get_session(session_id)
+    pctx1 = registry.get_context(session_id, pid1)
+    pctx2 = registry.get_context(session_id, pid2)
 
-    # Both projects exist in the same session
-    assert pid1 in session["projects"]
-    assert pid2 in session["projects"]
+    # Both exist
+    assert pctx1 is not None
+    assert pctx2 is not None
 
-    # Each has its own state dict — not the same object
-    assert session["projects"][pid1] is not session["projects"][pid2]
+    # Each is a separate object
+    assert pctx1 is not pctx2
 
     # Each knows its own project_id
-    assert session["projects"][pid1]["project_id"] == pid1
-    assert session["projects"][pid2]["project_id"] == pid2
+    assert pctx1.project_id == pid1
+    assert pctx2.project_id == pid2
 
 
 def test_two_users_have_separate_sessions(client):
@@ -84,15 +82,13 @@ def test_two_users_have_separate_sessions(client):
     pid_a = r_a.json()["project_id"]
     pid_b = r_b.json()["project_id"]
 
-    sess_a = session_store.get_session(session_a)
-    sess_b = session_store.get_session(session_b)
+    # User A's project not visible in User B's session and vice versa
+    assert registry.get_context(session_a, pid_b) is None
+    assert registry.get_context(session_b, pid_a) is None
 
-    # Each user has their own session
-    assert sess_a is not sess_b
-
-    # User A's project not in User B's session and vice versa
-    assert pid_a not in sess_b["projects"]
-    assert pid_b not in sess_a["projects"]
+    # Each user's project is in their own session
+    assert registry.get_context(session_a, pid_a) is not None
+    assert registry.get_context(session_b, pid_b) is not None
 
 
 def test_missing_session_id_header_returns_400(client):
@@ -245,8 +241,8 @@ def test_delete_project_success_and_wrong_session_rejected(client):
     project_id = created.json()["project_id"]
 
     # Project state must exist in memory after creation
-    session = session_store.get_session(owner_session)
-    assert project_id in session["projects"]
+    pctx = registry.get_context(owner_session, project_id)
+    assert pctx is not None
 
     # Wrong session cannot delete this project
     denied = client.delete(f"/api/project/{project_id}", headers={"session_id": wrong_session})
@@ -258,7 +254,7 @@ def test_delete_project_success_and_wrong_session_rejected(client):
     assert deleted.json()["success"] is True
 
     # In-memory project state must be removed after delete
-    assert project_id not in session["projects"]
+    assert registry.get_context(owner_session, project_id) is None
 
     # After delete, it should disappear from recent list for owner
     recent_after = client.get("/api/project/recent", headers={"session_id": owner_session})

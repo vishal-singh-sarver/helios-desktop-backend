@@ -11,40 +11,36 @@ Write-Host "Building HeliosGUI Backend Executable"
 Write-Host "=========================================="
 Write-Host "[*] Platform: win"
 
+function Test-SupportedPythonVersion($command, [string[]]$arguments) {
+  try {
+    $version = & $command @($arguments + @('-c', "import sys; print(str(sys.version_info.major) + '.' + str(sys.version_info.minor))")) 2>$null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    return ($version.Trim() -match '^3\.(10|11|12)$')
+  } catch {
+    return $false
+  }
+}
+
 function Find-Python {
-  $candidates = @('python3.11', 'python3.10', 'python', 'python3', 'py')
-
-  foreach ($candidate in $candidates) {
-    if ($candidate -eq 'py') {
-      $command = Get-Command py -ErrorAction SilentlyContinue
-      if ($command) {
-        try {
-          & py -3 -c "import sys; sys.exit(0)"
-          if ($LASTEXITCODE -eq 0) {
-            return @{ Command = 'py'; Arguments = @('-3') }
-          }
-        } catch {
-          continue
-        }
-      }
-
-      continue
-    }
-
-    $command = Get-Command $candidate -ErrorAction SilentlyContinue
-    if ($command) {
-      try {
-        & $candidate -c "import sys; sys.exit(0)"
-        if ($LASTEXITCODE -eq 0) {
-          return @{ Command = $candidate; Arguments = @() }
-        }
-      } catch {
-        continue
+  # Prefer specific known-good versions (3.10/3.11/3.12). Avoid 3.13/3.14
+  # because backend C-extension deps don't yet publish wheels for them.
+  if (Get-Command py -ErrorAction SilentlyContinue) {
+    foreach ($ver in @('-3.11', '-3.12', '-3.10')) {
+      if (Test-SupportedPythonVersion 'py' @($ver)) {
+        return @{ Command = 'py'; Arguments = @($ver) }
       }
     }
   }
 
-  throw "Python 3.10+ is required but no supported python executable was found."
+  foreach ($candidate in @('python3.11', 'python3.12', 'python3.10', 'python', 'python3')) {
+    if (Get-Command $candidate -ErrorAction SilentlyContinue) {
+      if (Test-SupportedPythonVersion $candidate @()) {
+        return @{ Command = $candidate; Arguments = @() }
+      }
+    }
+  }
+
+  throw "Python 3.10/3.11/3.12 is required but no supported interpreter was found. Install via: winget install -e --id Python.Python.3.11"
 }
 
 function Get-PythonVersion($python) {
@@ -92,8 +88,8 @@ function Remove-DirectoryRobust([string]$path) {
 
 $python = Find-Python
 $pythonVersion = Get-PythonVersion $python
-if ($pythonVersion -notmatch '^3\.(\d+)$' -or [int]$Matches[1] -lt 10) {
-  throw "Python 3.10+ is required. Found: $pythonVersion"
+if ($pythonVersion -notmatch '^3\.(10|11|12)$') {
+  throw "Python 3.10/3.11/3.12 is required (3.13+ has incomplete wheel coverage for backend deps). Found: $pythonVersion"
 }
 
 Write-Host "[*] Using Python: $($python.Command) ($pythonVersion)"
@@ -128,30 +124,30 @@ if ($LASTEXITCODE -ne 0) {
   throw "Failed to install PyInstaller."
 }
 
-# Build pyhelios native library if missing
+# Build pyhelios native library if missing.
+# Failures are fatal: a packaged backend without libhelios.dll silently falls
+# back to PYHELIOS_AVAILABLE=False at runtime, which is the exact bug we are
+# trying to prevent. Better to abort the build than ship a broken installer.
 $libheliosPath = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\libhelios.dll'
 if (-not (Test-Path $libheliosPath)) {
-  $buildScript = Join-Path $backendApiDir 'scripts\build_pyhelios.sh'
   $buildScriptPs1 = Join-Path $backendApiDir 'scripts\build_pyhelios.ps1'
-  if (Test-Path $buildScriptPs1) {
-    Write-Host "[*] Native library (libhelios.dll) not found - building pyhelios from source..."
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $buildScriptPs1
-    if (Test-Path $libheliosPath) {
-      Write-Host "[*] pyhelios native library built successfully"
-    } else {
-      Write-Host "[!] WARNING: pyhelios build completed but libhelios.dll not found - pyhelios will be unavailable"
-    }
-  } elseif (Test-Path $buildScript) {
-    Write-Host "[*] Native library (libhelios.dll) not found - building pyhelios from source..."
-    & bash $buildScript
-    if (Test-Path $libheliosPath) {
-      Write-Host "[*] pyhelios native library built successfully"
-    } else {
-      Write-Host "[!] WARNING: pyhelios build completed but libhelios.dll not found - pyhelios will be unavailable"
-    }
-  } else {
-    Write-Host "[!] WARNING: libhelios.dll not found and build script missing - pyhelios will be unavailable"
+  if (-not (Test-Path $buildScriptPs1)) {
+    throw "libhelios.dll not found at $libheliosPath and build_pyhelios.ps1 is missing. Cannot build native library."
   }
+
+  Write-Host "[*] Native library (libhelios.dll) not found - building pyhelios from source..."
+  # Pass the venv python and skip the editable install: PyInstaller bundles
+  # pyhelios via --add-data below, so installing it into the venv is unneeded
+  # and ambient-pip pollution risks breaking the build on machines with
+  # multiple Python versions on PATH.
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $buildScriptPs1 -PythonExe $venvPython -SkipPipInstall
+  if ($LASTEXITCODE -ne 0) {
+    throw "build_pyhelios.ps1 failed (exit code $LASTEXITCODE). See output above for details."
+  }
+  if (-not (Test-Path $libheliosPath)) {
+    throw "build_pyhelios.ps1 reported success but libhelios.dll was not produced at $libheliosPath."
+  }
+  Write-Host "[*] pyhelios native library built successfully"
 } else {
   Write-Host "[*] Native library found: $libheliosPath"
 }
@@ -204,13 +200,12 @@ foreach ($pyFile in (Get-ChildItem -Path $pyheliosSrc -Filter '*.py' -File -Erro
   $pyInstallerArgs += @('--add-data', "$($pyFile.FullName);pyhelios\")
 }
 
-# 3. Native library (.dll)
+# 3. Native library (.dll) — required, must exist by this point
 $libheliosPath = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\libhelios.dll'
-if (Test-Path $libheliosPath) {
-  $pyInstallerArgs += @('--add-binary', "$libheliosPath;pyhelios\pyhelios_build\build\lib\")
-} else {
-  Write-Host "[!] WARNING: libhelios.dll not found at $libheliosPath — native library will not be bundled"
+if (-not (Test-Path $libheliosPath)) {
+  throw "libhelios.dll missing at $libheliosPath at PyInstaller stage. The earlier auto-build step should have produced it - this indicates a logic error in this script."
 }
+$pyInstallerArgs += @('--add-binary', "$libheliosPath;pyhelios\pyhelios_build\build\lib\")
 
 # 4. Runtime asset images (textures needed by C++ core)
 $imagesDir = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\images'
@@ -252,7 +247,16 @@ if (-not (Test-Path $executable -PathType Leaf)) {
   throw "Build failed - executable not found at $executable"
 }
 
+# Verify the native library actually ended up in the bundled tree. Without
+# this, PyInstaller can silently drop --add-binary entries on path errors and
+# we would ship an installer that reports PYHELIOS_AVAILABLE=False at runtime.
+$bundledLibhelios = Join-Path $distDir '_internal\pyhelios\pyhelios_build\build\lib\libhelios.dll'
+if (-not (Test-Path $bundledLibhelios -PathType Leaf)) {
+  throw "Build failed - libhelios.dll was not bundled into the PyInstaller output. Expected at: $bundledLibhelios"
+}
+
 Write-Host "=========================================="
 Write-Host "[*] Build successful!"
-Write-Host "  Output: dist/heliosgui_backend.exe"
+Write-Host "  Output:    dist/heliosgui_backend.exe"
+Write-Host "  libhelios: $bundledLibhelios"
 Write-Host "=========================================="

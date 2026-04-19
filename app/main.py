@@ -13,6 +13,7 @@ from app.routers import (
     materials,
     transforms,
     timeseries,
+    weather,
     import_export,
     scripting,
 )
@@ -50,5 +51,6 @@ app.include_router(plantarch.router,     prefix="/api/plantarch",  tags=["planta
 app.include_router(materials.router,     prefix="/api/materials",  tags=["materials"])
 app.include_router(transforms.router,    prefix="/api/geometry",   tags=["transforms"])
 app.include_router(timeseries.router,    prefix="/api/timeseries", tags=["timeseries"])
+app.include_router(weather.router,       prefix="/api/weather",    tags=["weather"])
 app.include_router(import_export.router, prefix="/api",            tags=["import"])
 app.include_router(scripting.router,     prefix="/api/script",     tags=["scripting"])

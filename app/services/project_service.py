@@ -3,7 +3,7 @@ from sqlalchemy import func
 from fastapi import HTTPException
 import shutil
 
-from app.db.models import Project
+from app.db.models import Project, Scenario
 from app.core.timezone import utc_offset_from_coords
 from app.core.session_store import registry
 from app.core.config import settings
@@ -33,8 +33,14 @@ def create_project(session_id: str, name: str, latitude: float,
     )
     try:
         db.add(project)
+        db.flush()  # get project.id without committing yet
+
+        # Auto-create the "main" scenario — every project must have >=1
+        main_scenario = Scenario(project_id=project.id, name="main")
+        db.add(main_scenario)
         db.commit()
         db.refresh(project)
+        db.refresh(main_scenario)
     except Exception:
         db.rollback()
         raise HTTPException(500, "Failed to create project")
@@ -48,9 +54,14 @@ def create_project(session_id: str, name: str, latitude: float,
 
     pctx.initialized = True
 
+    # Register the main scenario's ScenarioContext so the first request
+    # that targets it is instant.
+    registry.get_or_create_scenario_context(session_id, project.id, main_scenario.id)
+
     return {
         "success": True,
         "project_id": project.id,
+        "main_scenario_id": main_scenario.id,
         "name": clean_name,
         "latitude": latitude,
         "longitude": longitude,
@@ -98,11 +109,12 @@ def delete_project(session_id: str, project_id: str, db: Session) -> dict:
         db.rollback()
         raise HTTPException(500, "Failed to delete project")
 
-    # Mutate store — remove reference, GC handles cleanup
+    # Mutate store — remove reference, GC handles cleanup.
+    # remove_project also wipes all scenarios for this project from memory.
     registry.remove_project(session_id, project_id)
 
-    # Disk cleanup
-    project_dir = settings.resolved_projects_dir / project_id
-    shutil.rmtree(project_dir, ignore_errors=True)
+    # Disk cleanup — legacy project snapshot tree + scenario data tree.
+    shutil.rmtree(settings.resolved_projects_dir / project_id, ignore_errors=True)
+    shutil.rmtree(settings.data_dir / project_id, ignore_errors=True)
 
     return {"success": True, "project_id": project_id}

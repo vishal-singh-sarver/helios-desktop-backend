@@ -6,6 +6,7 @@ from app.core.lifespan import lifespan
 from app.routers import (
     system,
     project,
+    scenario,
     geometry,
     objects,
     tree,
@@ -44,6 +45,7 @@ async def stale_pyhelios_header(request: Request, call_next):
 # ── Routers ────────────────────────────────────────────────────────────────
 app.include_router(system.router)
 app.include_router(project.router,       prefix="/api/project",    tags=["project"])
+app.include_router(scenario.router,      prefix="/api/project",    tags=["scenario"])
 app.include_router(geometry.router,      prefix="/api/geometry",   tags=["geometry"])
 app.include_router(objects.router,       prefix="/api/objects",    tags=["objects"])
 app.include_router(tree.router,          prefix="/api/tree",       tags=["tree"])

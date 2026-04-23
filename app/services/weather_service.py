@@ -1,12 +1,13 @@
 """
-Weather data service.
+Weather data service — per-scenario.
 
-Brute-force design: the project's weather CSV lives on disk at
-backend-api/data/<project_id>/weather.csv. Uploaded CSVs go through an
-auto-transform step that detects date/time columns, normalizes formats,
-and drops non-numeric columns — so users can upload files in any
-reasonable format (CIMIS, NOAA, custom, etc.). The cleaned CSV is then
-saved and PyHelios is told to load it via:
+Each scenario in a project owns its own weather CSV:
+    backend-api/data/<project_id>/<scenario_id>/weather.csv
+
+Uploaded CSVs go through an auto-transform step that detects date/time
+columns, normalizes formats, and drops non-numeric columns — so users
+can upload files in any reasonable format (CIMIS, NOAA, custom, etc.).
+The cleaned CSV is saved and PyHelios is told to load it via:
 
     ctx.clearTimeseriesData()
     ctx.loadTabularTimeseriesData(path, column_labels, ",", "YYYY-MM-DD", 1)
@@ -26,33 +27,43 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException
 
 from app.core.config import settings
+from app.db.models import Scenario
 from app.helios import context as helios_ctx
 
 if TYPE_CHECKING:
-    from app.core.project_context import ProjectContext
-    from app.schemas.weather import AddRequest, DeleteRequest, UpdateRequest
+    from sqlalchemy.orm import Session
+    from app.core.scenario_context import ScenarioContext
 
 
 # ─── Path + file I/O helpers ─────────────────────────────────────────────────
 
 
-def _csv_path(project_id: str) -> Path:
-    """Return the on-disk path for this project's weather CSV.
-    Creates the project directory under backend-api/data if missing."""
-    proj_dir = settings.data_dir / project_id
-    proj_dir.mkdir(parents=True, exist_ok=True)
-    return proj_dir / "weather.csv"
+def _csv_path(project_id: str, scenario_id: str) -> Path:
+    """Return the on-disk path for this scenario's weather CSV.
+    Creates the scenario directory under backend-api/data if missing."""
+    scn_dir = settings.data_dir / project_id / scenario_id
+    scn_dir.mkdir(parents=True, exist_ok=True)
+    return scn_dir / "weather.csv"
 
 
-def _read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
-    """Read the cleaned CSV. Returns (header, rows). 404 if file missing."""
-    if not path.exists():
-        raise HTTPException(404, "no weather data uploaded for this project")
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        all_rows = list(csv.reader(f))
-    if not all_rows:
-        raise HTTPException(400, "weather CSV is empty")
-    return all_rows[0], all_rows[1:]
+def _persist_weather_path(
+    db: "Session", project_id: str, scenario_id: str, path: Path | None
+) -> None:
+    """Keep the scenario's weather_file_path column in sync with disk state."""
+    scenario = (
+        db.query(Scenario)
+        .filter(Scenario.id == scenario_id, Scenario.project_id == project_id)
+        .first()
+    )
+    if scenario is None:
+        return
+    new_value = str(path) if path else None
+    if scenario.weather_file_path != new_value:
+        scenario.weather_file_path = new_value
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
 
 
 def _write_csv(path: Path, header: list[str], rows: list[list[str]]) -> None:
@@ -64,14 +75,14 @@ def _write_csv(path: Path, header: list[str], rows: list[list[str]]) -> None:
         writer.writerows(rows)
 
 
-def _reload_pyhelios(pctx: "ProjectContext", path: Path, header: list[str]) -> None:
+def _reload_pyhelios(sctx: "ScenarioContext", path: Path, header: list[str]) -> None:
     """Tell PyHelios to clear and reload its timeseries from the CSV file.
-    No-op if PyHelios isn't available (e.g. running in pip mode)."""
-    if not helios_ctx.PYHELIOS_AVAILABLE or pctx.context is None:
+    No-op if PyHelios isn't available or the scenario has no live Context."""
+    if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
         return
     try:
-        pctx.context.clearTimeseriesData()
-        pctx.context.loadTabularTimeseriesData(
+        sctx.context.clearTimeseriesData()
+        sctx.context.loadTabularTimeseriesData(
             str(path),
             list(header),
             ",",
@@ -80,36 +91,6 @@ def _reload_pyhelios(pctx: "ProjectContext", path: Path, header: list[str]) -> N
         )
     except Exception as exc:
         raise HTTPException(503, f"PyHelios reload failed: {exc}")
-
-
-def _sync_pyhelios_after_write(
-    pctx: "ProjectContext", path: Path, header: list[str]
-) -> None:
-    """Sync PyHelios memory with the CSV on disk after a mutation.
-
-    Prefers `updateTabularTimeseriesData(path, ...)` when it exists
-    (efficient in-place refresh, expected in a future PyHelios release).
-    Falls back to `clearTimeseriesData() + loadTabularTimeseriesData()`
-    which is what we do today.
-
-    Same arguments as `loadTabularTimeseriesData` for signature symmetry.
-    No-op when PyHelios is unavailable or the context has no live handle.
-    """
-    if not helios_ctx.PYHELIOS_AVAILABLE or pctx.context is None:
-        return
-    ctx = pctx.context
-    try:
-        if hasattr(ctx, "updateTabularTimeseriesData"):
-            ctx.updateTabularTimeseriesData(
-                str(path), list(header), ",", "YYYY-MM-DD", 1
-            )
-        else:
-            ctx.clearTimeseriesData()
-            ctx.loadTabularTimeseriesData(
-                str(path), list(header), ",", "YYYY-MM-DD", 1
-            )
-    except Exception as exc:
-        raise HTTPException(503, f"PyHelios sync failed: {exc}")
 
 
 # ─── Auto-transform: any-format CSV → standard (date, time, numeric...) ──────
@@ -432,17 +413,19 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
 # ─── Endpoint handler ────────────────────────────────────────────────────────
 
 
-def upload_file(pctx: "ProjectContext", file_bytes: bytes) -> dict:
-    """Auto-transform uploaded CSV, save to disk, reload PyHelios."""
+def upload_file(sctx: "ScenarioContext", file_bytes: bytes, db: "Session") -> dict:
+    """Auto-transform uploaded CSV, save to disk, reload PyHelios, and
+    persist the scenario's weather_file_path column."""
     if not file_bytes:
         raise HTTPException(400, "uploaded file is empty")
 
     header, rows = _transform_csv(file_bytes)
 
-    path = _csv_path(pctx.project_id)
+    path = _csv_path(sctx.project_id, sctx.scenario_id)
     _write_csv(path, header, rows)
 
-    _reload_pyhelios(pctx, path, header)
+    _reload_pyhelios(sctx, path, header)
+    _persist_weather_path(db, sctx.project_id, sctx.scenario_id, path)
 
     return {
         "success": True,
@@ -450,303 +433,3 @@ def upload_file(pctx: "ProjectContext", file_bytes: bytes) -> dict:
         "column_count": len(header),
     }
 
-
-def inspect(pctx: "ProjectContext") -> dict:
-    """Return both layers of state side-by-side so you can verify what's
-    on disk vs what's actually in PyHelios's C++ memory.
-
-    File layer always reports if the CSV exists. PyHelios layer is null
-    until PyHelios is available AND the project context has a live
-    PyHelios Context."""
-    path = _csv_path(pctx.project_id)
-
-    file_state: dict = {"exists": path.exists(), "path": str(path)}
-    if path.exists():
-        with open(path, "r", newline="", encoding="utf-8") as f:
-            all_rows = list(csv.reader(f))
-        if all_rows:
-            header = all_rows[0]
-            data = all_rows[1:]
-            file_state.update(
-                row_count=len(data),
-                column_count=len(header),
-                header=header,
-                first_rows=data[:3],
-                last_rows=data[-3:] if len(data) > 3 else [],
-            )
-
-    pyhelios_state: dict | None = None
-    if helios_ctx.PYHELIOS_AVAILABLE and pctx.context is not None:
-        try:
-            ctx = pctx.context
-            # Sample the first row's data via per-label queries — proves the
-            # values are in C++ memory, not just on disk.
-            samples: list[dict] = []
-            if path.exists() and "header" in file_state and file_state["first_rows"]:
-                header = file_state["header"]
-                first_row = file_state["first_rows"][0]
-                date_str, time_str = first_row[0], first_row[1]
-                y, mo, d = map(int, date_str.split("-"))
-                hh, mm, ss = map(int, time_str.split(":"))
-                date_obj = helios_ctx.Date(y, mo, d)
-                time_obj = helios_ctx.Time(hh, mm, ss)
-                for col_idx in range(2, len(header)):
-                    label = header[col_idx]
-                    try:
-                        val = ctx.queryTimeseriesData(label, date_obj, time_obj)
-                    except Exception as exc:
-                        val = f"<query failed: {exc}>"
-                    samples.append({
-                        "label": label,
-                        "date": date_str,
-                        "time": time_str,
-                        "value_in_pyhelios": val,
-                    })
-            pyhelios_state = {"loaded": True, "samples": samples}
-        except Exception as exc:
-            pyhelios_state = {"loaded": False, "error": str(exc)}
-    elif helios_ctx.PYHELIOS_AVAILABLE:
-        pyhelios_state = {
-            "loaded": False,
-            "reason": "project context has no PyHelios Context yet",
-        }
-
-    return {
-        "pyhelios_available": helios_ctx.PYHELIOS_AVAILABLE,
-        "file": file_state,
-        "pyhelios_state": pyhelios_state,
-    }
-
-
-def add(pctx: "ProjectContext", req: "AddRequest") -> dict:
-    """Add rows, a column, or both. Reloads PyHelios once at the end.
-
-    - Column name gets slugified (so 'Pressure (kPa)' → 'pressure_kpa').
-    - Column added FIRST when both are present so new rows can include
-      a value for the newly-added column.
-    - Each row must include 'date' and 'time'; other keys map to existing
-      header slugs. Unknown keys are silently ignored. Missing keys for
-      known columns get an empty cell.
-    - Row values for non-date/time columns must be numeric or empty.
-    - Duplicate (date, time) is rejected — both against existing rows
-      and within the batch itself.
-    """
-    if req.rows is None and req.column is None:
-        raise HTTPException(400, "must provide 'rows', 'column', or both")
-
-    path = _csv_path(pctx.project_id)
-    header, rows = _read_csv(path)
-
-    added_column_slug: str | None = None
-
-    # ── Add column first (if requested) ──────────────────────────────────
-    if req.column is not None:
-        slug = _slugify(req.column.columnname)
-        if not slug:
-            raise HTTPException(
-                400,
-                f"column name '{req.column.columnname}' is invalid "
-                "(slugifies to empty)",
-            )
-        if slug in ("date", "time"):
-            raise HTTPException(400, f"cannot add column named '{slug}'")
-        if slug in header:
-            raise HTTPException(400, f"column '{slug}' already exists")
-
-        # Validate every supplied value is numeric or empty
-        for v in req.column.values:
-            if not _is_numeric_or_empty(str(v)):
-                raise HTTPException(
-                    400, f"value '{v}' for column '{slug}' is not numeric"
-                )
-
-        header.append(slug)
-        for i, row in enumerate(rows):
-            val = str(req.column.values[i]) if i < len(req.column.values) else ""
-            row.append(val)
-        added_column_slug = slug
-
-    # ── Add rows (if requested) ──────────────────────────────────────────
-    if req.rows is not None:
-        if not req.rows:
-            raise HTTPException(400, "rows list is empty")
-
-        # Collect existing (date, time) keys for duplicate checking
-        existing_keys: set[tuple[str, str]] = set()
-        for existing in rows:
-            if len(existing) >= 2:
-                existing_keys.add((existing[0], existing[1]))
-
-        batch_keys: set[tuple[str, str]] = set()
-
-        for row_idx, row_data in enumerate(req.rows):
-            if "date" not in row_data or "time" not in row_data:
-                raise HTTPException(
-                    400, f"row {row_idx + 1} must include 'date' and 'time'"
-                )
-
-            new_date = str(row_data["date"]).strip()
-            new_time = str(row_data["time"]).strip()
-            if not new_date or not new_time:
-                raise HTTPException(
-                    400, f"row {row_idx + 1}: 'date' and 'time' cannot be empty"
-                )
-
-            key = (new_date, new_time)
-
-            # Reject if duplicate within the batch
-            if key in batch_keys:
-                raise HTTPException(
-                    400,
-                    f"duplicate row in batch: date={new_date} time={new_time}",
-                )
-
-            # Reject if duplicate against existing rows
-            if key in existing_keys:
-                raise HTTPException(
-                    400,
-                    f"row with date={new_date} time={new_time} already exists",
-                )
-
-            # Build row in column order
-            new_row: list[str] = []
-            for col in header:
-                val = str(row_data.get(col, "")).strip()
-                if col not in ("date", "time"):
-                    if not _is_numeric_or_empty(val):
-                        raise HTTPException(
-                            400,
-                            f"row {row_idx + 1}: value '{val}' for column "
-                            f"'{col}' is not numeric",
-                        )
-                new_row.append(val)
-
-            rows.append(new_row)
-            batch_keys.add(key)
-
-    _write_csv(path, header, rows)
-    _reload_pyhelios(pctx, path, header)
-
-    response: dict = {
-        "success": True,
-        "row_count": len(rows),
-        "column_count": len(header),
-    }
-    if added_column_slug is not None:
-        response["added_column"] = added_column_slug
-    return response
-
-
-def delete(pctx: "ProjectContext", req: "DeleteRequest") -> dict:
-    """Delete a row, a column, or both. Reloads PyHelios once at the end.
-
-    - Row removed FIRST when both are present — so the column index
-      doesn't shift mid-operation.
-    - Cannot delete the 'date' or 'time' column (required by PyHelios).
-    """
-    path = _csv_path(pctx.project_id)
-
-    # ── Delete entire file (no row, no column specified) ─────────────────
-    if req.row is None and req.column is None:
-        if path.exists():
-            path.unlink()
-        if helios_ctx.PYHELIOS_AVAILABLE and pctx.context is not None:
-            try:
-                pctx.context.clearTimeseriesData()
-            except Exception:
-                pass
-        return {"success": True, "row_count": 0, "column_count": 0}
-
-    header, rows = _read_csv(path)
-
-    # ── Delete row first (if requested) ──────────────────────────────────
-    if req.row is not None:
-        date = req.row.date.strip()
-        time = req.row.time.strip()
-        new_rows = [
-            r for r in rows
-            if not (len(r) >= 2 and r[0] == date and r[1] == time)
-        ]
-        if len(new_rows) == len(rows):
-            raise HTTPException(404, f"no row with date={date} time={time}")
-        rows = new_rows
-
-    # ── Delete column (if requested) ─────────────────────────────────────
-    if req.column is not None:
-        name = req.column.columnname.strip()
-        if name.lower() in ("date", "time"):
-            raise HTTPException(400, "cannot delete the 'date' or 'time' column")
-        if name not in header:
-            raise HTTPException(404, f"column '{name}' not found")
-
-        col_idx = header.index(name)
-        header = header[:col_idx] + header[col_idx + 1:]
-        rows = [r[:col_idx] + r[col_idx + 1:] for r in rows]
-
-    _write_csv(path, header, rows)
-    _reload_pyhelios(pctx, path, header)
-
-    return {
-        "success": True,
-        "row_count": len(rows),
-        "column_count": len(header),
-    }
-
-
-def update_cell(
-    pctx: "ProjectContext", req: "UpdateRequest"
-) -> dict:
-    """Update a single cell, matched by (date, time, column).
-
-    Uses the forward-compatible _sync_pyhelios_after_write helper so that
-    when PyHelios adds updateTabularTimeseriesData in a future release,
-    we automatically use the faster path. Today it falls back to the full
-    clearTimeseriesData + loadTabularTimeseriesData cycle.
-
-    Value must be numeric or empty (empty clears the cell).
-    """
-    date = req.row.date.strip()
-    time = req.row.time.strip()
-    col = req.col.strip()
-    value = req.value
-
-    if not date or not time:
-        raise HTTPException(400, "row 'date' and 'time' cannot be empty")
-    if not col:
-        raise HTTPException(400, "'col' cannot be empty")
-
-    if value.strip() != "":
-        try:
-            float(value)
-        except ValueError:
-            raise HTTPException(
-                400, f"value '{value}' for column '{col}' is not numeric"
-            )
-
-    path = _csv_path(pctx.project_id)
-    header, rows = _read_csv(path)
-
-    if col in ("date", "time"):
-        raise HTTPException(400, "cannot update the 'date' or 'time' column")
-    if col not in header:
-        raise HTTPException(404, f"column '{col}' not found")
-    col_idx = header.index(col)
-
-    matched_idx = None
-    for i, row in enumerate(rows):
-        if len(row) >= 2 and row[0] == date and row[1] == time:
-            matched_idx = i
-            break
-    if matched_idx is None:
-        raise HTTPException(404, f"no row with date={date} time={time}")
-
-    # Pad short rows defensively (shouldn't happen with our clean CSV)
-    while len(rows[matched_idx]) <= col_idx:
-        rows[matched_idx].append("")
-
-    rows[matched_idx][col_idx] = value
-
-    _write_csv(path, header, rows)
-    _sync_pyhelios_after_write(pctx, path, header)
-
-    return {"success": True}

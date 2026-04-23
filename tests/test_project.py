@@ -23,6 +23,9 @@ def test_create_project_success(client):
     assert data["longitude"] == 77.2
     assert "project_id" in data
     assert "utc_offset" in data
+    # New project auto-creates a "main" scenario
+    assert "main_scenario_id" in data
+    assert data["main_scenario_id"]
 
     # Project state must be initialized in memory under the correct session
     project_id = data["project_id"]

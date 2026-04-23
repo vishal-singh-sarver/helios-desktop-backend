@@ -19,6 +19,21 @@ def get_session_id(
     return sid
 
 
+def get_scenario_id(
+    scenario_id: str | None = Header(default=None, alias="scenario-id"),
+) -> str:
+    """
+    Validate and return the scenario_id string from the `scenario-id` header.
+
+    Use for: any endpoint that operates on a specific scenario within a
+    project (e.g. weather endpoints). The project_id still comes from the
+    URL path; this is the extra header that pins us to one scenario.
+    """
+    if not scenario_id or not scenario_id.strip():
+        raise HTTPException(400, "scenario_id header is required")
+    return scenario_id.strip()
+
+
 def get_project_context(
     session_id: str | None = Header(default=None, alias="session-id"),
     project_id: str | None = Header(default=None, alias="project-id"),

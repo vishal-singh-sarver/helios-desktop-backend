@@ -50,6 +50,21 @@ class ProjectVersion(Base):
     bytes_compressed = Column(Integer, nullable=False, default=0)
 
 
+class Scenario(Base):
+    __tablename__ = "scenarios"
+    __table_args__ = (
+        UniqueConstraint("project_id", "name"),
+    )
+
+    id                = Column(Text, primary_key=True, default=_new_id)
+    project_id        = Column(Text, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name              = Column(Text, nullable=False)
+    weather_file_path = Column(Text, nullable=True)
+    context_file_path = Column(Text, nullable=True)
+    created_at        = Column(Text, nullable=False, default=_now)
+    updated_at        = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
 class ProjectObject(Base):
     __tablename__ = "project_objects"
     __table_args__ = (

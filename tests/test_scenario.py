@@ -54,11 +54,20 @@ def _scenario_dir(project_id: str, scenario_id: str) -> Path:
 
 def _upload(client, session_id, project_id, scenario_id, csv_bytes):
     r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
-        headers={"session-id": session_id, "scenario-id": scenario_id},
+        f"/api/weather/project/{project_id}/scenario/{scenario_id}/uploadfile",
+        headers={"session-id": session_id},
         files={"file": ("t.csv", csv_bytes, "text/csv")},
     )
     assert r.status_code == 200
+
+
+def _get_all_data(client, session_id, project_id, scenario_id):
+    r = client.get(
+        f"/api/weather/project/{project_id}/scenario/{scenario_id}/getAllTimeSeriesData",
+        headers={"session-id": session_id},
+    )
+    assert r.status_code == 200
+    return r.json()
 
 
 # ─────────────────────────── Auto-creation of "main" ─────────────────────────
@@ -116,7 +125,10 @@ def test_create_scenario_empty_start(client):
         db.close()
 
 
-def test_create_scenario_forks_weather_from_source(client):
+def test_create_scenario_with_source_succeeds(client):
+    """Creating a scenario with a source_scenario_id succeeds. Weather data
+    is session-only (no disk persistence), so the fork is a DB-row fork —
+    nothing is copied to disk and the new scenario starts empty in PyHelios."""
     session_id, project_id, main_sid = _make_project(client)
     _upload(client, session_id, project_id, main_sid, CLEAN_CSV_A)
 
@@ -128,21 +140,13 @@ def test_create_scenario_forks_weather_from_source(client):
     assert r.status_code == 201
     new_sid = r.json()["scenario_id"]
 
-    # New scenario's folder has a copied weather.csv — byte-for-byte
-    # identical to the SOURCE's stored file (not the raw upload, which
-    # gets transformed/re-serialized by the upload pipeline).
-    src_csv = _scenario_dir(project_id, main_sid) / "weather.csv"
-    new_csv = _scenario_dir(project_id, new_sid) / "weather.csv"
-    assert new_csv.exists()
-    assert new_csv.read_bytes() == src_csv.read_bytes()
-
-    # DB row now has weather_file_path set
+    # The new scenario exists as its own DB row.
     db = SessionLocal()
     try:
         row = db.query(Scenario).filter(Scenario.id == new_sid).first()
         assert row is not None
-        assert row.weather_file_path is not None
-        assert "weather.csv" in row.weather_file_path
+        assert row.project_id == project_id
+        assert row.name == "fork1"
     finally:
         db.close()
 
@@ -253,7 +257,7 @@ def test_list_scenarios_wrong_session_returns_404(client):
 # ─────────────────────────── Delete scenario ─────────────────────────────────
 
 
-def test_delete_scenario_wipes_row_memory_and_disk(client):
+def test_delete_scenario_wipes_row_and_memory(client):
     session_id, project_id, main_sid = _make_project(client)
     _upload(client, session_id, project_id, main_sid, CLEAN_CSV_A)
 
@@ -263,8 +267,6 @@ def test_delete_scenario_wipes_row_memory_and_disk(client):
         headers={"session-id": session_id},
     )
     new_sid = r.json()["scenario_id"]
-    scn_dir = _scenario_dir(project_id, new_sid)
-    assert scn_dir.exists()
 
     r = client.delete(
         f"/api/project/{project_id}/scenarios/{new_sid}",
@@ -283,9 +285,6 @@ def test_delete_scenario_wipes_row_memory_and_disk(client):
     # Memory gone
     assert registry.get_scenario_context(session_id, project_id, new_sid) is None
 
-    # Disk gone
-    assert not scn_dir.exists()
-
 
 def test_delete_unknown_scenario_returns_404(client):
     session_id, project_id, _ = _make_project(client)
@@ -300,6 +299,7 @@ def test_delete_unknown_scenario_returns_404(client):
 
 
 def test_two_scenarios_have_isolated_weather_data(client):
+    """Each scenario owns its own PyHelios Context — uploads are isolated."""
     session_id, project_id, main_sid = _make_project(client)
 
     # Upload different CSVs into two scenarios
@@ -313,16 +313,12 @@ def test_two_scenarios_have_isolated_weather_data(client):
     other_sid = r.json()["scenario_id"]
     _upload(client, session_id, project_id, other_sid, CLEAN_CSV_B)
 
-    # Verify each scenario's CSV file on disk has its own data
-    main_csv = _scenario_dir(project_id, main_sid) / "weather.csv"
-    other_csv = _scenario_dir(project_id, other_sid) / "weather.csv"
-    assert main_csv.exists()
-    assert other_csv.exists()
+    # Read each scenario back through the API and verify isolation
+    main_data = _get_all_data(client, session_id, project_id, main_sid)
+    other_data = _get_all_data(client, session_id, project_id, other_sid)
 
-    main_first_data_line = main_csv.read_text(encoding="utf-8").splitlines()[1]
-    other_first_data_line = other_csv.read_text(encoding="utf-8").splitlines()[1]
-    assert main_first_data_line.startswith("2023-07-13")   # main has CSV A
-    assert other_first_data_line.startswith("2023-08-01")  # other has CSV B
+    assert main_data["rows"][0]["date"] == "2023-07-13"   # CSV A
+    assert other_data["rows"][0]["date"] == "2023-08-01"  # CSV B
 
 
 # ─────────────────────────── Cascade delete ──────────────────────────────────
@@ -359,31 +355,16 @@ def test_delete_project_cascades_to_scenarios(client):
     assert registry.get_scenario_context(session_id, project_id, main_sid) is None
     assert registry.get_scenario_context(session_id, project_id, extra_sid) is None
 
-    # Disk folder gone
-    assert not (settings.data_dir / project_id).exists()
-
 
 # ─────────────────────────── Weather endpoint auth with scenarios ────────────
-
-
-def test_weather_without_scenario_id_header_returns_400(client):
-    session_id, project_id, main_sid = _make_project(client)
-
-    r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
-        headers={"session-id": session_id},  # missing scenario-id
-        files={"file": ("t.csv", CLEAN_CSV_A, "text/csv")},
-    )
-    assert r.status_code == 400
-    assert "scenario_id" in r.text.lower()
 
 
 def test_weather_with_unknown_scenario_returns_404(client):
     session_id, project_id, _ = _make_project(client)
     bogus = uuid4().hex
     r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
-        headers={"session-id": session_id, "scenario-id": bogus},
+        f"/api/weather/project/{project_id}/scenario/{bogus}/uploadfile",
+        headers={"session-id": session_id},
         files={"file": ("t.csv", CLEAN_CSV_A, "text/csv")},
     )
     assert r.status_code == 404
@@ -392,13 +373,13 @@ def test_weather_with_unknown_scenario_returns_404(client):
 
 def test_weather_with_scenario_from_another_project_returns_404(client):
     """A scenario exists, but under a different project — should 404."""
-    session_id_a, project_a, main_sid_a = _make_project(client)
-    _, project_b, main_sid_b = _make_project(client)
+    session_id_a, project_a, _ = _make_project(client)
+    _, _, main_sid_b = _make_project(client)
 
-    # Try to use project_b's scenario with project_a's URL path
+    # Try to use project_b's scenario with project_a in the URL path
     r = client.post(
-        f"/api/weather/{project_a}/uploadfile",
-        headers={"session-id": session_id_a, "scenario-id": main_sid_b},
+        f"/api/weather/project/{project_a}/scenario/{main_sid_b}/uploadfile",
+        headers={"session-id": session_id_a},
         files={"file": ("t.csv", CLEAN_CSV_A, "text/csv")},
     )
     assert r.status_code == 404

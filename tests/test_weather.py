@@ -3,15 +3,16 @@ Tests for the weather endpoints + the auto-transform layer.
 
 Covers:
 - Unit tests for _transform_csv (CIMIS, ISO 8601, semicolon, AM/PM, fallbacks, rejections)
-- Integration tests via TestClient for upload, update, inspect
+- Integration tests via TestClient for the six weather endpoints
 - Auth / scope tests (wrong session, missing project, missing headers)
+
+URL shape (all endpoints):
+    /api/weather/project/{project_id}/scenario/{scenario_id}/<verb>
 """
-from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
-from app.core.config import settings
 from app.services.weather_service import _transform_csv
 
 
@@ -22,7 +23,7 @@ def _make_project(client) -> tuple[str, str, str]:
     """Create a project. Returns (session_id, project_id, main_scenario_id).
 
     Every new project auto-creates a 'main' scenario; weather endpoints
-    require a scenario-id header so tests always need it.
+    require a scenario in the URL path.
     """
     session_id = f"session_{uuid4().hex[:8]}"
     payload = {
@@ -40,13 +41,12 @@ def _make_project(client) -> tuple[str, str, str]:
     return session_id, body["project_id"], body["main_scenario_id"]
 
 
-def _weather_headers(session_id: str, scenario_id: str) -> dict:
-    return {"session-id": session_id, "scenario-id": scenario_id}
+def _session_headers(session_id: str) -> dict:
+    return {"session-id": session_id}
 
 
-def _csv_on_disk(project_id: str, scenario_id: str) -> Path:
-    """Path the upload endpoint writes to for a specific scenario."""
-    return settings.data_dir / project_id / scenario_id / "weather.csv"
+def _url(project_id: str, scenario_id: str, verb: str) -> str:
+    return f"/api/weather/project/{project_id}/scenario/{scenario_id}/{verb}"
 
 
 CLEAN_CSV = (
@@ -78,13 +78,11 @@ def test_transform_cimis_format():
     """Split date+HHMM, qc flag columns, Stn Name as text, '2400' rollover."""
     header, rows = _transform_csv(CIMIS_CSV)
 
-    # Text columns dropped, qc columns dropped, headers slugified
     assert header == ["date", "time", "stn_id", "eto_mm", "air_temp_c", "rel_hum"]
     assert "stn_name" not in header
     assert "cimis_region" not in header
     assert "qc" not in header
 
-    # Date + HHMM normalized
     assert rows[0][:2] == ["2023-07-13", "01:00:00"]
     assert rows[1][:2] == ["2023-07-13", "14:00:00"]
     # 2400 rolls over to next day's 00:00:00
@@ -149,7 +147,7 @@ def test_transform_rejects_no_date_column():
 
 
 def test_transform_deduplicates_by_timestamp_keeps_last():
-    """PyHelios returns NaN for duplicate timestamps. The transformer must
+    """PyHelios silently drops duplicate timestamps. The transformer must
     deduplicate, keeping the last row for each (date, time) pair."""
     raw = (
         b"date,time,temp\n"
@@ -158,8 +156,7 @@ def test_transform_deduplicates_by_timestamp_keeps_last():
         b"2023-07-13,11:00:00,23.8\n"
     )
     header, rows = _transform_csv(raw)
-    assert len(rows) == 2  # duplicate removed
-    # The LAST occurrence (99.9) should be kept, not the first (22.5)
+    assert len(rows) == 2
     assert rows[0] == ["2023-07-13", "10:00:00", "99.9"]
     assert rows[1] == ["2023-07-13", "11:00:00", "23.8"]
 
@@ -178,51 +175,39 @@ def test_transform_drops_columns_with_non_numeric_values():
 # ─────────────────────────── Upload endpoint ─────────────────────────────────
 
 
-def test_upload_clean_csv_returns_success_and_writes_file(client):
+def test_upload_clean_csv_returns_success(client):
     session_id, project_id, scenario_id = _make_project(client)
 
     r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
-        headers=_weather_headers(session_id, scenario_id),
+        _url(project_id, scenario_id, "uploadfile"),
+        headers=_session_headers(session_id),
         files={"file": ("test.csv", CLEAN_CSV, "text/csv")},
     )
 
     assert r.status_code == 200
-    body = r.json()
-    assert body == {"success": True, "row_count": 3, "column_count": 4}
-
-    # File on disk should match
-    saved = _csv_on_disk(project_id, scenario_id).read_text(encoding="utf-8").splitlines()
-    assert saved[0] == "date,time,temperature,humidity"
-    assert saved[1] == "2023-07-13,10:00:00,22.5,65"
+    assert r.json() == {"success": True, "row_count": 3, "column_count": 4}
 
 
 def test_upload_cimis_csv_gets_transformed(client):
     session_id, project_id, scenario_id = _make_project(client)
 
     r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
-        headers=_weather_headers(session_id, scenario_id),
+        _url(project_id, scenario_id, "uploadfile"),
+        headers=_session_headers(session_id),
         files={"file": ("cimis.csv", CIMIS_CSV, "text/csv")},
     )
 
     assert r.status_code == 200
-    assert r.json()["row_count"] == 3
     # CIMIS output: date, time, stn_id, eto_mm, air_temp_c, rel_hum
-    assert r.json()["column_count"] == 6
-
-    saved = _csv_on_disk(project_id, scenario_id).read_text(encoding="utf-8").splitlines()
-    assert saved[0] == "date,time,stn_id,eto_mm,air_temp_c,rel_hum"
-    # 2400 rollover landed correctly
-    assert saved[3].startswith("2023-07-14,00:00:00")
+    assert r.json() == {"success": True, "row_count": 3, "column_count": 6}
 
 
 def test_upload_empty_file_returns_400(client):
     session_id, project_id, scenario_id = _make_project(client)
 
     r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
-        headers=_weather_headers(session_id, scenario_id),
+        _url(project_id, scenario_id, "uploadfile"),
+        headers=_session_headers(session_id),
         files={"file": ("empty.csv", b"", "text/csv")},
     )
 
@@ -235,8 +220,8 @@ def test_upload_invalid_csv_format_returns_400(client):
 
     bad = b"name,value\nfoo,1\nbar,2\n"
     r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
-        headers=_weather_headers(session_id, scenario_id),
+        _url(project_id, scenario_id, "uploadfile"),
+        headers=_session_headers(session_id),
         files={"file": ("bad.csv", bad, "text/csv")},
     )
 
@@ -247,7 +232,7 @@ def test_upload_missing_session_id_header_returns_400(client):
     _, project_id, scenario_id = _make_project(client)
 
     r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
+        _url(project_id, scenario_id, "uploadfile"),
         files={"file": ("test.csv", CLEAN_CSV, "text/csv")},
     )
 
@@ -261,8 +246,8 @@ def test_upload_unknown_project_returns_404(client):
     bogus_scenario = uuid4().hex
 
     r = client.post(
-        f"/api/weather/{bogus_project}/uploadfile",
-        headers=_weather_headers(session_id, bogus_scenario),
+        _url(bogus_project, bogus_scenario, "uploadfile"),
+        headers=_session_headers(session_id),
         files={"file": ("test.csv", CLEAN_CSV, "text/csv")},
     )
 
@@ -277,10 +262,66 @@ def test_upload_with_wrong_session_returns_404(client):
     assert intruder_session != owner_session
 
     r = client.post(
-        f"/api/weather/{project_id}/uploadfile",
-        headers=_weather_headers(intruder_session, scenario_id),
+        _url(project_id, scenario_id, "uploadfile"),
+        headers=_session_headers(intruder_session),
         files={"file": ("test.csv", CLEAN_CSV, "text/csv")},
     )
 
     assert r.status_code == 404
 
+
+# ─────────────────────────── Read endpoints ──────────────────────────────────
+
+
+def test_inspect_empty_scenario(client):
+    session_id, project_id, scenario_id = _make_project(client)
+    r = client.get(
+        _url(project_id, scenario_id, "inspect"),
+        headers=_session_headers(session_id),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "pyhelios_available" in body
+    assert body["file"] == {
+        "exists": False,
+        "note": "no file — content lives in PyHelios memory only",
+    }
+
+
+def test_get_all_timeseries_data_empty_scenario(client):
+    session_id, project_id, scenario_id = _make_project(client)
+    r = client.get(
+        _url(project_id, scenario_id, "getAllTimeSeriesData"),
+        headers=_session_headers(session_id),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is True
+    assert body["rows"] == []
+    assert body["row_count"] == 0
+    assert body["total_rows"] == 0
+    assert body["labels"] == ["date", "time"]
+
+
+def test_get_all_timeseries_data_accepts_paging_params(client):
+    session_id, project_id, scenario_id = _make_project(client)
+    r = client.get(
+        _url(project_id, scenario_id, "getAllTimeSeriesData"),
+        headers=_session_headers(session_id),
+        params={"limit": 10, "offset": 5},
+    )
+    assert r.status_code == 200
+
+
+# ─────────────────────────── Delete wipe-all ─────────────────────────────────
+
+
+def test_delete_wipe_all_returns_success(client):
+    session_id, project_id, scenario_id = _make_project(client)
+    r = client.post(
+        _url(project_id, scenario_id, "delete"),
+        headers=_session_headers(session_id),
+        json={},
+    )
+    # 200 if PyHelios is available, 503 otherwise
+    assert r.status_code in (200, 503)

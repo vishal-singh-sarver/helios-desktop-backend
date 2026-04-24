@@ -1,27 +1,24 @@
-"""Weather endpoints — file-on-disk + PyHelios reload approach.
+"""Weather endpoints — session-only state (no persistence).
 
-Endpoints:
+All endpoints live under:
+    /api/weather/project/{project_id}/scenario/{scenario_id}/<verb>
 
-    POST /api/weather/{project_id}/uploadfile   multipart CSV upload
+Required header:
+    session-id    — whose session this belongs to
 
-Every request is scoped to a scenario. Required headers:
-    session-id    — who you are
-    scenario-id   — which scenario inside the project to operate on
-
-project_id is a path parameter. The CSV lives at
-backend-api/data/<project_id>/<scenario_id>/weather.csv. Every write
-reloads PyHelios from the file via clearTimeseriesData() +
-loadTabularTimeseriesData(path).
+project_id and scenario_id are URL path parameters. Every request
+routes through _resolve_scenario for auth + context lookup.
 """
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_session_id, get_scenario_id
-from app.core.session_store import registry
+from app.core.dependencies import get_session_id
 from app.core.scenario_context import ScenarioContext
+from app.core.session_store import registry
 from app.db.database import get_db
 from app.db.models import Project, Scenario
 from app.helios import context as helios_ctx
+from app.schemas.weather import AddRequest, DeleteRequest, UpdateRequest
 from app.services import weather_service
 
 router = APIRouter()
@@ -30,17 +27,14 @@ router = APIRouter()
 def _resolve_scenario(
     session_id: str, project_id: str, scenario_id: str, db: Session
 ) -> ScenarioContext:
-    """Auth + lazy rehydration for weather operations.
+    """Auth + lazy hydration for weather operations.
 
-    1. Verify the project exists in the DB and belongs to this session.
-       If not → 404.
-    2. Verify the scenario exists in the DB and belongs to the project.
-       If not → 404.
-    3. Get-or-create the in-memory ScenarioContext. If the server was
-       restarted, this rebuilds an empty context; the weather service
-       lazy-loads the CSV into PyHelios on first use.
-    4. Lazy-init the PyHelios Context if PyHelios is available and the
-       scenario context has no live handle yet.
+    1. Validate IDs are non-empty.
+    2. Confirm the project exists in the DB and belongs to this session (→ 404).
+    3. Confirm the scenario exists in the DB and belongs to the project (→ 404).
+    4. Get-or-create the in-memory ScenarioContext (fresh after restart).
+    5. If PyHelios is available and the scenario has no live Context yet,
+       create an empty one — no file hydration (weather is session-only).
     """
     pid = project_id.strip()
     sid = scenario_id.strip()
@@ -71,18 +65,86 @@ def _resolve_scenario(
     return sctx
 
 
-@router.post("/{project_id}/uploadfile")
-async def upload_file(
+# ─── Read endpoints ──────────────────────────────────────────────────────────
+
+
+@router.get("/project/{project_id}/scenario/{scenario_id}/inspect")
+def inspect(
     project_id: str,
-    file: UploadFile = File(...),
+    scenario_id: str,
     session_id: str = Depends(get_session_id),
-    scenario_id: str = Depends(get_scenario_id),
     db: Session = Depends(get_db),
 ):
-    """Upload a CSV file. Saves to disk and reloads PyHelios.
+    """Lightweight debug probe — first 3 rows + availability metadata."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.inspect(sctx)
 
-    Updates the scenario's weather_file_path column on first upload so the
-    scenario knows where its weather CSV lives."""
+
+@router.get("/project/{project_id}/scenario/{scenario_id}/getAllTimeSeriesData")
+def get_all_timeseries_data(
+    project_id: str,
+    scenario_id: str,
+    limit: int | None = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Full table read with optional paging."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.get_all_timeseries_data(sctx, limit=limit, offset=offset)
+
+
+# ─── Write endpoints ─────────────────────────────────────────────────────────
+
+
+@router.post("/project/{project_id}/scenario/{scenario_id}/uploadfile")
+async def upload_file(
+    project_id: str,
+    scenario_id: str,
+    file: UploadFile = File(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Bulk-load a CSV into PyHelios via loadTabularTimeseriesData."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
     content = await file.read()
-    return weather_service.upload_file(sctx, content, db)
+    return weather_service.upload_file(sctx, content)
+
+
+@router.post("/project/{project_id}/scenario/{scenario_id}/add")
+def add_weather(
+    project_id: str,
+    scenario_id: str,
+    body: AddRequest = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Add one column and/or any number of rows."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.add(sctx, body)
+
+
+@router.post("/project/{project_id}/scenario/{scenario_id}/update")
+def update_weather(
+    project_id: str,
+    scenario_id: str,
+    body: UpdateRequest = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Update one existing cell."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.update_cell(sctx, body)
+
+
+@router.post("/project/{project_id}/scenario/{scenario_id}/delete")
+def delete_weather(
+    project_id: str,
+    scenario_id: str,
+    body: DeleteRequest = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Delete a row, a column, or wipe everything."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.delete(sctx, body)

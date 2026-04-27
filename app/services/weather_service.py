@@ -31,6 +31,15 @@ from fastapi import HTTPException
 
 from app.helios import context as helios_ctx
 
+# PyHelios's specific exception for "thing not found" errors (missing label,
+# missing cell, etc.). Defensive import: if PyHelios isn't available, define
+# a dummy so this module can still load.
+try:
+    from pyhelios.exceptions import HeliosRuntimeError
+except ImportError:  # pragma: no cover
+    class HeliosRuntimeError(Exception):
+        pass
+
 if TYPE_CHECKING:
     from app.core.scenario_context import ScenarioContext
     from app.schemas.weather import AddRequest, DeleteRequest, UpdateRequest
@@ -40,13 +49,19 @@ if TYPE_CHECKING:
 
 
 def _helios_date_time(date_str: str, time_str: str):
-    """Parse 'YYYY-MM-DD' + 'HH:MM:SS' into PyHelios (Date, Time) objects."""
+    """Parse 'YYYY-MM-DD' + 'HH:MM:SS' into PyHelios (Date, Time) objects.
+
+    Range validation is delegated to PyHelios's Date/Time constructors —
+    we don't duplicate it. The try/except covers both string-format errors
+    (int parse fails) and PyHelios's range errors (Date/Time __init__ raises),
+    so any bad input → clean 400 instead of leaking as 500.
+    """
     try:
         y, mo, d = (int(p) for p in date_str.split("-"))
         hh, mm, ss = (int(p) for p in time_str.split(":"))
-    except (ValueError, AttributeError):
-        raise HTTPException(400, f"bad date/time: '{date_str}' '{time_str}'")
-    return helios_ctx.Date(y, mo, d), helios_ctx.Time(hh, mm, ss)
+        return helios_ctx.Date(y, mo, d), helios_ctx.Time(hh, mm, ss)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(400, f"bad date/time '{date_str}' '{time_str}': {exc}")
 
 
 def _label_has_timestamp(ctx, label: str, date_obj, time_obj) -> bool:
@@ -651,26 +666,24 @@ def update_cell(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
         raise HTTPException(503, "PyHelios not available")
     ctx = sctx.context
 
+    # Business rule — PyHelios doesn't reserve these names, we do.
     if req.col in ("date", "time"):
         raise HTTPException(400, "cannot update the date/time column")
-    if req.col not in ctx.listTimeseriesVariables():
-        raise HTTPException(404, f"column '{req.col}' not found")
-    if req.value != "" and not _is_numeric_or_empty(req.value):
-        raise HTTPException(400, f"value '{req.value}' is not numeric or empty")
 
     date_obj, time_obj = _helios_date_time(req.row.date, req.row.time)
 
-    if not _label_has_timestamp(ctx, req.col, date_obj, time_obj):
-        raise HTTPException(
-            404,
-            f"no cell at {req.row.date} {req.row.time} for column '{req.col}'",
-        )
-
-    # updateTimeseriesData signature: (label, Date, Time, new_value). Value LAST.
-    if req.value == "":
-        ctx.updateTimeseriesData(req.col, date_obj, time_obj, float("nan"))
-    else:
-        ctx.updateTimeseriesData(req.col, date_obj, time_obj, float(req.value))
+    # PyHelios validates everything else for us:
+    #   - missing column          → HeliosRuntimeError
+    #   - missing cell at (d, t)  → HeliosRuntimeError
+    #   - non-numeric value       → ValueError (from float() cast)
+    # Catch its specific exception types and convert to clean HTTP codes.
+    try:
+        new_value = float("nan") if req.value == "" else float(req.value)
+        ctx.updateTimeseriesData(req.col, date_obj, time_obj, new_value)
+    except ValueError as exc:
+        raise HTTPException(400, f"value '{req.value}' is not numeric: {exc}")
+    except HeliosRuntimeError as exc:
+        raise HTTPException(404, str(exc))
 
     return {"success": True}
 
@@ -710,15 +723,21 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest") -> dict:
     # STEP B — clear one column
     if req.column is not None:
         name = req.column.columnname
+        # Business rule — PyHelios doesn't reserve these names, we do.
         if name in ("date", "time"):
             raise HTTPException(400, "cannot delete the date/time column")
-        if name not in ctx.listTimeseriesVariables():
-            raise HTTPException(404, f"column '{name}' not found")
-        n = ctx.getTimeseriesLength(name)
-        for i in range(n):
-            date_obj = ctx.queryTimeseriesDate(name, i)
-            time_obj = ctx.queryTimeseriesTime(name, i)
-            ctx.updateTimeseriesData(name, date_obj, time_obj, float("nan"))
+
+        # PyHelios validates: getTimeseriesLength raises HeliosRuntimeError on
+        # missing label. The remaining loop is safe — date/time come from
+        # PyHelios's own data, so updateTimeseriesData won't error per cell.
+        try:
+            n = ctx.getTimeseriesLength(name)
+            for i in range(n):
+                date_obj = ctx.queryTimeseriesDate(name, i)
+                time_obj = ctx.queryTimeseriesTime(name, i)
+                ctx.updateTimeseriesData(name, date_obj, time_obj, float("nan"))
+        except HeliosRuntimeError as exc:
+            raise HTTPException(404, str(exc))
 
     labels_after = list(ctx.listTimeseriesVariables())
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0

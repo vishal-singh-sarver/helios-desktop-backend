@@ -325,3 +325,307 @@ def test_delete_wipe_all_returns_success(client):
     )
     # 200 if PyHelios is available, 503 otherwise
     assert r.status_code in (200, 503)
+
+
+# ─────────────────────────── /add — column branch ────────────────────────────
+#
+# New column flow (doc Section 3.2):
+#   - body.column is a LIST of {name, datatype, data_unit, values:[{date,time,value}]}
+#   - Each column persists a row in `weather_data_headers` AND writes its cells
+#     into PyHelios under label = str(header.id).
+#   - Single transaction wraps all N columns; partial failure rolls back.
+#   - Empty list -> 400. Duplicate names in body -> 422. Existing name -> 409.
+
+
+def _make_data_type(client) -> int:
+    r = client.post("/api/data-types/", json={"data_type": f"T_{uuid4().hex[:8]}"})
+    assert r.status_code == 201, r.text
+    return r.json()["data_type"]["id"]
+
+
+def _make_data_unit(client, data_type_id: int) -> int:
+    r = client.post(
+        "/api/data-units/",
+        json={"unit": f"u_{uuid4().hex[:8]}", "data_type_id": data_type_id},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["data_unit"]["id"]
+
+
+def _headers_url(project_id: str, scenario_id: str) -> str:
+    return f"/api/weather/project/{project_id}/scenario/{scenario_id}/weather_data_header"
+
+
+def test_add_single_column_returns_id_and_persists_header(client):
+    """One column wrapped in [...] -> 200 with columns:[{id,name,...}], header
+    visible via GET /weather_data_header, cells under label str(id)."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temp",
+            "datatype": dt,
+            "data_unit": u,
+            "values": [
+                {"date": "2024-01-01", "time": "10:00:00", "value": "20.5"},
+                {"date": "2024-01-01", "time": "11:00:00", "value": "21.0"},
+            ],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert len(body["columns"]) == 1
+    col = body["columns"][0]
+    assert col["name"] == "temp"
+    assert col["datatype_id"] == dt
+    assert col["data_unit_id"] == u
+    assert isinstance(col["id"], int)
+
+    # Header is now visible in the per-scenario header set.
+    r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
+    assert r.status_code == 200
+    names = [h["name"] for h in r.json()["headers"]]
+    assert "temp" in names
+
+    # PyHelios stores the cells under str(header.id), NOT the user-facing name.
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    assert r.status_code == 200
+    labels = r.json()["labels"]
+    assert str(col["id"]) in labels
+    assert "temp" not in labels  # user name is not the storage key
+
+
+def test_add_multi_column_persists_all_in_order(client):
+    """Multi-column add is one atomic call. display_order monotonic."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u1 = _make_data_unit(client, dt)
+    u2 = _make_data_unit(client, dt)
+
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "a", "datatype": dt, "data_unit": u1, "values": []},
+            {"name": "b", "datatype": dt, "data_unit": u2, "values": []},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    cols = r.json()["columns"]
+    assert [c["name"] for c in cols] == ["a", "b"]
+
+    # Display order in the header set is incremental.
+    r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
+    headers = r.json()["headers"]
+    by_name = {h["name"]: h for h in headers}
+    assert by_name["a"]["display_order"] < by_name["b"]["display_order"]
+
+
+def test_add_column_with_null_metadata_persists_header_anyway(client):
+    """datatype/data_unit are optional. Column still persists with NULL FKs —
+    used when the frontend adds a column before the user has chosen its
+    catalog mapping."""
+    sid, pid, scn = _make_project(client)
+
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "raw", "values": []}]},
+    )
+    assert r.status_code == 200, r.text
+    col = r.json()["columns"][0]
+    assert col["datatype_id"] is None
+    assert col["data_unit_id"] is None
+
+
+def test_add_empty_column_list_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": []},
+    )
+    assert r.status_code == 400
+
+
+def test_add_duplicate_names_in_body_returns_422(client):
+    """Pydantic _no_dup_column_names validator catches this before the service."""
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "dup", "values": []},
+            {"name": "dup", "values": []},
+        ]},
+    )
+    assert r.status_code == 422
+
+
+def test_add_existing_column_name_returns_409(client):
+    """Adding a column whose name collides with an existing header -> 409."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "temp", "datatype": dt, "data_unit": u, "values": []}]},
+    )
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "temp", "datatype": dt, "data_unit": u, "values": []}]},
+    )
+    assert r.status_code == 409
+    assert "already exists" in r.json()["detail"].lower()
+
+
+def test_add_reserved_name_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "date", "values": []}]},
+    )
+    assert r.status_code == 400
+    assert "reserved" in r.json()["detail"].lower()
+
+
+def test_add_unknown_datatype_returns_404(client):
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "x", "datatype": 99999999, "data_unit": u, "values": []
+        }]},
+    )
+    assert r.status_code == 404
+
+
+def test_add_unknown_data_unit_returns_404(client):
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "x", "datatype": dt, "data_unit": 99999999, "values": []
+        }]},
+    )
+    assert r.status_code == 404
+
+
+def test_add_unit_does_not_belong_to_datatype_returns_400(client):
+    """Service-level invariant: data_unit.data_type_id must equal datatype."""
+    sid, pid, scn = _make_project(client)
+    dt1 = _make_data_type(client)
+    dt2 = _make_data_type(client)
+    u_of_dt2 = _make_data_unit(client, dt2)
+
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "x", "datatype": dt1, "data_unit": u_of_dt2, "values": []
+        }]},
+    )
+    assert r.status_code == 400
+    assert "belongs to" in r.json()["detail"].lower()
+
+
+def test_add_partial_failure_rolls_back_first_column(client):
+    """If column[1] fails validation, column[0] must NOT be persisted —
+    transaction is all-or-nothing."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # First call: install one valid column so we have something to compare against.
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "preexisting", "datatype": dt, "data_unit": u, "values": []}]},
+    )
+    assert r.status_code == 200
+
+    # Second call: column[0] is fine, column[1] has unknown datatype -> whole call fails.
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "good", "datatype": dt, "data_unit": u, "values": []},
+            {"name": "bad",  "datatype": 99999999, "data_unit": u, "values": []},
+        ]},
+    )
+    assert r.status_code == 404
+
+    # Neither "good" nor "bad" must exist; only "preexisting" survives.
+    r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
+    names = [h["name"] for h in r.json()["headers"]]
+    assert names == ["preexisting"]
+
+
+def test_add_bad_value_format_returns_400_and_does_not_persist(client):
+    """A malformed cell in the values array fails the whole add."""
+    sid, pid, scn = _make_project(client)
+
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "x",
+            "values": [
+                {"date": "not-a-date", "time": "10:00:00", "value": "1.0"},
+            ],
+        }]},
+    )
+    assert r.status_code == 400
+
+    # No header was created.
+    r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
+    assert "x" not in [h["name"] for h in r.json()["headers"]]
+
+
+def test_add_empty_values_creates_column_with_no_cells(client):
+    """A column with values:[] is legal — the metadata row is the point."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    r = client.post(
+        _url(pid, scn, "add"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "metadata_only", "datatype": dt, "data_unit": u, "values": []
+        }]},
+    )
+    assert r.status_code == 200, r.text
+
+    # Cells: PyHelios still sees a label (column exists) but its length is 0.
+    col_id = r.json()["columns"][0]["id"]
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    body = r.json()
+    # The label exists either way; row_count for an empty column is 0.
+    # PyHelios may not register a label until the first cell is written.
+    # Either way, no rows were appended.
+    assert body["row_count"] == 0
+    # Sanity: header row exists.
+    assert col_id in [h["id"] for h in
+                      client.get(_headers_url(pid, scn),
+                                 headers=_session_headers(sid)).json()["headers"]]

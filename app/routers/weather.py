@@ -15,7 +15,8 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import get_session_id
 from app.db.database import get_db
 from app.schemas.weather import AddRequest, DeleteRequest, UpdateRequest
-from app.services import weather_service
+from app.schemas.weather_header import WeatherDataHeaderReplaceRequest
+from app.services import weather_header_service, weather_service
 from app.services.scenario_service import _resolve_scenario
 
 router = APIRouter()
@@ -77,7 +78,7 @@ def add_weather(
 ):
     """Add one column and/or any number of rows."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.add(sctx, body)
+    return weather_service.add(sctx, body, db)
 
 
 @router.post("/project/{project_id}/scenario/{scenario_id}/update")
@@ -104,3 +105,43 @@ def delete_weather(
     """Delete a row, a column, or wipe everything."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
     return weather_service.delete(sctx, body)
+
+
+# ─── Per-scenario weather header mapping ────────────────────────────────────
+
+
+@router.get("/project/{project_id}/scenario/{scenario_id}/weather_data_header")
+def get_weather_data_header(
+    project_id: str,
+    scenario_id: str,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Return this scenario's CSV-column-to-(data_type, unit) mapping."""
+    return weather_header_service.get_headers(session_id, project_id, scenario_id, db)
+
+
+@router.put("/project/{project_id}/scenario/{scenario_id}/weather_data_header")
+def replace_weather_data_header(
+    project_id: str,
+    scenario_id: str,
+    body: WeatherDataHeaderReplaceRequest = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Atomically replace the scenario's header set. Empty list clears it."""
+    items = [h.model_dump() for h in body.headers]
+    return weather_header_service.replace_headers(
+        session_id, project_id, scenario_id, items, db
+    )
+
+
+@router.delete("/project/{project_id}/scenario/{scenario_id}/weather_data_header")
+def clear_weather_data_header(
+    project_id: str,
+    scenario_id: str,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Remove all headers for the scenario. Returns the count removed."""
+    return weather_header_service.clear_headers(session_id, project_id, scenario_id, db)

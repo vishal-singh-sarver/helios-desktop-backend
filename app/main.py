@@ -17,6 +17,8 @@ from app.routers import (
     weather,
     import_export,
     scripting,
+    helios_data_type,
+    data_unit,
 )
 
 app = FastAPI(
@@ -56,3 +58,5 @@ app.include_router(timeseries.router,    prefix="/api/timeseries", tags=["timese
 app.include_router(weather.router,       prefix="/api/weather",    tags=["weather"])
 app.include_router(import_export.router, prefix="/api",            tags=["import"])
 app.include_router(scripting.router,     prefix="/api/script",     tags=["scripting"])
+app.include_router(helios_data_type.router, prefix="/api/data-types", tags=["catalog"])
+app.include_router(data_unit.router,        prefix="/api/data-units", tags=["catalog"])

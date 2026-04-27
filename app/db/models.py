@@ -79,3 +79,67 @@ class ProjectObject(Base):
     type            = Column(Text, nullable=False)
     primitive_uuids = Column(Text, nullable=False, default="[]")   # JSON
     children        = Column(Text, nullable=False, default="[]")   # JSON
+
+
+class HeliosDataType(Base):
+    """Master-data: a kind of measurement (Temperature, Humidity, ...). Global, not session-scoped."""
+    __tablename__ = "helios_data_types"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    data_type   = Column(Text, nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    created_at  = Column(Text, nullable=False, default=_now)
+    updated_at  = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class DataUnit(Base):
+    """Master-data: a unit belonging to one data type (Celsius → Temperature). Optional min/max range."""
+    __tablename__ = "data_units"
+    __table_args__ = (
+        UniqueConstraint("data_type_id", "unit"),
+    )
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    unit         = Column(Text, nullable=False)
+    alias        = Column(Text, nullable=True)
+    data_type_id = Column(
+        Integer,
+        ForeignKey("helios_data_types.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    min          = Column(Float, nullable=True)
+    max          = Column(Float, nullable=True)
+    created_at   = Column(Text, nullable=False, default=_now)
+    updated_at   = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class WeatherDataHeader(Base):
+    """Per-scenario: maps a CSV column name to a (data_type, unit) from the catalog."""
+    __tablename__ = "weather_data_headers"
+    __table_args__ = (
+        UniqueConstraint("scenario_id", "name"),
+    )
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    scenario_id         = Column(
+        Text,
+        ForeignKey("scenarios.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    helios_data_type_id = Column(
+        Integer,
+        ForeignKey("helios_data_types.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    unit_id             = Column(
+        Integer,
+        ForeignKey("data_units.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    name                = Column(Text, nullable=False)
+    status              = Column(Integer, nullable=False, default=1)
+    display_order       = Column(Integer, nullable=False, default=0)
+    created_at          = Column(Text, nullable=False, default=_now)
+    updated_at          = Column(Text, nullable=False, default=_now, onupdate=_now)

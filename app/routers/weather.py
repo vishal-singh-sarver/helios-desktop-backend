@@ -9,60 +9,16 @@ Required header:
 project_id and scenario_id are URL path parameters. Every request
 routes through _resolve_scenario for auth + context lookup.
 """
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_session_id
-from app.core.scenario_context import ScenarioContext
-from app.core.session_store import registry
 from app.db.database import get_db
-from app.db.models import Project, Scenario
-from app.helios import context as helios_ctx
 from app.schemas.weather import AddRequest, DeleteRequest, UpdateRequest
 from app.services import weather_service
+from app.services.scenario_service import _resolve_scenario
 
 router = APIRouter()
-
-
-def _resolve_scenario(
-    session_id: str, project_id: str, scenario_id: str, db: Session
-) -> ScenarioContext:
-    """Auth + lazy hydration for weather operations.
-
-    1. Validate IDs are non-empty.
-    2. Confirm the project exists in the DB and belongs to this session (→ 404).
-    3. Confirm the scenario exists in the DB and belongs to the project (→ 404).
-    4. Get-or-create the in-memory ScenarioContext (fresh after restart).
-    5. If PyHelios is available and the scenario has no live Context yet,
-       create an empty one — no file hydration (weather is session-only).
-    """
-    pid = project_id.strip()
-    sid = scenario_id.strip()
-    if not pid:
-        raise HTTPException(400, "project_id is required")
-    if not sid:
-        raise HTTPException(400, "scenario_id is required")
-
-    project = (
-        db.query(Project)
-        .filter(Project.id == pid, Project.session_id == session_id)
-        .first()
-    )
-    if project is None:
-        raise HTTPException(404, f"Project {pid} not found")
-
-    scenario = (
-        db.query(Scenario)
-        .filter(Scenario.id == sid, Scenario.project_id == pid)
-        .first()
-    )
-    if scenario is None:
-        raise HTTPException(404, f"Scenario {sid} not found in this project")
-
-    sctx = registry.get_or_create_scenario_context(session_id, pid, sid)
-    if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
-        sctx.context = helios_ctx.Context()
-    return sctx
 
 
 # ─── Read endpoints ──────────────────────────────────────────────────────────

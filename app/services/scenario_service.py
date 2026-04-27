@@ -19,8 +19,10 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.scenario_context import ScenarioContext
 from app.core.session_store import registry
 from app.db.models import Project, Scenario
+from app.helios import context as helios_ctx
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -43,6 +45,41 @@ def _assert_project_owned(
     if project is None:
         raise HTTPException(404, f"Project {project_id} not found")
     return project
+
+
+def _resolve_scenario(
+    session_id: str, project_id: str, scenario_id: str, db: Session
+) -> ScenarioContext:
+    """Auth + lazy hydration for any endpoint scoped to a scenario.
+
+    1. Validate IDs are non-empty.
+    2. Confirm the project exists in the DB and belongs to this session (→ 404).
+    3. Confirm the scenario exists in the DB and belongs to the project (→ 404).
+    4. Get-or-create the in-memory ScenarioContext (fresh after restart).
+    5. If PyHelios is available and the scenario has no live Context yet,
+       create an empty one — no file hydration (weather is session-only).
+    """
+    pid = project_id.strip()
+    sid = scenario_id.strip()
+    if not pid:
+        raise HTTPException(400, "project_id is required")
+    if not sid:
+        raise HTTPException(400, "scenario_id is required")
+
+    _assert_project_owned(db, session_id, pid)
+
+    scenario = (
+        db.query(Scenario)
+        .filter(Scenario.id == sid, Scenario.project_id == pid)
+        .first()
+    )
+    if scenario is None:
+        raise HTTPException(404, f"Scenario {sid} not found in this project")
+
+    sctx = registry.get_or_create_scenario_context(session_id, pid, sid)
+    if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
+        sctx.context = helios_ctx.Context()
+    return sctx
 
 
 # ─── Endpoint handlers ───────────────────────────────────────────────────────

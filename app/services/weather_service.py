@@ -25,7 +25,6 @@ import math
 import os
 import tempfile
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException
@@ -90,37 +89,12 @@ def _is_numeric_value(v: Any) -> bool:
 
 
 _DATE_FORMATS = [
-    "%Y-%m-%d",    # 2023-07-13
-    "%m/%d/%Y",    # 7/13/2023   (US-style — tried before D/M to favor CIMIS)
-    "%d/%m/%Y",    # 13/7/2023
-    "%Y/%m/%d",    # 2023/7/13
-    "%d-%m-%Y",    # 13-07-2023
-    "%m-%d-%Y",    # 07-13-2023
-    "%Y%m%d",      # 20230713
-    "%d-%b-%Y",    # 13-Jul-2023
-    "%d %b %Y",    # 13 Jul 2023
-    "%b %d %Y",    # Jul 13 2023
-    "%b %d, %Y",   # Jul 13, 2023
-    "%d %B %Y",    # 13 July 2023
-    "%B %d %Y",    # July 13 2023
-    "%B %d, %Y",   # July 13, 2023
-    "%Y-%b-%d",    # 2023-Jul-13
+    "%Y-%m-%d",    # 2023-07-13   (canonical / clean CSV)
+    "%m/%d/%Y",    # 7/13/2023    (CIMIS)
 ]
 
 _DATETIME_FORMATS = [
-    "%Y-%m-%dT%H:%M:%SZ",        # 2023-07-13T10:00:00Z (ISO 8601 UTC)
-    "%Y-%m-%dT%H:%M:%S",         # 2023-07-13T10:00:00
-    "%Y-%m-%dT%H:%M",            # 2023-07-13T10:00
-    "%Y-%m-%d %H:%M:%S",         # 2023-07-13 10:00:00
-    "%Y-%m-%d %H:%M",            # 2023-07-13 10:00
-    "%m/%d/%Y %H:%M:%S",         # 7/13/2023 10:00:00
-    "%m/%d/%Y %H:%M",            # 7/13/2023 10:00
-    "%m/%d/%Y %I:%M:%S %p",      # 7/13/2023 10:00:00 AM
-    "%m/%d/%Y %I:%M %p",         # 7/13/2023 10:00 AM
-    "%d/%m/%Y %H:%M:%S",         # 13/7/2023 10:00:00
-    "%d/%m/%Y %H:%M",            # 13/7/2023 10:00
-    "%Y%m%d%H%M%S",              # 20230713100000
-    "%Y%m%d%H%M",                # 202307131000 (Ameriflux TIMESTAMP_START)
+    "%Y-%m-%dT%H:%M:%SZ",  # 2023-07-13T10:00:00Z (ISO 8601 UTC)
 ]
 
 

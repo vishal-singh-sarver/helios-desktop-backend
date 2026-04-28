@@ -697,6 +697,40 @@ def test_addrow_against_empty_addcol_no_seed_required(client):
     assert body["column_count"] == 3   # date + time + 1 SQL header
 
 
+def test_addcol_and_addrow_accept_hhmm_time_format(client):
+    """Time strings without seconds (HH:MM) are normalized to HH:MM:00.
+    Browser <input type="time"> emits HH:MM by default; CIMIS and many
+    weather feeds also use it."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # /addCol with HH:MM time in the seed cell
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temp",
+            "datatype": dt,
+            "data_unit": u,
+            "values": [{"date": "2024-01-01", "time": "10:00", "value": "20.0"}],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    col_id = r.json()["columns"][0]["id"]
+
+    # /addRow with HH:MM time
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "11:00", str(col_id): "21.0"},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["added_rows"] == 1
+
+
 def test_addrow_ignores_headers_named_date_or_time(client):
     """The bulk PUT /weather_data_header doesn't enforce the reserved-name
     rule. If a header named 'date' or 'time' slipped in, /addRow must

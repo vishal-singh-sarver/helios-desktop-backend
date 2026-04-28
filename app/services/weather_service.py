@@ -51,16 +51,22 @@ if TYPE_CHECKING:
 
 
 def _helios_date_time(date_str: str, time_str: str):
-    """Parse 'YYYY-MM-DD' + 'HH:MM:SS' into PyHelios (Date, Time) objects.
+    """Parse 'YYYY-MM-DD' + 'HH:MM[:SS]' into PyHelios (Date, Time) objects.
+
+    Time accepts both `HH:MM` (browser <input type="time">, CIMIS, partial
+    ISO) and `HH:MM:SS`. Missing seconds default to 0.
 
     Range validation is delegated to PyHelios's Date/Time constructors —
     we don't duplicate it. The try/except covers both string-format errors
-    (int parse fails) and PyHelios's range errors (Date/Time __init__ raises),
-    so any bad input → clean 400 instead of leaking as 500.
+    (int parse fails / wrong arity) and PyHelios's range errors (Date/Time
+    __init__ raises), so any bad input → clean 400 instead of leaking as 500.
     """
     try:
         y, mo, d = (int(p) for p in date_str.split("-"))
-        hh, mm, ss = (int(p) for p in time_str.split(":"))
+        time_parts = time_str.split(":")
+        if len(time_parts) == 2:
+            time_parts = (*time_parts, "0")
+        hh, mm, ss = (int(p) for p in time_parts)
         return helios_ctx.Date(y, mo, d), helios_ctx.Time(hh, mm, ss)
     except (ValueError, AttributeError) as exc:
         raise HTTPException(400, f"bad date/time '{date_str}' '{time_str}': {exc}")

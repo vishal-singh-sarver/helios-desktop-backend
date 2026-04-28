@@ -641,11 +641,13 @@ def test_add_empty_values_creates_column_with_no_cells(client):
 
 
 def _add_one_column(client, sid, pid, scn) -> tuple[int, int]:
-    """Install two columns and seed each with one cell so PyHelios registers
-    their labels. Without a seed, PyHelios doesn't expose the label and the
-    row branch's label-set check would reject any subsequent /addRow.
+    """Install two columns with a seed cell each. The seed timestamp lets
+    tests that assert row_count have a known starting baseline. Returns
+    the two header ids; PyHelios cells live under str(id).
 
-    Returns the two header ids; cells live under str(id)."""
+    Note: the SEED is only needed for tests that check row_count. /addRow
+    works against empty-addCol columns too — see
+    test_addrow_against_empty_addcol_no_seed_required for that case."""
     dt = _make_data_type(client)
     u = _make_data_unit(client, dt)
     seed = [{"date": "2023-01-01", "time": "00:00:00", "value": "0"}]
@@ -660,6 +662,39 @@ def _add_one_column(client, sid, pid, scn) -> tuple[int, int]:
     assert r.status_code == 200, r.text
     cols = r.json()["columns"]
     return cols[0]["id"], cols[1]["id"]
+
+
+def test_addrow_against_empty_addcol_no_seed_required(client):
+    """A column added via /addCol with values=[] must still be a legal
+    /addRow target — the SQL header drives the label set, not PyHelios's
+    listTimeseriesVariables()."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # /addCol with no values: SQL header exists, PyHelios has no label yet
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "empty_col", "datatype": dt, "data_unit": u, "values": []},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    col_id = r.json()["columns"][0]["id"]
+
+    # /addRow that references it must succeed
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(col_id): "42.0"},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["added_rows"] == 1
+    assert body["column_count"] == 3   # date + time + 1 SQL header
 
 
 def test_addrow_single_row_appends_to_pyhelios(client):

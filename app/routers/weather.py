@@ -99,7 +99,7 @@ def add_rows(
 ):
     """Append rows to the timeseries table — PyHelios-only, no SQL writes."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.add_rows(sctx, body.rows)
+    return weather_service.add_rows(sctx, body.rows, db)
 
 
 @router.post("/project/{project_id}/scenario/{scenario_id}/update")

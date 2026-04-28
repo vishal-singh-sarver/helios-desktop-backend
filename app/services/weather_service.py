@@ -717,26 +717,45 @@ def add_columns(
     return {"success": True, "columns": created_columns}
 
 
-def add_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]]) -> dict:
+def add_rows(
+    sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session
+) -> dict:
     """Append rows to the timeseries table.
 
-    Each row must include `date` + `time` and exactly the set of currently
-    registered PyHelios labels (the `str(header.id)` values).
+    Each row must include `date` + `time` and exactly the set of header
+    ids (stringified) registered in `weather_data_headers` for this
+    scenario. SQL is the source of truth for "which columns this scenario
+    has" — that lets a column added via /addCol with values=[] be a legal
+    /addRow target before any PyHelios cell exists for it.
+
+    Trade-off: labels that exist in PyHelios but NOT in SQL — e.g.
+    CSV-column names registered via /uploadfile — are not valid /addRow
+    targets. Those flows write rows through their own paths.
 
     PyHelios silently drops duplicate timestamps, so we reject duplicates
-    upfront (both within the batch and against existing rows). No SQL
-    writes here — rows live entirely in PyHelios.
+    upfront (both within the batch and against existing rows).
     """
     if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
         raise HTTPException(503, "PyHelios not available")
 
     ctx = sctx.context
 
-    # ── Snapshot existing labels + timestamps for validation ──
-    existing_labels = list(ctx.listTimeseriesVariables())
+    # ── Label set from SQL: every header id (str) for this scenario ──
+    header_ids = [
+        row[0]
+        for row in db.query(WeatherDataHeader.id)
+        .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
+        .all()
+    ]
+    existing_label_set = {str(hid) for hid in header_ids}
+
+    # ── Existing timestamps still come from PyHelios (SQL doesn't track
+    # row timestamps). We can only anchor on a label PyHelios actually
+    # has registered — empty-addCol headers have no cells yet. ──
+    pyhelios_labels = list(ctx.listTimeseriesVariables())
     existing_timestamps: list[tuple[Any, Any]] = []
-    if existing_labels:
-        anchor = existing_labels[0]
+    if pyhelios_labels:
+        anchor = pyhelios_labels[0]
         n = ctx.getTimeseriesLength(anchor)
         for i in range(n):
             existing_timestamps.append(
@@ -748,7 +767,6 @@ def add_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]]) -> dict:
     existing_timestamp_keys = {
         (str(d), str(t)) for d, t in existing_timestamps
     }
-    existing_label_set = set(existing_labels)
 
     # ── Validation ──
     batch_keys: set[tuple[str, str]] = set()
@@ -798,7 +816,7 @@ def add_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]]) -> dict:
     return {
         "success": True,
         "row_count": len(existing_timestamps) + len(rows),
-        "column_count": 2 + len(ctx.listTimeseriesVariables()),
+        "column_count": 2 + len(existing_label_set),
         "added_rows": added_rows,
     }
 

@@ -24,7 +24,7 @@ from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
 from app.services.scenario_service import _resolve_scenario
 
 
-def _serialize(row: WeatherDataHeader) -> dict:
+def serialize(row: WeatherDataHeader) -> dict:
     return {
         "id": row.id,
         "scenario_id": row.scenario_id,
@@ -53,7 +53,7 @@ def get_headers(
     return {
         "success": True,
         "count": len(rows),
-        "headers": [_serialize(r) for r in rows],
+        "headers": [serialize(r) for r in rows],
     }
 
 
@@ -120,7 +120,7 @@ def replace_headers(
     return {
         "success": True,
         "count": len(rows),
-        "headers": [_serialize(r) for r in rows],
+        "headers": [serialize(r) for r in rows],
     }
 
 
@@ -312,4 +312,4 @@ def update_header(
         db.rollback()
         raise HTTPException(500, "Failed to update header")
 
-    return {"success": True, "header": _serialize(row)}
+    return {"success": True, "header": serialize(row)}

@@ -3,11 +3,12 @@ from sqlalchemy import func
 from fastapi import HTTPException
 import shutil
 
-from app.db.models import Project, Scenario
+from app.db.models import Project, Scenario, WeatherDataHeader
 from app.core.timezone import utc_offset_from_coords
 from app.core.session_store import registry
 from app.core.config import settings
 from app.helios import context as helios_ctx
+from app.services.weather_header_service import serialize as serialize_header
 
 
 def create_project(session_id: str, name: str, latitude: float,
@@ -67,6 +68,70 @@ def create_project(session_id: str, name: str, latitude: float,
         "longitude": longitude,
         "utc_offset": utc_offset,
         "session_id": session_id,
+    }
+
+
+def get_project_with_scenarios(
+    session_id: str, project_id: str, db: Session
+) -> dict:
+    """Fetch a project + every scenario + each scenario's weather headers.
+
+    Two-level deep tree for the frontend's "project overview" view. Three
+    flat queries (project, scenarios, headers) grouped in Python — avoids
+    the N+1 of one-query-per-scenario without paying for a JOIN that
+    explodes one row per (scenario, header) pair.
+
+    Auth follows the rest of project_service: a project that doesn't
+    belong to the calling session returns 404, never 403.
+    """
+    project = (
+        db.query(Project)
+        .filter(Project.id == project_id, Project.session_id == session_id)
+        .first()
+    )
+    if project is None:
+        raise HTTPException(404, f"Project {project_id} not found")
+
+    scenarios = (
+        db.query(Scenario)
+        .filter(Scenario.project_id == project_id)
+        .order_by(Scenario.created_at.asc())
+        .all()
+    )
+
+    scenario_ids = [s.id for s in scenarios]
+    headers_by_scenario: dict[str, list[dict]] = {}
+    if scenario_ids:
+        header_rows = (
+            db.query(WeatherDataHeader)
+            .filter(WeatherDataHeader.scenario_id.in_(scenario_ids))
+            .order_by(WeatherDataHeader.display_order.asc())
+            .all()
+        )
+        for h in header_rows:
+            headers_by_scenario.setdefault(h.scenario_id, []).append(serialize_header(h))
+
+    return {
+        "project": {
+            "id": project.id,
+            "name": project.name,
+            "latitude": project.latitude,
+            "longitude": project.longitude,
+            "utc_offset": project.utc_offset,
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+            "scenarios": [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "has_weather": bool(s.weather_file_path),
+                    "created_at": s.created_at,
+                    "updated_at": s.updated_at,
+                    "weather_data_headers": headers_by_scenario.get(s.id, []),
+                }
+                for s in scenarios
+            ],
+        }
     }
 
 

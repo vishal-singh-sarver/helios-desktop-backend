@@ -128,16 +128,16 @@ def delete_weather(
     return weather_service.delete(sctx, body)
 
 
-@router.post("/project/{project_id}/scenario/{scenario_id}/wipe")
-def wipe_weather(
+@router.delete("/project/{project_id}/scenario/{scenario_id}/clear_data")
+def clear_weather_data(
     project_id: str,
     scenario_id: str,
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    """Wipe everything: SQL weather_data_headers + PyHelios timeseries data."""
+    """Clear everything: SQL weather_data_headers + PyHelios timeseries data."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.wipe(sctx, db)
+    return weather_service.clear_data(sctx, db)
 
 
 # ─── Per-scenario weather header mapping ────────────────────────────────────

@@ -327,12 +327,12 @@ def test_delete_wipe_all_returns_success(client):
     assert r.status_code in (200, 503)
 
 
-# ─────────────────────────── /wipe — clear both stores ──────────────────────
+# ─────────────────────────── /clear_data — clear both stores ────────────────
 
 
-def test_wipe_clears_headers_and_pyhelios(client):
-    """POST /wipe deletes every weather_data_headers row for the scenario
-    AND clears PyHelios timeseries data. After: no headers, no rows."""
+def test_clear_data_clears_headers_and_pyhelios(client):
+    """DELETE /clear_data removes every weather_data_headers row for the
+    scenario AND clears PyHelios timeseries data. After: no headers, no rows."""
     sid, pid, scn = _make_project(client)
     dt = _make_data_type(client)
     u = _make_data_unit(client, dt)
@@ -353,8 +353,8 @@ def test_wipe_clears_headers_and_pyhelios(client):
     r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
     assert r.json()["count"] == 2
 
-    # Wipe
-    r = client.post(_url(pid, scn, "wipe"), headers=_session_headers(sid))
+    # Clear
+    r = client.delete(_url(pid, scn, "clear_data"), headers=_session_headers(sid))
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["success"] is True
@@ -374,10 +374,10 @@ def test_wipe_clears_headers_and_pyhelios(client):
     assert r.json()["row_count"] == 0
 
 
-def test_wipe_on_empty_scenario_returns_zero(client):
-    """Wiping a scenario that has nothing is a clean no-op."""
+def test_clear_data_on_empty_scenario_returns_zero(client):
+    """Clearing a scenario that has nothing is a clean no-op."""
     sid, pid, scn = _make_project(client)
-    r = client.post(_url(pid, scn, "wipe"), headers=_session_headers(sid))
+    r = client.delete(_url(pid, scn, "clear_data"), headers=_session_headers(sid))
     assert r.status_code == 200
     assert r.json() == {
         "success": True,
@@ -387,25 +387,25 @@ def test_wipe_on_empty_scenario_returns_zero(client):
     }
 
 
-def test_wipe_unknown_scenario_returns_404(client):
+def test_clear_data_unknown_scenario_returns_404(client):
     sid = f"session_{uuid4().hex[:8]}"
-    r = client.post(
-        f"/api/weather/project/{uuid4().hex}/scenario/{uuid4().hex}/wipe",
+    r = client.delete(
+        f"/api/weather/project/{uuid4().hex}/scenario/{uuid4().hex}/clear_data",
         headers=_session_headers(sid),
     )
     assert r.status_code == 404
 
 
-def test_wipe_from_another_session_returns_404(client):
-    sid_owner, pid, scn = _make_project(client)
+def test_clear_data_from_another_session_returns_404(client):
+    _, pid, scn = _make_project(client)
     sid_intruder = f"session_{uuid4().hex[:8]}"
 
-    r = client.post(_url(pid, scn, "wipe"), headers=_session_headers(sid_intruder))
+    r = client.delete(_url(pid, scn, "clear_data"), headers=_session_headers(sid_intruder))
     assert r.status_code == 404
 
 
-def test_wipe_does_not_affect_other_scenarios(client):
-    """Wiping scenario A leaves scenario B intact."""
+def test_clear_data_does_not_affect_other_scenarios(client):
+    """Clearing scenario A leaves scenario B intact."""
     sid, pid, scn_a = _make_project(client)
     dt = _make_data_type(client)
     u = _make_data_unit(client, dt)
@@ -429,8 +429,8 @@ def test_wipe_does_not_affect_other_scenarios(client):
             }]},
         )
 
-    # Wipe scenario A only
-    r = client.post(_url(pid, scn_a, "wipe"), headers=_session_headers(sid))
+    # Clear scenario A only
+    r = client.delete(_url(pid, scn_a, "clear_data"), headers=_session_headers(sid))
     assert r.status_code == 200
 
     # A is empty
@@ -810,6 +810,75 @@ def test_addrow_against_empty_addcol_no_seed_required(client):
     body = r.json()
     assert body["added_rows"] == 1
     assert body["column_count"] == 3   # date + time + 1 SQL header
+
+
+def test_addrow_with_all_null_values_still_adds_rows(client):
+    """A row with null for every column is a valid 'empty row' — PyHelios
+    gets NaN cells under every label so `getAllTimeSeriesData` sees the
+    timestamp. This was previously a silent no-op (counter bumped, nothing
+    written)."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # Two columns, no seed — relies on SQL-sourced label set
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "a", "datatype": dt, "data_unit": u, "values": []},
+            {"name": "b", "datatype": dt, "data_unit": u, "values": []},
+        ]},
+    )
+    a_id, b_id = (c["id"] for c in r.json()["columns"])
+
+    # Mirror frontend's payload shape: nulls for every label
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2026-04-01", "time": "01:00:00", str(a_id): None, str(b_id): None},
+            {"date": "2026-04-01", "time": "02:00:00", str(a_id): None, str(b_id): None},
+            {"date": "2026-04-01", "time": "03:00:00", str(a_id): None, str(b_id): None},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["added_rows"] == 3
+
+    # Rows actually landed in PyHelios — not just counted in the response
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    assert r.json()["row_count"] == 3
+
+
+def test_addrow_mixed_null_and_numeric_writes_both(client):
+    """If some cells are numeric and some null, the row gets written:
+    numeric values land as floats, null becomes NaN."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "a", "datatype": dt, "data_unit": u, "values": []},
+            {"name": "b", "datatype": dt, "data_unit": u, "values": []},
+        ]},
+    )
+    a_id, b_id = (c["id"] for c in r.json()["columns"])
+
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-05-01", "time": "10:00:00", str(a_id): "1.5", str(b_id): None},
+        ]},
+    )
+    assert r.status_code == 200
+    assert r.json()["added_rows"] == 1
 
 
 def test_addcol_and_addrow_accept_hhmm_time_format(client):

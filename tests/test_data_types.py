@@ -154,3 +154,84 @@ def test_delete_returns_success_and_row_disappears(client):
 def test_delete_unknown_id_returns_404(client):
     r = client.delete("/api/data-types/99999999")
     assert r.status_code == 404
+
+
+# ─── /api/data-types/with-units ─────────────────────────────────────────────
+#
+# GET /with-units returns every data type with its data_units nested.
+# Types with no units come back with `units: []`.
+
+
+def _make_unit(client, data_type_id: int) -> int:
+    r = client.post(
+        "/api/data-units/",
+        json={"unit": f"u_{uuid4().hex[:8]}", "data_type_id": data_type_id},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["data_unit"]["id"]
+
+
+def test_with_units_returns_types_and_their_units(client):
+    dt1, _ = _make_data_type(client)
+    dt2, _ = _make_data_type(client)
+    u1a = _make_unit(client, dt1)
+    u1b = _make_unit(client, dt1)
+    u2a = _make_unit(client, dt2)
+
+    r = client.get("/api/data-types/with-units")
+    assert r.status_code == 200
+
+    by_id = {t["id"]: t for t in r.json()["data_types"]}
+    assert dt1 in by_id
+    assert dt2 in by_id
+
+    unit_ids_dt1 = [u["id"] for u in by_id[dt1]["units"]]
+    unit_ids_dt2 = [u["id"] for u in by_id[dt2]["units"]]
+    assert u1a in unit_ids_dt1
+    assert u1b in unit_ids_dt1
+    assert u2a in unit_ids_dt2
+    assert u1a not in unit_ids_dt2  # units don't leak across types
+
+
+def test_with_units_includes_type_with_no_units(client):
+    """A data_type that has zero units must come back with units: []."""
+    dt, _ = _make_data_type(client)
+
+    r = client.get("/api/data-types/with-units")
+    assert r.status_code == 200
+
+    by_id = {t["id"]: t for t in r.json()["data_types"]}
+    assert dt in by_id
+    assert by_id[dt]["units"] == []
+
+
+def test_with_units_unit_payload_includes_conversion_fields(client):
+    """The nested unit objects must expose the conversion fields just like
+    GET /api/data-units does."""
+    dt, _ = _make_data_type(client)
+    r = client.post(
+        "/api/data-units/",
+        json={
+            "unit": f"u_{uuid4().hex[:8]}",
+            "data_type_id": dt,
+            "to_base_factor": 0.5,
+            "to_base_offset": -10.0,
+            "is_base": True,
+        },
+    )
+    assert r.status_code == 201
+
+    r = client.get("/api/data-types/with-units")
+    by_id = {t["id"]: t for t in r.json()["data_types"]}
+    unit = by_id[dt]["units"][0]
+    assert unit["to_base_factor"] == 0.5
+    assert unit["to_base_offset"] == -10.0
+    assert unit["is_base"] is True
+
+
+def test_with_units_path_does_not_collide_with_get_by_id(client):
+    """`/with-units` must not be parsed as `/{data_type_id}` — that would
+    return 404 (not an integer). Confirm the literal path wins."""
+    r = client.get("/api/data-types/with-units")
+    assert r.status_code == 200
+    assert "data_types" in r.json()

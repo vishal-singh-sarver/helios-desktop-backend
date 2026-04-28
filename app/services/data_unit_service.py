@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
 
 
-def _serialize(row: DataUnit) -> dict:
+def serialize(row: DataUnit) -> dict:
     return {
         "id": row.id,
         "unit": row.unit,
@@ -96,7 +96,7 @@ def create_data_unit(
     except Exception:
         db.rollback()
         raise HTTPException(500, "Failed to create data_unit")
-    return {"success": True, "data_unit": _serialize(row)}
+    return {"success": True, "data_unit": serialize(row)}
 
 
 def list_data_units(data_type_id: int | None, db: Session) -> dict:
@@ -105,14 +105,14 @@ def list_data_units(data_type_id: int | None, db: Session) -> dict:
     if data_type_id is not None:
         q = q.filter(DataUnit.data_type_id == data_type_id)
     rows = q.order_by(DataUnit.id.asc()).all()
-    return {"data_units": [_serialize(r) for r in rows]}
+    return {"data_units": [serialize(r) for r in rows]}
 
 
 def get_data_unit(data_unit_id: int, db: Session) -> dict:
     row = db.query(DataUnit).filter(DataUnit.id == data_unit_id).first()
     if row is None:
         raise HTTPException(404, f"data_unit {data_unit_id} not found")
-    return {"data_unit": _serialize(row)}
+    return {"data_unit": serialize(row)}
 
 
 def update_data_unit(
@@ -169,7 +169,7 @@ def update_data_unit(
     except Exception:
         db.rollback()
         raise HTTPException(500, "Failed to update data_unit")
-    return {"success": True, "data_unit": _serialize(row)}
+    return {"success": True, "data_unit": serialize(row)}
 
 
 def delete_data_unit(data_unit_id: int, db: Session) -> dict:

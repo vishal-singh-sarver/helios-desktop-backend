@@ -697,6 +697,40 @@ def test_addrow_against_empty_addcol_no_seed_required(client):
     assert body["column_count"] == 3   # date + time + 1 SQL header
 
 
+def test_addrow_ignores_headers_named_date_or_time(client):
+    """The bulk PUT /weather_data_header doesn't enforce the reserved-name
+    rule. If a header named 'date' or 'time' slipped in, /addRow must
+    NOT include its id in the required label set."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # Sideload a header with a reserved name via bulk PUT (addCol would
+    # reject this, but bulk PUT doesn't).
+    r = client.put(
+        f"/api/weather/project/{pid}/scenario/{scn}/weather_data_header",
+        headers=_session_headers(sid),
+        json={"headers": [
+            {"name": "date", "helios_data_type_id": dt, "unit_id": u, "display_order": 0},
+            {"name": "real", "helios_data_type_id": dt, "unit_id": u, "display_order": 1},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    real_id = next(h["id"] for h in r.json()["headers"] if h["name"] == "real")
+
+    # /addRow with only the "real" header — must succeed; the "date" header
+    # is filtered out of the required label set.
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(real_id): "1.0"},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["added_rows"] == 1
+
+
 def test_addrow_single_row_appends_to_pyhelios(client):
     sid, pid, scn = _make_project(client)
     a_id, b_id = _add_one_column(client, sid, pid, scn)

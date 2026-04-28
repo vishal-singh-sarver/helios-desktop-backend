@@ -740,11 +740,16 @@ def add_rows(
 
     ctx = sctx.context
 
-    # ── Label set from SQL: every header id (str) for this scenario ──
+    # ── Label set from SQL: every header id (str) for this scenario.
+    # Headers named "date" or "time" are excluded — those names are
+    # reserved as row keys, not data columns. addCol/PATCH refuse to
+    # create them, but the bulk PUT doesn't enforce that, so a sideloaded
+    # row could exist; this filter keeps add_rows robust either way. ──
     header_ids = [
         row[0]
         for row in db.query(WeatherDataHeader.id)
         .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
+        .filter(WeatherDataHeader.name.notin_(("date", "time")))
         .all()
     ]
     existing_label_set = {str(hid) for hid in header_ids}

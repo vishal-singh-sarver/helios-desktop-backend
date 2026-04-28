@@ -922,3 +922,42 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest") -> dict:
         "row_count": row_count,
         "column_count": column_count,
     }
+
+
+# ─── wipe — clear both stores ────────────────────────────────────────────────
+
+
+def wipe(sctx: "ScenarioContext", db: Session) -> dict:
+    """Wipe everything for the scenario: SQL headers + PyHelios cells.
+
+    Order: SQL delete first (transactional), then PyHelios clearTimeseriesData
+    as best-effort. Mirrors the pattern in `delete_header`. If the PyHelios
+    call fails, the SQL state is still consistent (no headers, no metadata),
+    and any leaked PyHelios cells are orphans that don't affect /addRow
+    since the label set is now empty.
+    """
+    if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
+        raise HTTPException(503, "PyHelios not available")
+
+    try:
+        headers_removed = (
+            db.query(WeatherDataHeader)
+            .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
+            .delete()
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Failed to wipe scenario weather state")
+
+    try:
+        sctx.context.clearTimeseriesData()
+    except Exception:
+        pass  # SQL is the source of truth; orphan cells will be invisible to /addRow
+
+    return {
+        "success": True,
+        "headers_removed": headers_removed,
+        "row_count": 0,
+        "column_count": 2,
+    }

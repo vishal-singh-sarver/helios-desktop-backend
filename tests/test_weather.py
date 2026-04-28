@@ -327,6 +327,121 @@ def test_delete_wipe_all_returns_success(client):
     assert r.status_code in (200, 503)
 
 
+# ─────────────────────────── /wipe — clear both stores ──────────────────────
+
+
+def test_wipe_clears_headers_and_pyhelios(client):
+    """POST /wipe deletes every weather_data_headers row for the scenario
+    AND clears PyHelios timeseries data. After: no headers, no rows."""
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # Seed two columns with cells so both stores have content
+    client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "a", "datatype": dt, "data_unit": u,
+             "values": [{"date": "2024-01-01", "time": "10:00:00", "value": "1"}]},
+            {"name": "b", "datatype": dt, "data_unit": u,
+             "values": [{"date": "2024-01-01", "time": "10:00:00", "value": "2"}]},
+        ]},
+    )
+
+    # Sanity: data is there before
+    r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
+    assert r.json()["count"] == 2
+
+    # Wipe
+    r = client.post(_url(pid, scn, "wipe"), headers=_session_headers(sid))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["headers_removed"] == 2
+    assert body["row_count"] == 0
+    assert body["column_count"] == 2
+
+    # SQL: header set is empty
+    r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
+    assert r.json()["count"] == 0
+
+    # PyHelios: no rows left
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    assert r.json()["row_count"] == 0
+
+
+def test_wipe_on_empty_scenario_returns_zero(client):
+    """Wiping a scenario that has nothing is a clean no-op."""
+    sid, pid, scn = _make_project(client)
+    r = client.post(_url(pid, scn, "wipe"), headers=_session_headers(sid))
+    assert r.status_code == 200
+    assert r.json() == {
+        "success": True,
+        "headers_removed": 0,
+        "row_count": 0,
+        "column_count": 2,
+    }
+
+
+def test_wipe_unknown_scenario_returns_404(client):
+    sid = f"session_{uuid4().hex[:8]}"
+    r = client.post(
+        f"/api/weather/project/{uuid4().hex}/scenario/{uuid4().hex}/wipe",
+        headers=_session_headers(sid),
+    )
+    assert r.status_code == 404
+
+
+def test_wipe_from_another_session_returns_404(client):
+    sid_owner, pid, scn = _make_project(client)
+    sid_intruder = f"session_{uuid4().hex[:8]}"
+
+    r = client.post(_url(pid, scn, "wipe"), headers=_session_headers(sid_intruder))
+    assert r.status_code == 404
+
+
+def test_wipe_does_not_affect_other_scenarios(client):
+    """Wiping scenario A leaves scenario B intact."""
+    sid, pid, scn_a = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # Create a second scenario
+    r = client.post(
+        f"/api/project/{pid}/scenarios/create",
+        json={"name": "second"},
+        headers=_session_headers(sid),
+    )
+    scn_b = r.json()["scenario_id"]
+
+    # Seed both scenarios
+    for s in (scn_a, scn_b):
+        client.post(
+            _url(pid, s, "addCol"),
+            headers=_session_headers(sid),
+            json={"column": [{
+                "name": "x", "datatype": dt, "data_unit": u,
+                "values": [{"date": "2024-01-01", "time": "10:00:00", "value": "1"}],
+            }]},
+        )
+
+    # Wipe scenario A only
+    r = client.post(_url(pid, scn_a, "wipe"), headers=_session_headers(sid))
+    assert r.status_code == 200
+
+    # A is empty
+    r = client.get(_headers_url(pid, scn_a), headers=_session_headers(sid))
+    assert r.json()["count"] == 0
+
+    # B still has its column
+    r = client.get(_headers_url(pid, scn_b), headers=_session_headers(sid))
+    assert r.json()["count"] == 1
+
+
 # ─────────────────────────── /addCol ────────────────────────────────────────
 #
 # Column flow (doc Section 3.2):

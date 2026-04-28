@@ -22,7 +22,15 @@ async def create_data_unit(
     req: DataUnitCreateRequest, db: Session = Depends(get_db)
 ):
     return data_unit_service.create_data_unit(
-        req.unit, req.alias, req.data_type_id, req.min, req.max, db
+        req.unit,
+        req.alias,
+        req.data_type_id,
+        req.min,
+        req.max,
+        req.to_base_factor,
+        req.to_base_offset,
+        req.is_base,
+        db,
     )
 
 
@@ -46,7 +54,15 @@ async def update_data_unit(
     db: Session = Depends(get_db),
 ):
     return data_unit_service.update_data_unit(
-        data_unit_id, req.unit, req.alias, req.min, req.max, db
+        data_unit_id,
+        req.unit,
+        req.alias,
+        req.min,
+        req.max,
+        req.to_base_factor,
+        req.to_base_offset,
+        req.is_base,
+        db,
     )
 
 

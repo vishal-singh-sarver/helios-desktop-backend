@@ -93,25 +93,40 @@ class HeliosDataType(Base):
 
 
 class DataUnit(Base):
-    """Master-data: a unit belonging to one data type (Celsius → Temperature). Optional min/max range."""
+    """Master-data: a unit belonging to one data type (Celsius → Temperature).
+
+    Affine conversion to the type's canonical/base unit:
+        value_in_base = value * to_base_factor + to_base_offset
+    `is_base=1` marks the canonical unit. The partial unique index
+    `idx_data_units_one_base` enforces at most one base per data_type.
+    """
     __tablename__ = "data_units"
     __table_args__ = (
         UniqueConstraint("data_type_id", "unit"),
+        Index(
+            "idx_data_units_one_base",
+            "data_type_id",
+            unique=True,
+            sqlite_where=Column("is_base") == 1,
+        ),
     )
 
-    id           = Column(Integer, primary_key=True, autoincrement=True)
-    unit         = Column(Text, nullable=False)
-    alias        = Column(Text, nullable=True)
-    data_type_id = Column(
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    unit           = Column(Text, nullable=False)
+    alias          = Column(Text, nullable=True)
+    data_type_id   = Column(
         Integer,
         ForeignKey("helios_data_types.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
-    min          = Column(Float, nullable=True)
-    max          = Column(Float, nullable=True)
-    created_at   = Column(Text, nullable=False, default=_now)
-    updated_at   = Column(Text, nullable=False, default=_now, onupdate=_now)
+    min            = Column(Float, nullable=True)
+    max            = Column(Float, nullable=True)
+    to_base_factor = Column(Float, nullable=False, default=1.0)
+    to_base_offset = Column(Float, nullable=False, default=0.0)
+    is_base        = Column(Integer, nullable=False, default=0)
+    created_at     = Column(Text, nullable=False, default=_now)
+    updated_at     = Column(Text, nullable=False, default=_now, onupdate=_now)
 
 
 class WeatherDataHeader(Base):

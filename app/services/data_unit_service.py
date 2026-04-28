@@ -26,9 +26,20 @@ def _serialize(row: DataUnit) -> dict:
         "data_type_id": row.data_type_id,
         "min": row.min,
         "max": row.max,
+        "to_base_factor": row.to_base_factor,
+        "to_base_offset": row.to_base_offset,
+        "is_base": bool(row.is_base),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
+
+
+def _existing_base_for_type(data_type_id: int, db: Session) -> DataUnit | None:
+    return (
+        db.query(DataUnit)
+        .filter(DataUnit.data_type_id == data_type_id, DataUnit.is_base == 1)
+        .first()
+    )
 
 
 def create_data_unit(
@@ -37,6 +48,9 @@ def create_data_unit(
     data_type_id: int,
     min: float | None,
     max: float | None,
+    to_base_factor: float,
+    to_base_offset: float,
+    is_base: bool,
     db: Session,
 ) -> dict:
     # Verify parent type exists upfront, so we 404 cleanly instead of letting
@@ -49,12 +63,26 @@ def create_data_unit(
     if parent is None:
         raise HTTPException(404, f"data_type_id {data_type_id} not found")
 
+    # Pre-check the one-base-per-type invariant so the 409 is clear instead
+    # of leaking the partial unique index name through an IntegrityError.
+    if is_base:
+        existing_base = _existing_base_for_type(data_type_id, db)
+        if existing_base is not None:
+            raise HTTPException(
+                409,
+                f"data_type {data_type_id} already has a base unit "
+                f"(id={existing_base.id}, '{existing_base.unit}')",
+            )
+
     row = DataUnit(
         unit=unit,
         alias=alias,
         data_type_id=data_type_id,
         min=min,
         max=max,
+        to_base_factor=to_base_factor,
+        to_base_offset=to_base_offset,
+        is_base=1 if is_base else 0,
     )
     try:
         db.add(row)
@@ -93,6 +121,9 @@ def update_data_unit(
     alias: str | None,
     min: float | None,
     max: float | None,
+    to_base_factor: float | None,
+    to_base_offset: float | None,
+    is_base: bool | None,
     db: Session,
 ) -> dict:
     """Partial update. data_type_id is intentionally absent — a unit's parent
@@ -100,6 +131,17 @@ def update_data_unit(
     row = db.query(DataUnit).filter(DataUnit.id == data_unit_id).first()
     if row is None:
         raise HTTPException(404, f"data_unit {data_unit_id} not found")
+
+    # Pre-check before flipping is_base on, so we return a clear 409 if some
+    # OTHER unit already holds the base flag for this data_type.
+    if is_base is True and not row.is_base:
+        existing_base = _existing_base_for_type(row.data_type_id, db)
+        if existing_base is not None:
+            raise HTTPException(
+                409,
+                f"data_type {row.data_type_id} already has a base unit "
+                f"(id={existing_base.id}, '{existing_base.unit}')",
+            )
 
     if unit is not None:
         row.unit = unit
@@ -109,6 +151,12 @@ def update_data_unit(
         row.min = min
     if max is not None:
         row.max = max
+    if to_base_factor is not None:
+        row.to_base_factor = to_base_factor
+    if to_base_offset is not None:
+        row.to_base_offset = to_base_offset
+    if is_base is not None:
+        row.is_base = 1 if is_base else 0
 
     try:
         db.commit()

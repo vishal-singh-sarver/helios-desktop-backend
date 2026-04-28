@@ -1,12 +1,12 @@
 """
 Request bodies for weather endpoints.
 
-Matches the pseudocode in the design doc:
-    POST /add     body: AddRequest
+    POST /addCol  body: AddColumnsRequest
+    POST /addRow  body: AddRowsRequest
     POST /update  body: UpdateRequest
     POST /delete  body: DeleteRequest
 
-The `add` column flow links each new column to the metadata catalog
+The `addCol` flow links each new column to the metadata catalog
 (helios_data_types, data_units) and persists a row in weather_data_headers
 in addition to writing the cells into PyHelios. The PyHelios label used is
 the new header's autoincrement id (stringified), not the user-facing name.
@@ -58,24 +58,34 @@ class AddColumn(BaseModel):
         return v
 
 
-class AddRequest(BaseModel):
-    """Body for POST /add. Either `column` or `rows` (or both) must be set.
+class AddColumnsRequest(BaseModel):
+    """Body for POST /addCol — add one or more columns in a single batch.
 
-    `column` is a list — frontend always sends an array, even for a single
-    column. Empty list is rejected at the service layer.
+    `column` is a list (frontend always sends an array, even for a single
+    column). Empty list is rejected at the service layer for a clearer
+    error than a silent no-op.
     """
     model_config = ConfigDict(extra="forbid")
 
-    column: list[AddColumn] | None = None
-    rows: list[dict[str, Any]] | None = None
+    column: list[AddColumn]
 
     @model_validator(mode="after")
     def _no_dup_column_names(self):
-        if self.column is not None:
-            names = [c.name for c in self.column]
-            if len(names) != len(set(names)):
-                raise ValueError("duplicate column name in request body")
+        names = [c.name for c in self.column]
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate column name in request body")
         return self
+
+
+class AddRowsRequest(BaseModel):
+    """Body for POST /addRow — append one or more rows.
+
+    Each row dict must include `date` + `time` plus exactly the set of
+    existing column labels (the str(header.id) values). Mismatch is a 400.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[dict[str, Any]]
 
 
 class UpdateRequest(BaseModel):

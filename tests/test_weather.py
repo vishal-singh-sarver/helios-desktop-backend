@@ -327,9 +327,9 @@ def test_delete_wipe_all_returns_success(client):
     assert r.status_code in (200, 503)
 
 
-# ─────────────────────────── /add — column branch ────────────────────────────
+# ─────────────────────────── /addCol ────────────────────────────────────────
 #
-# New column flow (doc Section 3.2):
+# Column flow (doc Section 3.2):
 #   - body.column is a LIST of {name, datatype, data_unit, values:[{date,time,value}]}
 #   - Each column persists a row in `weather_data_headers` AND writes its cells
 #     into PyHelios under label = str(header.id).
@@ -364,7 +364,7 @@ def test_add_single_column_returns_id_and_persists_header(client):
     u = _make_data_unit(client, dt)
 
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{
             "name": "temp",
@@ -411,7 +411,7 @@ def test_add_multi_column_persists_all_in_order(client):
     u2 = _make_data_unit(client, dt)
 
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [
             {"name": "a", "datatype": dt, "data_unit": u1, "values": []},
@@ -436,7 +436,7 @@ def test_add_column_with_null_metadata_persists_header_anyway(client):
     sid, pid, scn = _make_project(client)
 
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{"name": "raw", "values": []}]},
     )
@@ -449,7 +449,7 @@ def test_add_column_with_null_metadata_persists_header_anyway(client):
 def test_add_empty_column_list_returns_400(client):
     sid, pid, scn = _make_project(client)
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": []},
     )
@@ -460,7 +460,7 @@ def test_add_duplicate_names_in_body_returns_422(client):
     """Pydantic _no_dup_column_names validator catches this before the service."""
     sid, pid, scn = _make_project(client)
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [
             {"name": "dup", "values": []},
@@ -477,12 +477,12 @@ def test_add_existing_column_name_returns_409(client):
     u = _make_data_unit(client, dt)
 
     client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{"name": "temp", "datatype": dt, "data_unit": u, "values": []}]},
     )
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{"name": "temp", "datatype": dt, "data_unit": u, "values": []}]},
     )
@@ -493,7 +493,7 @@ def test_add_existing_column_name_returns_409(client):
 def test_add_reserved_name_returns_400(client):
     sid, pid, scn = _make_project(client)
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{"name": "date", "values": []}]},
     )
@@ -506,7 +506,7 @@ def test_add_unknown_datatype_returns_404(client):
     dt = _make_data_type(client)
     u = _make_data_unit(client, dt)
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{
             "name": "x", "datatype": 99999999, "data_unit": u, "values": []
@@ -519,7 +519,7 @@ def test_add_unknown_data_unit_returns_404(client):
     sid, pid, scn = _make_project(client)
     dt = _make_data_type(client)
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{
             "name": "x", "datatype": dt, "data_unit": 99999999, "values": []
@@ -536,7 +536,7 @@ def test_add_unit_does_not_belong_to_datatype_returns_400(client):
     u_of_dt2 = _make_data_unit(client, dt2)
 
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{
             "name": "x", "datatype": dt1, "data_unit": u_of_dt2, "values": []
@@ -555,7 +555,7 @@ def test_add_partial_failure_rolls_back_first_column(client):
 
     # First call: install one valid column so we have something to compare against.
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{"name": "preexisting", "datatype": dt, "data_unit": u, "values": []}]},
     )
@@ -563,7 +563,7 @@ def test_add_partial_failure_rolls_back_first_column(client):
 
     # Second call: column[0] is fine, column[1] has unknown datatype -> whole call fails.
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [
             {"name": "good", "datatype": dt, "data_unit": u, "values": []},
@@ -583,7 +583,7 @@ def test_add_bad_value_format_returns_400_and_does_not_persist(client):
     sid, pid, scn = _make_project(client)
 
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{
             "name": "x",
@@ -606,7 +606,7 @@ def test_add_empty_values_creates_column_with_no_cells(client):
     u = _make_data_unit(client, dt)
 
     r = client.post(
-        _url(pid, scn, "add"),
+        _url(pid, scn, "addCol"),
         headers=_session_headers(sid),
         json={"column": [{
             "name": "metadata_only", "datatype": dt, "data_unit": u, "values": []
@@ -629,3 +629,187 @@ def test_add_empty_values_creates_column_with_no_cells(client):
     assert col_id in [h["id"] for h in
                       client.get(_headers_url(pid, scn),
                                  headers=_session_headers(sid)).json()["headers"]]
+
+
+# ─────────────────────────── /addRow ────────────────────────────────────────
+#
+# Row flow:
+#   - body.rows is a list of {date, time, <label>: value} dicts.
+#   - Labels must be the str(header.id) values returned by /addCol.
+#   - PyHelios silently drops dup timestamps, so we reject upfront (within
+#     batch and against existing rows).
+
+
+def _add_one_column(client, sid, pid, scn) -> tuple[int, int]:
+    """Install two columns and seed each with one cell so PyHelios registers
+    their labels. Without a seed, PyHelios doesn't expose the label and the
+    row branch's label-set check would reject any subsequent /addRow.
+
+    Returns the two header ids; cells live under str(id)."""
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+    seed = [{"date": "2023-01-01", "time": "00:00:00", "value": "0"}]
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "a", "datatype": dt, "data_unit": u, "values": seed},
+            {"name": "b", "datatype": dt, "data_unit": u, "values": seed},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    cols = r.json()["columns"]
+    return cols[0]["id"], cols[1]["id"]
+
+
+def test_addrow_single_row_appends_to_pyhelios(client):
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _add_one_column(client, sid, pid, scn)
+    # _add_one_column seeded 1 row at 2023-01-01 00:00:00.
+
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(a_id): "1.0", str(b_id): "2.0"},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["added_rows"] == 1
+    assert body["row_count"] == 2  # seed + new row
+
+    # Verify it landed.
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    assert r.json()["row_count"] == 2
+
+
+def test_addrow_multiple_rows_in_one_call(client):
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _add_one_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(a_id): "1.0", str(b_id): "2.0"},
+            {"date": "2024-01-01", "time": "11:00:00", str(a_id): "3.0", str(b_id): "4.0"},
+        ]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["added_rows"] == 2
+    assert body["row_count"] == 3  # seed + 2 new rows
+
+
+def test_addrow_missing_date_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _add_one_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"time": "10:00:00", str(a_id): "1.0", str(b_id): "2.0"},
+        ]},
+    )
+    assert r.status_code == 400
+    assert "date is required" in r.json()["detail"].lower()
+
+
+def test_addrow_missing_time_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _add_one_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", str(a_id): "1.0", str(b_id): "2.0"},
+        ]},
+    )
+    assert r.status_code == 400
+    assert "time is required" in r.json()["detail"].lower()
+
+
+def test_addrow_duplicate_timestamp_in_batch_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _add_one_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(a_id): "1.0", str(b_id): "2.0"},
+            {"date": "2024-01-01", "time": "10:00:00", str(a_id): "9.0", str(b_id): "8.0"},
+        ]},
+    )
+    assert r.status_code == 400
+    assert "duplicate timestamp in batch" in r.json()["detail"].lower()
+
+
+def test_addrow_existing_timestamp_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _add_one_column(client, sid, pid, scn)
+
+    # Seed one row.
+    client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(a_id): "1.0", str(b_id): "2.0"},
+        ]},
+    )
+
+    # Same timestamp again → 400.
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(a_id): "9.0", str(b_id): "8.0"},
+        ]},
+    )
+    assert r.status_code == 400
+    assert "already exists" in r.json()["detail"].lower()
+
+
+def test_addrow_label_mismatch_returns_400(client):
+    """Row labels (excluding date/time) must exactly match the existing
+    PyHelios label set — no missing, no extras."""
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _add_one_column(client, sid, pid, scn)
+
+    # Missing b_id.
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(a_id): "1.0"},
+        ]},
+    )
+    assert r.status_code == 400
+    assert "must match" in r.json()["detail"].lower()
+
+    # Unknown label.
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {"date": "2024-01-01", "time": "10:00:00", str(a_id): "1.0", str(b_id): "2.0", "ghost": "0"},
+        ]},
+    )
+    assert r.status_code == 400
+
+
+def test_addrow_unknown_scenario_returns_404(client):
+    sid = f"session_{uuid4().hex[:8]}"
+    r = client.post(
+        f"/api/weather/project/{uuid4().hex}/scenario/{uuid4().hex}/addRow",
+        headers=_session_headers(sid),
+        json={"rows": [{"date": "2024-01-01", "time": "10:00:00"}]},
+    )
+    assert r.status_code == 404

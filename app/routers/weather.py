@@ -14,8 +14,16 @@ from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_session_id
 from app.db.database import get_db
-from app.schemas.weather import AddRequest, DeleteRequest, UpdateRequest
-from app.schemas.weather_header import WeatherDataHeaderReplaceRequest
+from app.schemas.weather import (
+    AddColumnsRequest,
+    AddRowsRequest,
+    DeleteRequest,
+    UpdateRequest,
+)
+from app.schemas.weather_header import (
+    WeatherDataHeaderReplaceRequest,
+    WeatherDataHeaderUpdateRequest,
+)
 from app.services import weather_header_service, weather_service
 from app.services.scenario_service import _resolve_scenario
 
@@ -68,17 +76,30 @@ async def upload_file(
     return weather_service.upload_file(sctx, content)
 
 
-@router.post("/project/{project_id}/scenario/{scenario_id}/add")
-def add_weather(
+@router.post("/project/{project_id}/scenario/{scenario_id}/addCol")
+def add_columns(
     project_id: str,
     scenario_id: str,
-    body: AddRequest = Body(...),
+    body: AddColumnsRequest = Body(...),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    """Add one column and/or any number of rows."""
+    """Add one or more columns. Persists header rows + writes cells atomically."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.add(sctx, body, db)
+    return weather_service.add_columns(sctx, body.column, db)
+
+
+@router.post("/project/{project_id}/scenario/{scenario_id}/addRow")
+def add_rows(
+    project_id: str,
+    scenario_id: str,
+    body: AddRowsRequest = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Append rows to the timeseries table — PyHelios-only, no SQL writes."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.add_rows(sctx, body.rows)
 
 
 @router.post("/project/{project_id}/scenario/{scenario_id}/update")
@@ -145,3 +166,44 @@ def clear_weather_data_header(
 ):
     """Remove all headers for the scenario. Returns the count removed."""
     return weather_header_service.clear_headers(session_id, project_id, scenario_id, db)
+
+
+@router.patch(
+    "/project/{project_id}/scenario/{scenario_id}/weather_data_header/{header_id}"
+)
+def update_weather_data_header(
+    project_id: str,
+    scenario_id: str,
+    header_id: int,
+    body: WeatherDataHeaderUpdateRequest = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Partial update of a single header — name, datatype, unit, or order."""
+    return weather_header_service.update_header(
+        session_id,
+        project_id,
+        scenario_id,
+        header_id,
+        body.name,
+        body.helios_data_type_id,
+        body.unit_id,
+        body.display_order,
+        db,
+    )
+
+
+@router.delete(
+    "/project/{project_id}/scenario/{scenario_id}/weather_data_header/{header_id}"
+)
+def delete_weather_data_header(
+    project_id: str,
+    scenario_id: str,
+    header_id: int,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Delete one header row + NaN-clear its PyHelios cells (best-effort)."""
+    return weather_header_service.delete_header(
+        session_id, project_id, scenario_id, header_id, db
+    )

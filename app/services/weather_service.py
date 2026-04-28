@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
 
 if TYPE_CHECKING:
     from app.core.scenario_context import ScenarioContext
-    from app.schemas.weather import AddRequest, DeleteRequest, UpdateRequest
+    from app.schemas.weather import AddColumn, DeleteRequest, UpdateRequest
 
 
 # ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -567,34 +567,172 @@ def _cleanup_pyhelios_cells(ctx, cells: list[tuple[str, Any, Any]]) -> None:
             pass
 
 
-def add(sctx: "ScenarioContext", req: "AddRequest", db: Session) -> dict:
-    """Add one or more columns and/or any number of rows.
+def add_columns(
+    sctx: "ScenarioContext", columns: list["AddColumn"], db: Session
+) -> dict:
+    """Add one or more columns. Two-store atomic write.
 
-    Column branch (new flow):
-      - `column` is a list. Each entry is a fully-self-contained column spec
-        (name + optional metadata FKs + list of {date, time, value} cells).
-      - For each column, persist a row in `weather_data_headers` AND write
-        the cells into PyHelios under label `str(header.id)`.
-      - Single transaction wraps all N columns + all M cells.
+    For each column:
+      - persists a row in `weather_data_headers` (SQL),
+      - writes the cells into PyHelios under label `str(header.id)`.
 
-    Row branch (unchanged):
-      - `rows` is a list of dicts; each must include date+time + every existing
-        column key. Cells are written to PyHelios via `addTimeseriesData`.
-      - PyHelios silently drops duplicate timestamps, so we reject upfront.
+    Single transaction wraps all N columns + all M cells. Empty list is
+    rejected (400). On any mid-batch failure the SQL transaction rolls
+    back and PyHelios cells we wrote are NaN'd as best-effort cleanup
+    (PyHelios v0.1.19 has no true delete).
     """
-    if req.rows is None and req.column is None:
-        raise HTTPException(400, "must specify `column`, `rows`, or both")
     if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
         raise HTTPException(503, "PyHelios not available")
 
-    # Empty column list — request adds nothing. Reject so the frontend gets a
-    # clear signal instead of a silent no-op.
-    if req.column is not None and len(req.column) == 0:
+    if len(columns) == 0:
         raise HTTPException(400, "column list cannot be empty")
 
     ctx = sctx.context
 
-    # ── Snapshot of existing PyHelios labels / timestamps (used for row validation) ──
+    # ── Validation pass (fail-fast before any mutation) ──
+    existing_header_names = {
+        row[0]
+        for row in db.query(WeatherDataHeader.name)
+        .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
+        .all()
+    }
+
+    for i, col in enumerate(columns):
+        # 4a — reserved name
+        if col.name in ("date", "time"):
+            raise HTTPException(
+                400, f"column[{i}]: name '{col.name}' is reserved"
+            )
+
+        # 4b — UNIQUE(scenario_id, name)
+        if col.name in existing_header_names:
+            raise HTTPException(
+                409,
+                f"column[{i}]: name '{col.name}' already exists in scenario",
+            )
+
+        # 4c — datatype FK
+        if col.datatype is not None:
+            if db.get(HeliosDataType, col.datatype) is None:
+                raise HTTPException(
+                    404, f"column[{i}]: datatype {col.datatype} not found"
+                )
+
+        # 4d — data_unit FK (and fetch it for the consistency check)
+        unit_row = None
+        if col.data_unit is not None:
+            unit_row = db.get(DataUnit, col.data_unit)
+            if unit_row is None:
+                raise HTTPException(
+                    404,
+                    f"column[{i}]: data_unit {col.data_unit} not found",
+                )
+
+        # 4e — unit/type consistency
+        if col.datatype is not None and unit_row is not None:
+            if unit_row.data_type_id != col.datatype:
+                raise HTTPException(
+                    400,
+                    f"column[{i}]: unit '{unit_row.unit}' belongs to "
+                    f"data_type {unit_row.data_type_id}, not {col.datatype}",
+                )
+
+        # 4f — per-value parsing
+        for j, v in enumerate(col.values):
+            if not v.date or not v.time:
+                raise HTTPException(
+                    400,
+                    f"column[{i}].values[{j}]: date and time are required",
+                )
+            try:
+                list(int(p) for p in v.date.split("-"))
+                list(int(p) for p in v.time.split(":"))
+            except (ValueError, AttributeError):
+                raise HTTPException(
+                    400,
+                    f"column[{i}].values[{j}]: bad date/time format "
+                    f"'{v.date}' '{v.time}'",
+                )
+            if v.value != "" and not _is_numeric_or_empty(v.value):
+                raise HTTPException(
+                    400,
+                    f"column[{i}].values[{j}]: value '{v.value}' "
+                    f"is not numeric or empty",
+                )
+
+        # Track newly-added names so a follow-up item in the same request
+        # collides too (Pydantic also catches this, defence-in-depth).
+        existing_header_names.add(col.name)
+
+    # ── Atomic write: all N columns + all M cells in one transaction ──
+    order_start = (
+        db.query(WeatherDataHeader)
+        .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
+        .count()
+    )
+    written_cells: list[tuple[str, Any, Any]] = []
+    created_columns: list[dict] = []
+
+    try:
+        for i, col in enumerate(columns):
+            header = WeatherDataHeader(
+                scenario_id=sctx.scenario_id,
+                name=col.name,
+                helios_data_type_id=col.datatype,
+                unit_id=col.data_unit,
+                status=1,
+                display_order=order_start + i,
+            )
+            db.add(header)
+            db.flush()  # populate header.id
+
+            label = str(header.id)
+            for v in col.values:
+                if v.value == "":
+                    continue  # empty cells are no-ops
+                d, t = _helios_date_time(v.date, v.time)
+                ctx.addTimeseriesData(label, float(v.value), d, t)
+                written_cells.append((label, d, t))
+
+            created_columns.append(
+                {
+                    "id": header.id,
+                    "name": header.name,
+                    "datatype_id": header.helios_data_type_id,
+                    "data_unit_id": header.unit_id,
+                }
+            )
+
+        db.commit()
+
+    except HTTPException:
+        db.rollback()
+        _cleanup_pyhelios_cells(ctx, written_cells)
+        raise
+    except Exception as exc:
+        db.rollback()
+        _cleanup_pyhelios_cells(ctx, written_cells)
+        raise HTTPException(500, f"Failed to add columns: {exc}")
+
+    return {"success": True, "columns": created_columns}
+
+
+def add_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]]) -> dict:
+    """Append rows to the timeseries table.
+
+    Each row must include `date` + `time` and exactly the set of currently
+    registered PyHelios labels (the `str(header.id)` values).
+
+    PyHelios silently drops duplicate timestamps, so we reject duplicates
+    upfront (both within the batch and against existing rows). No SQL
+    writes here — rows live entirely in PyHelios.
+    """
+    if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
+        raise HTTPException(503, "PyHelios not available")
+
+    ctx = sctx.context
+
+    # ── Snapshot existing labels + timestamps for validation ──
     existing_labels = list(ctx.listTimeseriesVariables())
     existing_timestamps: list[tuple[Any, Any]] = []
     if existing_labels:
@@ -610,202 +748,59 @@ def add(sctx: "ScenarioContext", req: "AddRequest", db: Session) -> dict:
     existing_timestamp_keys = {
         (str(d), str(t)) for d, t in existing_timestamps
     }
+    existing_label_set = set(existing_labels)
 
-    # ── Validation pass for COLUMN branch (new flow, fail-fast) ──
-    if req.column is not None:
-        existing_header_names = {
-            row[0]
-            for row in db.query(WeatherDataHeader.name)
-            .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
-            .all()
-        }
+    # ── Validation ──
+    batch_keys: set[tuple[str, str]] = set()
+    for row_data in rows:
+        date_val = row_data.get("date")
+        time_val = row_data.get("time")
+        if date_val in (None, ""):
+            raise HTTPException(400, "date is required")
+        if time_val in (None, ""):
+            raise HTTPException(400, "time is required")
 
-        for i, col in enumerate(req.column):
-            # 4a — reserved name
-            if col.name in ("date", "time"):
-                raise HTTPException(
-                    400, f"column[{i}]: name '{col.name}' is reserved"
-                )
+        key = (date_val, time_val)
+        if key in batch_keys:
+            raise HTTPException(400, f"duplicate timestamp in batch: {key}")
+        if key in existing_timestamp_keys:
+            raise HTTPException(400, f"timestamp already exists: {key}")
+        batch_keys.add(key)
 
-            # 4b — UNIQUE(scenario_id, name)
-            if col.name in existing_header_names:
-                raise HTTPException(
-                    409,
-                    f"column[{i}]: name '{col.name}' already exists in scenario",
-                )
+        row_labels = {k for k in row_data.keys() if k not in ("date", "time")}
+        if row_labels != existing_label_set:
+            missing = existing_label_set - row_labels
+            unknown = row_labels - existing_label_set
+            raise HTTPException(
+                400,
+                f"row labels must match existing columns; "
+                f"missing={sorted(missing)}, unknown={sorted(unknown)}",
+            )
 
-            # 4c — datatype FK
-            if col.datatype is not None:
-                if db.get(HeliosDataType, col.datatype) is None:
-                    raise HTTPException(
-                        404, f"column[{i}]: datatype {col.datatype} not found"
-                    )
-
-            # 4d — data_unit FK (and fetch it for the consistency check)
-            unit_row = None
-            if col.data_unit is not None:
-                unit_row = db.get(DataUnit, col.data_unit)
-                if unit_row is None:
-                    raise HTTPException(
-                        404,
-                        f"column[{i}]: data_unit {col.data_unit} not found",
-                    )
-
-            # 4e — unit/type consistency
-            if col.datatype is not None and unit_row is not None:
-                if unit_row.data_type_id != col.datatype:
-                    raise HTTPException(
-                        400,
-                        f"column[{i}]: unit '{unit_row.unit}' belongs to "
-                        f"data_type {unit_row.data_type_id}, not {col.datatype}",
-                    )
-
-            # 4f — per-value parsing
-            for j, v in enumerate(col.values):
-                if not v.date or not v.time:
-                    raise HTTPException(
-                        400,
-                        f"column[{i}].values[{j}]: date and time are required",
-                    )
-                try:
-                    (int(p) for p in v.date.split("-"))
-                    (int(p) for p in v.time.split(":"))
-                    list(int(p) for p in v.date.split("-"))
-                    list(int(p) for p in v.time.split(":"))
-                except (ValueError, AttributeError):
-                    raise HTTPException(
-                        400,
-                        f"column[{i}].values[{j}]: bad date/time format "
-                        f"'{v.date}' '{v.time}'",
-                    )
-                if v.value != "" and not _is_numeric_or_empty(v.value):
-                    raise HTTPException(
-                        400,
-                        f"column[{i}].values[{j}]: value '{v.value}' "
-                        f"is not numeric or empty",
-                    )
-
-            # Track newly-added names so a follow-up item in the same request
-            # collides too (Pydantic also catches this, defence-in-depth).
-            existing_header_names.add(col.name)
-
-    # ── Validation pass for ROW branch (unchanged) ──
-    if req.rows is not None:
-        batch_keys: set[tuple[str, str]] = set()
-        existing_label_set = set(existing_labels)
-
-        for row_data in req.rows:
-            date_val = row_data.get("date")
-            time_val = row_data.get("time")
-            if date_val in (None, ""):
-                raise HTTPException(400, "date is required")
-            if time_val in (None, ""):
-                raise HTTPException(400, "time is required")
-
-            key = (date_val, time_val)
-            if key in batch_keys:
-                raise HTTPException(400, f"duplicate timestamp in batch: {key}")
-            if key in existing_timestamp_keys:
-                raise HTTPException(400, f"timestamp already exists: {key}")
-            batch_keys.add(key)
-
-            row_labels = {k for k in row_data.keys() if k not in ("date", "time")}
-            if row_labels != existing_label_set:
-                missing = existing_label_set - row_labels
-                unknown = row_labels - existing_label_set
-                raise HTTPException(
-                    400,
-                    f"row labels must match existing columns; "
-                    f"missing={sorted(missing)}, unknown={sorted(unknown)}",
-                )
-
-    # ── STEP A — add columns (if requested), atomic across the batch ──
-    created_columns: list[dict] = []
-    if req.column is not None:
-        order_start = (
-            db.query(WeatherDataHeader)
-            .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
-            .count()
-        )
-
-        # Track PyHelios cells so we can NaN them on rollback.
-        written_cells: list[tuple[str, Any, Any]] = []
-
-        try:
-            for i, col in enumerate(req.column):
-                header = WeatherDataHeader(
-                    scenario_id=sctx.scenario_id,
-                    name=col.name,
-                    helios_data_type_id=col.datatype,
-                    unit_id=col.data_unit,
-                    status=1,
-                    display_order=order_start + i,
-                )
-                db.add(header)
-                db.flush()  # populate header.id
-
-                label = str(header.id)
-                for v in col.values:
-                    if v.value == "":
-                        continue  # empty cells are no-ops
-                    d, t = _helios_date_time(v.date, v.time)
-                    ctx.addTimeseriesData(label, float(v.value), d, t)
-                    written_cells.append((label, d, t))
-
-                created_columns.append(
-                    {
-                        "id": header.id,
-                        "name": header.name,
-                        "datatype_id": header.helios_data_type_id,
-                        "data_unit_id": header.unit_id,
-                    }
-                )
-
-            db.commit()
-
-        except HTTPException:
-            db.rollback()
-            _cleanup_pyhelios_cells(ctx, written_cells)
-            raise
-        except Exception as exc:
-            db.rollback()
-            _cleanup_pyhelios_cells(ctx, written_cells)
-            raise HTTPException(500, f"Failed to add columns: {exc}")
-
-    # ── STEP B — add rows (if requested), unchanged ──
+    # ── Write ──
     added_rows = 0
-    if req.rows is not None:
-        for row_data in req.rows:
-            cells: dict[str, float] = {}
-            for k, v in row_data.items():
-                if k in ("date", "time"):
-                    continue
-                vstr = v if isinstance(v, str) else str(v)
-                if _is_numeric_value(v) or (
-                    isinstance(v, str)
-                    and _is_numeric_or_empty(vstr)
-                    and vstr.strip()
-                ):
-                    cells[k] = float(vstr)
-            if cells:
-                _add_row(ctx, row_data["date"], row_data["time"], cells)
-            added_rows += 1
+    for row_data in rows:
+        cells: dict[str, float] = {}
+        for k, v in row_data.items():
+            if k in ("date", "time"):
+                continue
+            vstr = v if isinstance(v, str) else str(v)
+            if _is_numeric_value(v) or (
+                isinstance(v, str)
+                and _is_numeric_or_empty(vstr)
+                and vstr.strip()
+            ):
+                cells[k] = float(vstr)
+        if cells:
+            _add_row(ctx, row_data["date"], row_data["time"], cells)
+        added_rows += 1
 
-    # ── Build response ──
-    result: dict[str, Any] = {"success": True}
-
-    if req.column is not None:
-        result["columns"] = created_columns
-
-    if req.rows is not None:
-        # Preserve the existing rows-only response shape.
-        row_count = len(existing_timestamps) + len(req.rows)
-        column_count = 2 + len(ctx.listTimeseriesVariables())
-        result["row_count"] = row_count
-        result["column_count"] = column_count
-        result["added_rows"] = added_rows
-
-    return result
+    return {
+        "success": True,
+        "row_count": len(existing_timestamps) + len(rows),
+        "column_count": 2 + len(ctx.listTimeseriesVariables()),
+        "added_rows": added_rows,
+    }
 
 
 # ─── update — pre-checks the cell exists ─────────────────────────────────────

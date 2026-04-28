@@ -46,3 +46,32 @@ class WeatherDataHeaderReplaceRequest(BaseModel):
         if len(orders) != len(set(orders)):
             raise ValueError("duplicate display_order in headers array")
         return self
+
+
+class WeatherDataHeaderUpdateRequest(BaseModel):
+    """PATCH /api/weather/project/{pid}/scenario/{sid}/weather_data_header/{header_id}
+
+    Partial update of a single header row. Only the provided fields change.
+
+    `helios_data_type_id` and `unit_id` are optional in the DB (migration 009),
+    so partial-mapping rows stay legal: a row may have both null, just one
+    set, or both set. When both end up non-null the service still verifies
+    `unit.data_type_id == helios_data_type_id`.
+    """
+
+    name: str | None = None
+    helios_data_type_id: int | None = None
+    unit_id: int | None = None
+    display_order: int | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _trim(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("name cannot be empty")
+        if len(v) > 100:
+            raise ValueError("name must be 100 characters or fewer")
+        return v

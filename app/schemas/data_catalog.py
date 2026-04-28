@@ -51,13 +51,23 @@ class HeliosDataTypeUpdateRequest(BaseModel):
 
 
 class DataUnitCreateRequest(BaseModel):
-    """POST /api/data-units"""
+    """POST /api/data-units
+
+    Conversion fields (`to_base_factor`, `to_base_offset`, `is_base`) describe
+    the affine map back to the data type's canonical unit:
+        value_in_base = value * to_base_factor + to_base_offset
+    Only one unit per data_type may have is_base=True (enforced by a
+    partial unique index in migration 010).
+    """
 
     unit: str
     alias: str | None = None
     data_type_id: int
     min: float | None = None
     max: float | None = None
+    to_base_factor: float = 1.0
+    to_base_offset: float = 0.0
+    is_base: bool = False
 
     @model_validator(mode="after")
     def _bounds(self):
@@ -80,6 +90,9 @@ class DataUnitUpdateRequest(BaseModel):
     alias: str | None = None
     min: float | None = None
     max: float | None = None
+    to_base_factor: float | None = None
+    to_base_offset: float | None = None
+    is_base: bool | None = None
 
     @model_validator(mode="after")
     def _bounds(self):

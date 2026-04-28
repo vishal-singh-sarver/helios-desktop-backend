@@ -26,13 +26,8 @@ async def create_data_type(
 
 @router.get("/")
 async def list_data_types(db: Session = Depends(get_db)):
-    return data_type_service.list_data_types(db)
-
-
-@router.get("/with-units")
-async def list_data_types_with_units(db: Session = Depends(get_db)):
     """Return all data types with their data_units nested under each."""
-    return data_type_service.list_data_types_with_units(db)
+    return data_type_service.list_data_types(db)
 
 
 @router.get("/{data_type_id}")

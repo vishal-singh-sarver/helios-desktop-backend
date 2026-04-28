@@ -47,19 +47,13 @@ def create_data_type(
 
 
 def list_data_types(db: Session) -> dict:
-    rows = db.query(HeliosDataType).order_by(HeliosDataType.id.asc()).all()
-    return {"data_types": [_serialize(r) for r in rows]}
-
-
-def list_data_types_with_units(db: Session) -> dict:
     """Return all data types, each with its data_units nested.
 
-    Two flat queries grouped in Python — cheaper for the common case of a
-    small catalog than a JOIN that returns one row per (type, unit) pair.
-    Types with no units come back with `units: []`.
+    Two flat queries grouped in Python — cheaper for a small catalog than
+    a JOIN that returns one row per (type, unit) pair. Types with no
+    units come back with `units: []`.
 
-    Ordering: types by id asc, units within each type by id asc — matches
-    the flat list endpoints so callers see a consistent sort.
+    Ordering: types by id asc, units within each type by id asc.
     """
     types = db.query(HeliosDataType).order_by(HeliosDataType.id.asc()).all()
     units = db.query(DataUnit).order_by(DataUnit.id.asc()).all()

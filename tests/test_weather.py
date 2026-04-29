@@ -327,6 +327,168 @@ def test_delete_wipe_all_returns_success(client):
     assert r.status_code in (200, 503)
 
 
+# ─────────────────────────── /update — batch cell updates ──────────────────
+
+
+def _seed_two_cell_column(client, sid, pid, scn) -> tuple[int, int]:
+    """Create two columns, each with two cells at known timestamps.
+    Returns the two header ids."""
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+    seed = [
+        {"date": "2024-01-01", "time": "10:00:00", "value": "1.0"},
+        {"date": "2024-01-01", "time": "11:00:00", "value": "2.0"},
+    ]
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "a", "datatype": dt, "data_unit": u, "values": seed},
+            {"name": "b", "datatype": dt, "data_unit": u, "values": seed},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    cols = r.json()["columns"]
+    return cols[0]["id"], cols[1]["id"]
+
+
+def test_update_single_cell(client):
+    sid, pid, scn = _make_project(client)
+    a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": [
+            {"col": str(a_id), "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "99.5"},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"success": True, "updated_count": 1}
+
+
+def test_update_many_cells_in_one_call(client):
+    """Mirrors the data-unit conversion case: many cells under the same
+    column rewritten in a single round-trip."""
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": [
+            {"col": str(a_id), "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "33.8"},
+            {"col": str(a_id), "row": {"date": "2024-01-01", "time": "11:00:00"}, "value": "35.6"},
+            {"col": str(b_id), "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "100.0"},
+            {"col": str(b_id), "row": {"date": "2024-01-01", "time": "11:00:00"}, "value": "200.0"},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"success": True, "updated_count": 4}
+
+
+def test_update_empty_list_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": []},
+    )
+    assert r.status_code == 400
+    assert "cannot be empty" in r.json()["detail"].lower()
+
+
+def test_update_reserved_column_name_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": [
+            {"col": str(a_id), "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "1.0"},
+            {"col": "date",   "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "2.0"},
+        ]},
+    )
+    assert r.status_code == 400
+    assert "updates[1]" in r.json()["detail"]
+
+
+def test_update_unknown_column_returns_404(client):
+    sid, pid, scn = _make_project(client)
+    a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": [
+            {"col": "99999999", "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "1.0"},
+        ]},
+    )
+    assert r.status_code == 404
+    assert "updates[0]" in r.json()["detail"]
+
+
+def test_update_unknown_cell_returns_404(client):
+    """Cell at (col, date, time) not present → 404 from PyHelios."""
+    sid, pid, scn = _make_project(client)
+    a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": [
+            {"col": str(a_id), "row": {"date": "2099-12-31", "time": "23:59:59"}, "value": "1.0"},
+        ]},
+    )
+    assert r.status_code == 404
+
+
+def test_update_non_numeric_value_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": [
+            {"col": str(a_id), "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "hello"},
+        ]},
+    )
+    assert r.status_code == 400
+
+
+def test_update_partial_failure_leaves_earlier_items_applied(client):
+    """Fail-fast: items processed before the failing one stay applied
+    (PyHelios isn't transactional). Documents the contract."""
+    sid, pid, scn = _make_project(client)
+    a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": [
+            {"col": str(a_id), "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "77.7"},
+            {"col": "99999999", "row": {"date": "2024-01-01", "time": "10:00:00"}, "value": "1.0"},
+        ]},
+    )
+    assert r.status_code == 404
+    assert "updates[1]" in r.json()["detail"]
+
+    # First item already applied — verify by reading the row back
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    rows = r.json()["rows"]
+    matching = next(
+        row for row in rows
+        if row["date"] == "2024-01-01" and row["time"] == "10:00:00"
+    )
+    # PyHelios stores 32-bit floats; round-trip loses precision.
+    assert matching[str(a_id)] == pytest.approx(77.7)
+
+
 # ─────────────────────────── /clear_data — clear both stores ────────────────
 
 

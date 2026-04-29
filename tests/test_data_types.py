@@ -5,6 +5,7 @@ Catalog is global (no session_id needed). Each test uses unique
 uuid-suffixed names so the shared test DB doesn't cause cross-test
 collisions.
 """
+import pytest
 from uuid import uuid4
 
 
@@ -227,3 +228,98 @@ def test_list_unit_payload_includes_conversion_fields(client):
     assert unit["to_base_factor"] == 0.5
     assert unit["to_base_offset"] == -10.0
     assert unit["is_base"] is True
+
+
+# ─── Default catalog seeded by migration 011 ────────────────────────────────
+#
+# The 9 weather parameters defined in the design doc with their canonical
+# units and conversion factors. Each parent has exactly one base unit
+# (enforced by the partial unique index from migration 010).
+
+
+def _by_name(client) -> dict[str, dict]:
+    """Return the catalog as a {data_type_name: row} map for assertions."""
+    r = client.get("/api/data-types/")
+    assert r.status_code == 200
+    return {t["data_type"]: t for t in r.json()["data_types"]}
+
+
+def test_default_data_types_seeded(client):
+    """All 9 weather parameters from the design doc are present."""
+    by_name = _by_name(client)
+    expected = {
+        "Direct Normal Radiation",
+        "Diffuse Horizontal Radiation",
+        "Air Temperature",
+        "Air Pressure",
+        "Air Humidity",
+        "Wind Speed",
+        "Turbidity",
+        "Beta Soil",
+        "Air CO2",
+    }
+    assert expected.issubset(set(by_name.keys()))
+
+
+def test_each_default_type_has_exactly_one_base_unit(client):
+    """Partial unique index from migration 010 enforces this, but verify
+    the seed data didn't somehow ship with zero or multiple bases."""
+    by_name = _by_name(client)
+    for type_name in (
+        "Direct Normal Radiation", "Diffuse Horizontal Radiation",
+        "Air Temperature", "Air Pressure", "Air Humidity", "Wind Speed",
+        "Turbidity", "Beta Soil", "Air CO2",
+    ):
+        units = by_name[type_name]["units"]
+        bases = [u for u in units if u["is_base"]]
+        assert len(bases) == 1, f"{type_name}: expected 1 base unit, got {len(bases)}"
+
+
+def test_air_temperature_conversion_factors(client):
+    """C → K and F → K factors round-trip to the canonical Kelvin values."""
+    units = {u["unit"]: u for u in _by_name(client)["Air Temperature"]["units"]}
+
+    # 0°C should equal 273.15 K
+    c = units["C"]
+    assert 0 * c["to_base_factor"] + c["to_base_offset"] == pytest.approx(273.15)
+
+    # 32°F should equal 273.15 K
+    f = units["F"]
+    assert 32 * f["to_base_factor"] + f["to_base_offset"] == pytest.approx(273.15, rel=1e-4)
+
+
+def test_air_pressure_conversion_factors(client):
+    units = {u["unit"]: u for u in _by_name(client)["Air Pressure"]["units"]}
+    # 1 atm should equal 101325 Pa
+    assert 1 * units["atm"]["to_base_factor"] + units["atm"]["to_base_offset"] == 101325.0
+    # 1 bar should equal 100000 Pa
+    assert 1 * units["bar"]["to_base_factor"] + units["bar"]["to_base_offset"] == 100000.0
+
+
+def test_wind_speed_conversion_factors(client):
+    units = {u["unit"]: u for u in _by_name(client)["Wind Speed"]["units"]}
+    # 3.6 km/h should equal 1 m/s
+    assert 3.6 * units["km/h"]["to_base_factor"] == pytest.approx(1.0)
+
+
+def test_co2_conversion_factors(client):
+    units = {u["unit"]: u for u in _by_name(client)["Air CO2"]["units"]}
+    # 1000 ppb = 1 ppm
+    assert 1000 * units["ppb"]["to_base_factor"] == pytest.approx(1.0)
+
+
+def test_default_units_min_max_set_on_base(client):
+    """Each base unit carries the design-doc min/max range; secondary
+    units leave them null (the range is meaningful in the canonical unit)."""
+    by_name = _by_name(client)
+
+    # Air Temperature K base: 223–350
+    units = {u["unit"]: u for u in by_name["Air Temperature"]["units"]}
+    assert units["K"]["min"] == 223
+    assert units["K"]["max"] == 350
+    assert units["C"]["min"] is None  # secondary unit — no range
+
+    # Air Humidity fraction base: 0–1
+    units = {u["unit"]: u for u in by_name["Air Humidity"]["units"]}
+    assert units["fraction"]["min"] == 0
+    assert units["fraction"]["max"] == 1

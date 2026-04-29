@@ -88,13 +88,30 @@ class AddRowsRequest(BaseModel):
     rows: list[dict[str, Any]]
 
 
-class UpdateRequest(BaseModel):
-    """Body for POST /update. Updates a single cell identified by (col, row)."""
+class UpdateValue(BaseModel):
+    """One cell update inside the UpdateRequest.updates list.
+
+    `col` is the PyHelios label (str(header.id)). `row` is the cell's
+    (date, time). `value` empty-string is treated as NaN (clears the cell).
+    """
     model_config = ConfigDict(extra="forbid")
 
     col: str
     row: RowRef
     value: str = ""
+
+
+class UpdateRequest(BaseModel):
+    """Body for POST /update — batch update of one or more existing cells.
+
+    Each item identifies a cell by (col, row) and provides the new value.
+    Used by the frontend when re-converting a column's values after the
+    user changes its data_unit. Empty `updates` list is rejected at the
+    service layer so the frontend gets a clear signal instead of a no-op.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    updates: list[UpdateValue]
 
 
 class DeleteColumn(BaseModel):

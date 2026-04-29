@@ -832,35 +832,53 @@ def add_rows(
     }
 
 
-# ─── update — pre-checks the cell exists ─────────────────────────────────────
+# ─── update — batch update of existing cells ────────────────────────────────
 
 
-def update_cell(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
-    """Update ONE existing cell. Returns 404 if the cell doesn't exist."""
+def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
+    """Update one or more existing cells in a single call.
+
+    Used by the frontend when changing a column's data_unit — every cell
+    in that column needs to be rewritten with the converted value. Each
+    item is independent: same column allowed across items, or different
+    columns mixed in.
+
+    Fail-fast on the first error. PyHelios isn't transactional and has no
+    remove API, so any items processed before the failing one stay
+    applied. The error includes the item index so the frontend can
+    pinpoint which one failed.
+    """
     if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
         raise HTTPException(503, "PyHelios not available")
     ctx = sctx.context
 
-    # Business rule — PyHelios doesn't reserve these names, we do.
-    if req.col in ("date", "time"):
-        raise HTTPException(400, "cannot update the date/time column")
+    if len(req.updates) == 0:
+        raise HTTPException(400, "updates list cannot be empty")
 
-    date_obj, time_obj = _helios_date_time(req.row.date, req.row.time)
+    for i, item in enumerate(req.updates):
+        # Business rule — PyHelios doesn't reserve these names, we do.
+        if item.col in ("date", "time"):
+            raise HTTPException(
+                400, f"updates[{i}]: cannot update the date/time column"
+            )
 
-    # PyHelios validates everything else for us:
-    #   - missing column          → HeliosRuntimeError
-    #   - missing cell at (d, t)  → HeliosRuntimeError
-    #   - non-numeric value       → ValueError (from float() cast)
-    # Catch its specific exception types and convert to clean HTTP codes.
-    try:
-        new_value = float("nan") if req.value == "" else float(req.value)
-        ctx.updateTimeseriesData(req.col, date_obj, time_obj, new_value)
-    except ValueError as exc:
-        raise HTTPException(400, f"value '{req.value}' is not numeric: {exc}")
-    except HeliosRuntimeError as exc:
-        raise HTTPException(404, str(exc))
+        date_obj, time_obj = _helios_date_time(item.row.date, item.row.time)
 
-    return {"success": True}
+        # PyHelios validates everything else for us:
+        #   - missing column          → HeliosRuntimeError
+        #   - missing cell at (d, t)  → HeliosRuntimeError
+        #   - non-numeric value       → ValueError (from float() cast)
+        try:
+            new_value = float("nan") if item.value == "" else float(item.value)
+            ctx.updateTimeseriesData(item.col, date_obj, time_obj, new_value)
+        except ValueError as exc:
+            raise HTTPException(
+                400, f"updates[{i}]: value '{item.value}' is not numeric: {exc}"
+            )
+        except HeliosRuntimeError as exc:
+            raise HTTPException(404, f"updates[{i}]: {exc}")
+
+    return {"success": True, "updated_count": len(req.updates)}
 
 
 # ─── delete — direct updateTimeseriesData calls (no wrappers) ────────────────

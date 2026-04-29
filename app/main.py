@@ -6,6 +6,7 @@ from app.core.lifespan import lifespan
 from app.routers import (
     system,
     project,
+    scenario,
     geometry,
     objects,
     tree,
@@ -13,8 +14,11 @@ from app.routers import (
     materials,
     transforms,
     timeseries,
+    weather,
     import_export,
     scripting,
+    helios_data_type,
+    data_unit,
 )
 
 app = FastAPI(
@@ -43,6 +47,7 @@ async def stale_pyhelios_header(request: Request, call_next):
 # ── Routers ────────────────────────────────────────────────────────────────
 app.include_router(system.router)
 app.include_router(project.router,       prefix="/api/project",    tags=["project"])
+app.include_router(scenario.router,      prefix="/api/project",    tags=["scenario"])
 app.include_router(geometry.router,      prefix="/api/geometry",   tags=["geometry"])
 app.include_router(objects.router,       prefix="/api/objects",    tags=["objects"])
 app.include_router(tree.router,          prefix="/api/tree",       tags=["tree"])
@@ -50,5 +55,8 @@ app.include_router(plantarch.router,     prefix="/api/plantarch",  tags=["planta
 app.include_router(materials.router,     prefix="/api/materials",  tags=["materials"])
 app.include_router(transforms.router,    prefix="/api/geometry",   tags=["transforms"])
 app.include_router(timeseries.router,    prefix="/api/timeseries", tags=["timeseries"])
+app.include_router(weather.router,       prefix="/api/weather",    tags=["weather"])
 app.include_router(import_export.router, prefix="/api",            tags=["import"])
 app.include_router(scripting.router,     prefix="/api/script",     tags=["scripting"])
+app.include_router(helios_data_type.router, prefix="/api/data-types", tags=["catalog"])
+app.include_router(data_unit.router,        prefix="/api/data-units", tags=["catalog"])

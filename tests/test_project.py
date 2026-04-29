@@ -23,6 +23,14 @@ def test_create_project_success(client):
     assert data["longitude"] == 77.2
     assert "project_id" in data
     assert "utc_offset" in data
+    # utc_offset is now an ISO 8601 offset string ("+HH:MM" / "-HH:MM").
+    # Migration 012 changed the column from REAL fractional hours to TEXT.
+    import re
+    assert isinstance(data["utc_offset"], str)
+    assert re.fullmatch(r"[+-]\d{2}:\d{2}", data["utc_offset"]), data["utc_offset"]
+    # New project auto-creates a "main" scenario
+    assert "main_scenario_id" in data
+    assert data["main_scenario_id"]
 
     # Project state must be initialized in memory under the correct session
     project_id = data["project_id"]
@@ -261,3 +269,148 @@ def test_delete_project_success_and_wrong_session_rejected(client):
     assert recent_after.status_code == 200
     remaining_ids = {item["id"] for item in recent_after.json()["projects"]}
     assert project_id not in remaining_ids
+
+
+# ─── GET /api/project/{project_id} — project + scenarios + headers ──────────
+
+
+def _make_project(client, session_id: str | None = None) -> tuple[str, str, str]:
+    """Returns (session_id, project_id, main_scenario_id)."""
+    sid = session_id or f"session_{uuid4().hex[:8]}"
+    r = client.post(
+        "/api/project/create",
+        json={"name": f"Pgw_{uuid4().hex[:8]}", "latitude": 10.0, "longitude": 20.0},
+        headers={"session-id": sid},
+    )
+    assert r.status_code == 201
+    body = r.json()
+    return sid, body["project_id"], body["main_scenario_id"]
+
+
+def _make_data_type(client) -> int:
+    r = client.post("/api/data-types/", json={"data_type": f"T_{uuid4().hex[:8]}"})
+    assert r.status_code == 201, r.text
+    return r.json()["data_type"]["id"]
+
+
+def _make_data_unit(client, data_type_id: int) -> int:
+    r = client.post(
+        "/api/data-units/",
+        json={"unit": f"u_{uuid4().hex[:8]}", "data_type_id": data_type_id},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["data_unit"]["id"]
+
+
+def test_get_project_returns_project_and_main_scenario(client):
+    sid, pid, scn = _make_project(client)
+
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid})
+    assert r.status_code == 200
+    body = r.json()["project"]
+
+    assert body["id"] == pid
+    assert "name" in body
+    assert "latitude" in body
+    assert "longitude" in body
+    assert "utc_offset" in body
+    assert isinstance(body["scenarios"], list)
+    assert len(body["scenarios"]) == 1
+
+    main = body["scenarios"][0]
+    assert main["id"] == scn
+    assert main["name"] == "main"
+    assert main["weather_data_headers"] == []
+
+
+def test_get_project_includes_all_scenarios(client):
+    sid, pid, _ = _make_project(client)
+
+    # Add a second scenario
+    r = client.post(
+        f"/api/project/{pid}/scenarios/create",
+        json={"name": "scenario_two"},
+        headers={"session-id": sid},
+    )
+    assert r.status_code == 201
+
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid})
+    scenarios = r.json()["project"]["scenarios"]
+    names = [s["name"] for s in scenarios]
+    assert "main" in names
+    assert "scenario_two" in names
+
+
+def test_get_project_nests_weather_headers_per_scenario(client):
+    sid, pid, scn = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # Install a header on the main scenario
+    r = client.put(
+        f"/api/weather/project/{pid}/scenario/{scn}/weather_data_header",
+        headers={"session-id": sid},
+        json={"headers": [
+            {"name": "temp", "helios_data_type_id": dt, "unit_id": u, "display_order": 0}
+        ]},
+    )
+    assert r.status_code == 200
+
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid})
+    main = r.json()["project"]["scenarios"][0]
+    assert len(main["weather_data_headers"]) == 1
+    h = main["weather_data_headers"][0]
+    assert h["name"] == "temp"
+    assert h["helios_data_type_id"] == dt
+    assert h["unit_id"] == u
+
+
+def test_get_project_headers_isolated_per_scenario(client):
+    """Headers in scenario A must not appear under scenario B."""
+    sid, pid, scn_a = _make_project(client)
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    # Create a second scenario
+    r = client.post(
+        f"/api/project/{pid}/scenarios/create",
+        json={"name": "second"},
+        headers={"session-id": sid},
+    )
+    scn_b = r.json()["scenario_id"]
+
+    # Headers ONLY on scenario A
+    client.put(
+        f"/api/weather/project/{pid}/scenario/{scn_a}/weather_data_header",
+        headers={"session-id": sid},
+        json={"headers": [
+            {"name": "only_in_a", "helios_data_type_id": dt, "unit_id": u, "display_order": 0}
+        ]},
+    )
+
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid})
+    by_id = {s["id"]: s for s in r.json()["project"]["scenarios"]}
+    assert len(by_id[scn_a]["weather_data_headers"]) == 1
+    assert by_id[scn_b]["weather_data_headers"] == []
+
+
+def test_get_project_unknown_returns_404(client):
+    sid = f"session_{uuid4().hex[:8]}"
+    r = client.get(f"/api/project/{uuid4().hex}", headers={"session-id": sid})
+    assert r.status_code == 404
+
+
+def test_get_project_from_another_session_returns_404(client):
+    _, pid, _ = _make_project(client)
+    sid_intruder = f"session_{uuid4().hex[:8]}"
+
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid_intruder})
+    assert r.status_code == 404
+
+
+def test_get_project_does_not_collide_with_recent_route(client):
+    """`/recent` is a literal path; it must not be parsed as a project_id."""
+    sid = f"session_{uuid4().hex[:8]}"
+    r = client.get("/api/project/recent", headers={"session-id": sid})
+    assert r.status_code == 200
+    assert "projects" in r.json()

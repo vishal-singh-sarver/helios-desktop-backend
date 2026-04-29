@@ -28,6 +28,16 @@ async def list_recent_projects(
     return project_service.list_recent_projects(session_id, db)
 
 
+@router.get("/{project_id}")
+async def get_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    session_id: str = Depends(get_session_id),
+):
+    """Project + its scenarios + each scenario's weather_data_headers."""
+    return project_service.get_project_with_scenarios(session_id, project_id, db)
+
+
 @router.delete("/{project_id}")
 async def delete_project(
     project_id: str,

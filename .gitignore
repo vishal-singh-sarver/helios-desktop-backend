@@ -20,12 +20,12 @@ venv/
 .venv/
 env/
 
-# Runtime data
-data/heliosgui.db
-data/heliosgui.db-shm
-data/heliosgui.db-wal
-data/projects/
+# Runtime data — ignore everything under data/ except the .gitkeep marker
+data/*
 !data/.gitkeep
+
+# Local documentation (not committed — maintained separately)
+docs/
 
 # Temporary XML snapshots
 *.xml.gz

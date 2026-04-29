@@ -35,11 +35,15 @@ CREATE TABLE IF NOT EXISTS data_units (
 
 CREATE INDEX IF NOT EXISTS idx_data_units_data_type ON data_units(data_type_id);
 
+-- helios_data_type_id and unit_id are nullable: a column header may be
+-- created before the user has chosen which (data_type, unit) it
+-- represents. Pairing consistency (when both are set) is enforced at
+-- the service layer.
 CREATE TABLE IF NOT EXISTS weather_data_headers (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     scenario_id         TEXT    NOT NULL REFERENCES scenarios(id)         ON DELETE CASCADE,
-    helios_data_type_id INTEGER NOT NULL REFERENCES helios_data_types(id) ON DELETE RESTRICT,
-    unit_id             INTEGER NOT NULL REFERENCES data_units(id)        ON DELETE RESTRICT,
+    helios_data_type_id INTEGER          REFERENCES helios_data_types(id) ON DELETE RESTRICT,
+    unit_id             INTEGER          REFERENCES data_units(id)        ON DELETE RESTRICT,
     name                TEXT    NOT NULL,
     status              INTEGER NOT NULL DEFAULT 1,
     display_order       INTEGER NOT NULL DEFAULT 0,

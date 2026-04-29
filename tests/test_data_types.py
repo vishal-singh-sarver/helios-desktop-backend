@@ -245,18 +245,21 @@ def _by_name(client) -> dict[str, dict]:
 
 
 def test_default_data_types_seeded(client):
-    """All 9 weather parameters from the design doc are present."""
+    """All 9 weather parameters from the design doc are present.
+    Names match the doc's "Key used" column — snake_case for the seven
+    that have a key, Title Case for the two radiation types where the
+    doc leaves "Key used" empty."""
     by_name = _by_name(client)
     expected = {
         "Direct Normal Radiation",
         "Diffuse Horizontal Radiation",
-        "Air Temperature",
-        "Air Pressure",
-        "Air Humidity",
-        "Wind Speed",
-        "Turbidity",
-        "Beta Soil",
-        "Air CO2",
+        "air_temperature",
+        "air_pressure",
+        "air_humidity",
+        "wind_speed",
+        "turbidity",
+        "beta_soil",
+        "air_CO2",
     }
     assert expected.issubset(set(by_name.keys()))
 
@@ -267,8 +270,8 @@ def test_each_default_type_has_exactly_one_base_unit(client):
     by_name = _by_name(client)
     for type_name in (
         "Direct Normal Radiation", "Diffuse Horizontal Radiation",
-        "Air Temperature", "Air Pressure", "Air Humidity", "Wind Speed",
-        "Turbidity", "Beta Soil", "Air CO2",
+        "air_temperature", "air_pressure", "air_humidity", "wind_speed",
+        "turbidity", "beta_soil", "air_CO2",
     ):
         units = by_name[type_name]["units"]
         bases = [u for u in units if u["is_base"]]
@@ -277,7 +280,7 @@ def test_each_default_type_has_exactly_one_base_unit(client):
 
 def test_air_temperature_conversion_factors(client):
     """C → K and F → K factors round-trip to the canonical Kelvin values."""
-    units = {u["unit"]: u for u in _by_name(client)["Air Temperature"]["units"]}
+    units = {u["unit"]: u for u in _by_name(client)["air_temperature"]["units"]}
 
     # 0°C should equal 273.15 K
     c = units["C"]
@@ -289,7 +292,7 @@ def test_air_temperature_conversion_factors(client):
 
 
 def test_air_pressure_conversion_factors(client):
-    units = {u["unit"]: u for u in _by_name(client)["Air Pressure"]["units"]}
+    units = {u["unit"]: u for u in _by_name(client)["air_pressure"]["units"]}
     # 1 atm should equal 101325 Pa
     assert 1 * units["atm"]["to_base_factor"] + units["atm"]["to_base_offset"] == 101325.0
     # 1 bar should equal 100000 Pa
@@ -297,13 +300,13 @@ def test_air_pressure_conversion_factors(client):
 
 
 def test_wind_speed_conversion_factors(client):
-    units = {u["unit"]: u for u in _by_name(client)["Wind Speed"]["units"]}
+    units = {u["unit"]: u for u in _by_name(client)["wind_speed"]["units"]}
     # 3.6 km/h should equal 1 m/s
     assert 3.6 * units["km/h"]["to_base_factor"] == pytest.approx(1.0)
 
 
 def test_co2_conversion_factors(client):
-    units = {u["unit"]: u for u in _by_name(client)["Air CO2"]["units"]}
+    units = {u["unit"]: u for u in _by_name(client)["air_CO2"]["units"]}
     # 1000 ppb = 1 ppm
     assert 1000 * units["ppb"]["to_base_factor"] == pytest.approx(1.0)
 
@@ -313,13 +316,13 @@ def test_default_units_min_max_set_on_base(client):
     units leave them null (the range is meaningful in the canonical unit)."""
     by_name = _by_name(client)
 
-    # Air Temperature K base: 223–350
-    units = {u["unit"]: u for u in by_name["Air Temperature"]["units"]}
+    # air_temperature K base: 223–350
+    units = {u["unit"]: u for u in by_name["air_temperature"]["units"]}
     assert units["K"]["min"] == 223
     assert units["K"]["max"] == 350
     assert units["C"]["min"] is None  # secondary unit — no range
 
-    # Air Humidity fraction base: 0–1
-    units = {u["unit"]: u for u in by_name["Air Humidity"]["units"]}
+    # air_humidity fraction base: 0–1
+    units = {u["unit"]: u for u in by_name["air_humidity"]["units"]}
     assert units["fraction"]["min"] == 0
     assert units["fraction"]["max"] == 1

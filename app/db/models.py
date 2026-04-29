@@ -27,7 +27,7 @@ class Project(Base):
     name               = Column(Text, nullable=False)
     latitude           = Column(Float, nullable=False, default=0.0)
     longitude          = Column(Float, nullable=False, default=0.0)
-    utc_offset         = Column(Float, nullable=False, default=0.0)
+    utc_offset         = Column(Text, nullable=False, default="+00:00")
     created_at         = Column(Text, nullable=False, default=_now)
     updated_at         = Column(Text, nullable=False, default=_now, onupdate=_now)
     current_version_id = Column(Integer, ForeignKey("project_versions.id", ondelete="SET NULL"), nullable=True)

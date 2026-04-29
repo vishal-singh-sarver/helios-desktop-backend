@@ -23,6 +23,11 @@ def test_create_project_success(client):
     assert data["longitude"] == 77.2
     assert "project_id" in data
     assert "utc_offset" in data
+    # utc_offset is now an ISO 8601 offset string ("+HH:MM" / "-HH:MM").
+    # Migration 012 changed the column from REAL fractional hours to TEXT.
+    import re
+    assert isinstance(data["utc_offset"], str)
+    assert re.fullmatch(r"[+-]\d{2}:\d{2}", data["utc_offset"]), data["utc_offset"]
     # New project auto-creates a "main" scenario
     assert "main_scenario_id" in data
     assert data["main_scenario_id"]

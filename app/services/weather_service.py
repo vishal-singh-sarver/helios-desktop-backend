@@ -807,23 +807,19 @@ def add_rows(
             )
 
     # ── Write ──
-    # null / "" / missing → NaN write so the row exists across every label
-    # (otherwise PyHelios would only carry the row under labels that had
-    # numeric values, and `getAllTimeSeriesData` would show ragged columns).
     added_rows = 0
     for row_data in rows:
         cells: dict[str, float] = {}
         for k, v in row_data.items():
             if k in ("date", "time"):
                 continue
-            if v is None:
-                cells[k] = float("nan")
-            elif isinstance(v, str) and v.strip() == "":
-                cells[k] = float("nan")
-            elif _is_numeric_value(v):
-                vstr = v if isinstance(v, str) else str(v)
+            vstr = v if isinstance(v, str) else str(v)
+            if _is_numeric_value(v) or (
+                isinstance(v, str)
+                and _is_numeric_or_empty(vstr)
+                and vstr.strip()
+            ):
                 cells[k] = float(vstr)
-            # else: non-numeric, non-empty string — silently skipped
         if cells:
             _add_row(ctx, row_data["date"], row_data["time"], cells)
         added_rows += 1

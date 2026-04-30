@@ -137,6 +137,21 @@ def test_patch_unknown_id_returns_404(client):
     assert r.status_code == 404
 
 
+# ─── 'check' data type seeded as a units-less catalog entry ────────────────
+
+
+def test_check_data_type_seeded_with_no_units(client):
+    """Migration 011 seeds a 'check' entry in helios_data_types — a
+    boolean / checkbox-style measurement that has no associated units.
+    Frontend uses this when a column should render as a checkbox instead
+    of a numeric input."""
+    r = client.get("/api/data-types/")
+    by_name = {t["data_type"]: t for t in r.json()["data_types"]}
+
+    assert "check" in by_name, "'check' data type should be seeded by migration 013"
+    assert by_name["check"]["units"] == [], "'check' should have an empty units list"
+
+
 # ─── DELETE ──────────────────────────────────────────────────────────────────
 
 

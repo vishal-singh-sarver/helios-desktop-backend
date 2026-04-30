@@ -39,7 +39,8 @@ INSERT OR IGNORE INTO helios_data_types (data_type, description) VALUES
     ('wind_speed',                   'Wind velocity affecting the environment'),
     ('turbidity',                    'Clarity of the atmosphere, affecting sunlight scattering'),
     ('beta_soil',                    'Soil moisture factor (effective water content vs field capacity / wilting point)'),
-    ('air_CO2',                      'CO2 concentration of air outside primitive boundary-layer');
+    ('air_CO2',                      'CO2 concentration of air outside primitive boundary-layer'),
+    ('check',                        'Boolean / checkbox-style measurement (no units)');
 
 -- ── Direct Normal Radiation: base = W/m^2 (no snake_case key in doc) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES

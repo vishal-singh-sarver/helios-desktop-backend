@@ -155,6 +155,7 @@ pyinstaller \
     --collect-all pydantic \
     --collect-all sqlalchemy \
     --add-data "$BACKEND_DIR/pyhelios:pyhelios" \
+    --add-data "$BACKEND_DIR/app/db/migrations:app/db/migrations" \
     $PYHELIOS_ADD_BINARY \
     $HIDDEN_IMPORTS_STR \
     backend_wrapper.py

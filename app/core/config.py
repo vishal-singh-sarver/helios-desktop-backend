@@ -1,4 +1,5 @@
 from pathlib import Path
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,7 +24,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
     # Storage
-    data_dir: Path = Path("data")
+    data_dir: Path = Field(default=Path("data"), validation_alias="HELIOS_DATA_DIR")
 
     # Database — derived from data_dir unless explicitly set
     db_path: Path | None = None

@@ -135,12 +135,17 @@ done
 #   --onedir:  Directory structure, no extraction needed on subsequent runs (~0.5s startup)
 LIBHELIOS_PATH="$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/$LIBHELIOS_NAME"
 
-PYHELIOS_ADD_BINARY=""
-if [ -f "$LIBHELIOS_PATH" ]; then
-    PYHELIOS_ADD_BINARY="--add-binary $LIBHELIOS_PATH:pyhelios/pyhelios_build/build/lib/"
-else
-    echo "[!] WARNING: $LIBHELIOS_PATH not found — pyhelios native library will not be bundled"
+if [ ! -f "$LIBHELIOS_PATH" ]; then
+    echo "[*] $LIBHELIOS_NAME not found — building PyHelios from source..."
+    bash "$BACKEND_DIR/scripts/build_pyhelios.sh"
 fi
+
+if [ ! -f "$LIBHELIOS_PATH" ]; then
+    echo "[!] ERROR: $LIBHELIOS_PATH still missing after build. Aborting."
+    exit 1
+fi
+
+PYHELIOS_ADD_BINARY="--add-binary $LIBHELIOS_PATH:pyhelios/pyhelios_build/build/lib/"
 
 pyinstaller \
     --onedir \

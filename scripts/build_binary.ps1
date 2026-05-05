@@ -160,19 +160,40 @@ $pyInstallerArgs = @(
   '--collect-all', 'sqlalchemy'
 )
 
-# Bundle pyhelios submodule (Windows uses ';' as PyInstaller path separator)
+# Bundle the pyhelios Python package and its native runtime DLLs only.
+# We deliberately do NOT bundle the entire pyhelios/ submodule (helios-core/,
+# pyhelios_build/build/, tests/, docs/, build_scripts/) - those aren't needed
+# at runtime, and the deep MSBuild .tlog paths under pyhelios_build/build/
+# blow Windows' MAX_PATH (260 chars) during PyInstaller's COLLECT phase.
 $pyheliosSrc = Join-Path $backendApiDir 'pyhelios'
-if (Test-Path $pyheliosSrc) {
-  $pyInstallerArgs += @('--add-data', "$pyheliosSrc;pyhelios")
+$pyheliosPkg = Join-Path $pyheliosSrc 'pyhelios'
+if (Test-Path $pyheliosPkg) {
+  $pyInstallerArgs += @('--add-data', "$pyheliosPkg;pyhelios\pyhelios")
 } else {
-  Write-Host "[!] WARNING: pyhelios submodule not found at $pyheliosSrc — pyhelios will not be bundled"
+  Write-Host "[!] WARNING: pyhelios package not found at $pyheliosPkg - pyhelios will not be bundled"
 }
 
-$libheliosPath = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\libhelios.dll'
-if (Test-Path $libheliosPath) {
-  $pyInstallerArgs += @('--add-binary', "$libheliosPath;pyhelios\pyhelios_build\build\lib\")
-} else {
-  Write-Host "[!] WARNING: libhelios.dll not found at $libheliosPath — native library will not be bundled"
+# Native runtime DLLs go where the loader expects them:
+#   pyhelios/plugins/loader.py:_find_library_directory() searches
+#   <pyhelios_root>/pyhelios_build/build/lib/ for libhelios.dll.
+$libBuildDir  = Join-Path $pyheliosSrc 'pyhelios_build\build\lib'
+$buildRootDir = Join-Path $pyheliosSrc 'pyhelios_build\build'
+$runtimeDlls = @(
+  @{ Path = Join-Path $libBuildDir  'libhelios.dll';   Required = $true  }
+  @{ Path = Join-Path $libBuildDir  'optix.6.5.0.dll'; Required = $false }
+  @{ Path = Join-Path $buildRootDir 'glew32.dll';      Required = $false }
+)
+$libheliosBundled = $false
+foreach ($dll in $runtimeDlls) {
+  if (Test-Path $dll.Path) {
+    $pyInstallerArgs += @('--add-binary', "$($dll.Path);pyhelios\pyhelios_build\build\lib")
+    if ($dll.Path -like '*libhelios.dll') { $libheliosBundled = $true }
+  } elseif ($dll.Required) {
+    Write-Host "[!] WARNING: required runtime DLL not found at $($dll.Path)"
+  }
+}
+if (-not $libheliosBundled) {
+  Write-Host "[!] WARNING: libhelios.dll missing - backend will fail at runtime. Build it first with 'python build_scripts\build_helios.py' in pyhelios/."
 }
 
 foreach ($hiddenImport in $hiddenImports) {

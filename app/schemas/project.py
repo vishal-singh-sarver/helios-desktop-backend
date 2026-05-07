@@ -49,6 +49,64 @@ class ProjectCreateRequest(BaseModel):
         return value
 
 
+class ProjectUpdateRequest(BaseModel):
+    """PATCH /api/project/{project_id} — partial update.
+
+    All fields optional; only sent fields change. Same per-field validation
+    as create (length, range, numeric coercion). When latitude OR longitude
+    changes, the service recomputes utc_offset.
+    """
+
+    name: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value):
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("Project name is required")
+        if len(value) > 30:
+            raise ValueError("This field supports up to 30 characters only")
+        return value
+
+    @field_validator("latitude", "longitude", mode="before")
+    @classmethod
+    def validate_numeric_input(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            value = value.strip()
+            try:
+                return float(value)
+            except ValueError:
+                raise ValueError("Invalid input")
+        raise ValueError("Invalid input")
+
+    @field_validator("latitude")
+    @classmethod
+    def validate_latitude(cls, value):
+        if value is None:
+            return None
+        if not (-90 <= value <= 90):
+            raise ValueError("Invalid")
+        return value
+
+    @field_validator("longitude")
+    @classmethod
+    def validate_longitude(cls, value):
+        if value is None:
+            return None
+        if not (-180 <= value <= 180):
+            raise ValueError("Invalid")
+        return value
+
+
 class ProjectSaveRequest(BaseModel):
     label: str = ""
 

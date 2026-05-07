@@ -157,6 +157,89 @@ def list_recent_projects(session_id: str, db: Session) -> dict:
     return {"projects": recent}
 
 
+def update_project(
+    session_id: str,
+    project_id: str,
+    name: str | None,
+    latitude: float | None,
+    longitude: float | None,
+    db: Session,
+) -> dict:
+    """Partial update of a project. Editable: name, latitude, longitude.
+
+    Auth + scope: the project must belong to the calling session, else 404.
+
+    Behavior:
+      - Empty body / all-None is a 200 no-op.
+      - Renaming to the project's current name is a no-op (no 409).
+      - Name uniqueness is checked case-insensitive within the session,
+        excluding the project being updated.
+      - When latitude or longitude changes, utc_offset is recomputed from
+        the resulting (lat, long) pair.
+    """
+    project = (
+        db.query(Project)
+        .filter(Project.id == project_id, Project.session_id == session_id)
+        .first()
+    )
+    if project is None:
+        raise HTTPException(404, "Project not found")
+
+    # Name uniqueness — case-insensitive, excluding self.
+    clean_name = name
+    if clean_name is not None and clean_name.lower() != project.name.lower():
+        clash = (
+            db.query(Project.id)
+            .filter(
+                func.lower(Project.name) == clean_name.lower(),
+                Project.session_id == session_id,
+                Project.id != project_id,
+            )
+            .first()
+        )
+        if clash is not None:
+            raise HTTPException(
+                409, "A project with this name already exists"
+            )
+
+    # Apply changes.
+    coords_changed = False
+    if clean_name is not None:
+        project.name = clean_name
+    if latitude is not None and latitude != project.latitude:
+        project.latitude = latitude
+        coords_changed = True
+    if longitude is not None and longitude != project.longitude:
+        project.longitude = longitude
+        coords_changed = True
+
+    # Recompute utc_offset on coord changes.
+    if coords_changed:
+        project.utc_offset = utc_offset_from_coords(
+            project.latitude, project.longitude
+        )
+
+    try:
+        db.commit()
+        db.refresh(project)
+    except Exception:
+        db.rollback()
+        raise HTTPException(500, "Failed to update project")
+
+    return {
+        "success": True,
+        "project": {
+            "id": project.id,
+            "name": project.name,
+            "latitude": project.latitude,
+            "longitude": project.longitude,
+            "utc_offset": project.utc_offset,
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+        },
+    }
+
+
 def delete_project(session_id: str, project_id: str, db: Session) -> dict:
     # Pre-compute — DB work
     project = (

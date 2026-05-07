@@ -18,6 +18,7 @@ from app.schemas.weather import (
     AddColumnsRequest,
     AddRowsRequest,
     DeleteRequest,
+    UpdateColumnsRequest,
     UpdateRequest,
 )
 from app.schemas.weather_header import (
@@ -89,6 +90,21 @@ def add_columns(
     return weather_service.add_columns(sctx, body.column, db)
 
 
+@router.patch("/project/{project_id}/scenario/{scenario_id}/updateCol")
+def update_columns(
+    project_id: str,
+    scenario_id: str,
+    body: UpdateColumnsRequest = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Update one or more existing columns by name. Body shape mirrors
+    addCol; each item upserts cells in `values[]` and optionally fills
+    remaining scenario timestamps with `default_value`."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.update_columns(sctx, body.column, db)
+
+
 @router.post("/project/{project_id}/scenario/{scenario_id}/addRow")
 def add_rows(
     project_id: str,
@@ -102,7 +118,7 @@ def add_rows(
     return weather_service.add_rows(sctx, body.rows, db)
 
 
-@router.post("/project/{project_id}/scenario/{scenario_id}/update")
+@router.patch("/project/{project_id}/scenario/{scenario_id}/update")
 def update_weather(
     project_id: str,
     scenario_id: str,

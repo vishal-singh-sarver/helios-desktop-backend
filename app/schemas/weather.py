@@ -1,3 +1,4 @@
+
 """
 Request bodies for weather endpoints.
 
@@ -39,6 +40,9 @@ class AddColumn(BaseModel):
       data_unit -> data_units.id
     When non-null and both present, the unit must belong to the type
     (service-level invariant; the schema doesn't enforce cross-table CHECKs).
+
+    `default_value` (optional) fills any scenario timestamp NOT covered by
+    `values[]`. Numeric (or numeric string). Null/absent = no fill.
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -46,6 +50,7 @@ class AddColumn(BaseModel):
     datatype: int | None = None
     data_unit: int | None = None
     values: list[ColumnValue] = Field(default_factory=list)
+    default_value: float | None = None
 
     @field_validator("name")
     @classmethod
@@ -57,6 +62,25 @@ class AddColumn(BaseModel):
             raise ValueError("name must be 100 characters or fewer")
         return v
 
+    @field_validator("default_value", mode="before")
+    @classmethod
+    def _coerce_default(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("default_value must be numeric")
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                raise ValueError(f"default_value '{v}' is not numeric")
+        raise ValueError("default_value must be numeric")
+
 
 class AddColumnsRequest(BaseModel):
     """Body for POST /addCol — add one or more columns in a single batch.
@@ -64,6 +88,30 @@ class AddColumnsRequest(BaseModel):
     `column` is a list (frontend always sends an array, even for a single
     column). Empty list is rejected at the service layer for a clearer
     error than a silent no-op.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    column: list[AddColumn]
+
+    @model_validator(mode="after")
+    def _no_dup_column_names(self):
+        names = [c.name for c in self.column]
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate column name in request body")
+        return self
+
+
+class UpdateColumnsRequest(BaseModel):
+    """Body for PATCH /updateCol — update one or more existing columns.
+
+    Same shape as AddColumnsRequest. Each column item identifies an existing
+    column by `name` (must exist for the scenario; 404 otherwise). Per-item:
+      - `datatype` / `data_unit`: PATCH semantics — only updated when non-null.
+      - `values[]`: each cell upserts (creates if missing, overwrites if exists).
+      - `default_value`: writes the default at every scenario timestamp NOT
+        listed in `values[]`, OVERWRITING any existing cell at that timestamp.
+        Use case: select-all / deselect-all on a `check` column with one
+        PATCH call — `default_value: 1` flips every row to 1.
     """
     model_config = ConfigDict(extra="forbid")
 

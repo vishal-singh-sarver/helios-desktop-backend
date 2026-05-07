@@ -4,6 +4,15 @@
 -- models (radiation, energy balance, photosynthesis, etc.) along with
 -- their conversion factors back to a canonical base unit per type.
 --
+-- Naming: data_type values follow the doc's "Key used" column.
+--   - air_temperature, air_pressure, air_humidity, wind_speed, turbidity,
+--     beta_soil, air_CO2 — snake_case keys PyHelios expects when wiring
+--     weather data into the simulation models.
+--   - Direct Normal Radiation and Diffuse Horizontal Radiation — left
+--     as Title Case because the doc's "Key used" column is empty for
+--     these two; no canonical key is defined yet.
+-- Description carries the human-readable form.
+--
 -- Each parameter has exactly one base unit (is_base=1) and zero or more
 -- secondary units linearly convertible via:
 --     value_in_base = value * to_base_factor + to_base_offset
@@ -24,65 +33,66 @@
 INSERT OR IGNORE INTO helios_data_types (data_type, description) VALUES
     ('Direct Normal Radiation',      'Radiative flux normal to the direction of radiation propagation'),
     ('Diffuse Horizontal Radiation', 'Diffused solar radiation reaching the surface'),
-    ('Air Temperature',              'Ambient air temperature at the location'),
-    ('Air Pressure',                 'Atmospheric pressure value for the scenario'),
-    ('Air Humidity',                 'Relative humidity level of the air'),
-    ('Wind Speed',                   'Wind velocity affecting the environment'),
-    ('Turbidity',                    'Clarity of the atmosphere, affecting sunlight scattering'),
-    ('Beta Soil',                    'Soil moisture factor (effective water content vs field capacity / wilting point)'),
-    ('Air CO2',                      'CO2 concentration of air outside primitive boundary-layer');
+    ('air_temperature',              'Ambient air temperature at the location'),
+    ('air_pressure',                 'Atmospheric pressure value for the scenario'),
+    ('air_humidity',                 'Relative humidity level of the air'),
+    ('wind_speed',                   'Wind velocity affecting the environment'),
+    ('turbidity',                    'Clarity of the atmosphere, affecting sunlight scattering'),
+    ('beta_soil',                    'Soil moisture factor (effective water content vs field capacity / wilting point)'),
+    ('air_CO2',                      'CO2 concentration of air outside primitive boundary-layer'),
+    ('check',                        'Boolean / checkbox-style measurement (no units)');
 
--- ── Direct Normal Radiation: base = W/m^2 ──
+-- ── Direct Normal Radiation: base = W/m^2 (no snake_case key in doc) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
     ((SELECT id FROM helios_data_types WHERE data_type = 'Direct Normal Radiation'), 'W/m^2',  'W/m²',  1.0,    0.0, 1, 0, 1500),
     ((SELECT id FROM helios_data_types WHERE data_type = 'Direct Normal Radiation'), 'kW/m^2', 'kW/m²', 1000.0, 0.0, 0, NULL, NULL);
 
--- ── Diffuse Horizontal Radiation: base = W/m^2 ──
+-- ── Diffuse Horizontal Radiation: base = W/m^2 (no snake_case key in doc) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
     ((SELECT id FROM helios_data_types WHERE data_type = 'Diffuse Horizontal Radiation'), 'W/m^2',  'W/m²',  1.0,    0.0, 1, 0, 1500),
     ((SELECT id FROM helios_data_types WHERE data_type = 'Diffuse Horizontal Radiation'), 'kW/m^2', 'kW/m²', 1000.0, 0.0, 0, NULL, NULL);
 
--- ── Air Temperature: base = Kelvin ──
+-- ── air_temperature: base = Kelvin ──
 -- C → K: K = C + 273.15
 -- F → K: K = (F + 459.67) * 5/9   →   factor 5/9, offset 459.67 * 5/9 ≈ 255.3722
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Temperature'), 'K', 'Kelvin',     1.0,                 0.0,                 1, 223, 350),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Temperature'), 'C', 'Celsius',    1.0,                 273.15,              0, NULL, NULL),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Temperature'), 'F', 'Fahrenheit', 0.5555555555555556,  255.3722222222222,   0, NULL, NULL);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_temperature'), 'K', 'Kelvin',     1.0,                 0.0,                 1, 223, 350),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_temperature'), 'C', 'Celsius',    1.0,                 273.15,              0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_temperature'), 'F', 'Fahrenheit', 0.5555555555555556,  255.3722222222222,   0, NULL, NULL);
 
--- ── Air Pressure: base = Pascal ──
+-- ── air_pressure: base = Pascal ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Pressure'), 'Pa',   'Pascal',                  1.0,           0.0, 1, 87000, 150000),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Pressure'), 'hPa',  'hectopascal',             100.0,         0.0, 0, NULL, NULL),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Pressure'), 'kPa',  'kilopascal',              1000.0,        0.0, 0, NULL, NULL),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Pressure'), 'atm',  'atmosphere',              101325.0,      0.0, 0, NULL, NULL),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Pressure'), 'bar',  NULL,                      100000.0,      0.0, 0, NULL, NULL),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Pressure'), 'mmHg', 'millimetres of mercury',  133.322387415, 0.0, 0, NULL, NULL);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_pressure'), 'Pa',   'Pascal',                  1.0,           0.0, 1, 87000, 150000),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_pressure'), 'hPa',  'hectopascal',             100.0,         0.0, 0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_pressure'), 'kPa',  'kilopascal',              1000.0,        0.0, 0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_pressure'), 'atm',  'atmosphere',              101325.0,      0.0, 0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_pressure'), 'bar',  NULL,                      100000.0,      0.0, 0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_pressure'), 'mmHg', 'millimetres of mercury',  133.322387415, 0.0, 0, NULL, NULL);
 
--- ── Air Humidity: base = fraction (0-1) ──
+-- ── air_humidity: base = fraction (0-1) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Humidity'), 'fraction', NULL,      1.0,  0.0, 1, 0, 1),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air Humidity'), '%',        'percent', 0.01, 0.0, 0, NULL, NULL);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_humidity'), 'fraction', NULL,      1.0,  0.0, 1, 0, 1),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_humidity'), '%',        'percent', 0.01, 0.0, 0, NULL, NULL);
 
--- ── Wind Speed: base = m/s ──
+-- ── wind_speed: base = m/s ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Wind Speed'), 'm/s',   'metres per second',   1.0,                 0.0, 1, 0, 60),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Wind Speed'), 'km/h',  'kilometres per hour', 0.2777777777777778,  0.0, 0, NULL, NULL),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Wind Speed'), 'mph',   'miles per hour',      0.44704,             0.0, 0, NULL, NULL),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Wind Speed'), 'knots', NULL,                  0.5144444444444445,  0.0, 0, NULL, NULL),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Wind Speed'), 'ft/s',  'feet per second',     0.3048,              0.0, 0, NULL, NULL);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'wind_speed'), 'm/s',   'metres per second',   1.0,                 0.0, 1, 0, 60),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'wind_speed'), 'km/h',  'kilometres per hour', 0.2777777777777778,  0.0, 0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'wind_speed'), 'mph',   'miles per hour',      0.44704,             0.0, 0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'wind_speed'), 'knots', NULL,                  0.5144444444444445,  0.0, 0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'wind_speed'), 'ft/s',  'feet per second',     0.3048,              0.0, 0, NULL, NULL);
 
--- ── Turbidity: base = unitless (single unit) ──
+-- ── turbidity: base = unitless (single unit) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Turbidity'), 'unitless', NULL, 1.0, 0.0, 1, 0, 10);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'turbidity'), 'unitless', NULL, 1.0, 0.0, 1, 0, 10);
 
--- ── Beta Soil: base = unitless (single unit, coefficient 0-1) ──
+-- ── beta_soil: base = unitless (single unit, coefficient 0-1) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Beta Soil'), 'unitless', NULL, 1.0, 0.0, 1, 0, 1);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'beta_soil'), 'unitless', NULL, 1.0, 0.0, 1, 0, 1);
 
--- ── Air CO2: base = umol/mol (== ppm) ──
+-- ── air_CO2: base = umol/mol (== ppm) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air CO2'), 'umol/mol', 'ppm', 1.0,   0.0, 1, 0, 3000),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'Air CO2'), 'ppb',      NULL,  0.001, 0.0, 0, NULL, NULL);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'umol/mol', 'ppm', 1.0,   0.0, 1, 0, 3000),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'ppb',      NULL,  0.001, 0.0, 0, NULL, NULL);
 
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (11);

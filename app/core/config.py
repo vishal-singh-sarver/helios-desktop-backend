@@ -1,5 +1,5 @@
 from pathlib import Path
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,8 +23,14 @@ class Settings(BaseSettings):
     # CORS — comma-separated origins string from .env, parsed to list below
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
-    # Storage
-    data_dir: Path = Field(default=Path("data"), validation_alias="HELIOS_DATA_DIR")
+    # Storage — accepts HELIOS_DATA_DIR (set by the Electron main process in
+    # packaged mode via backend-manager.ts) or DATA_DIR (for standalone/dev
+    # runs). Without this alias, pydantic would only read DATA_DIR and the
+    # packaged app would silently fall back to Path("data") relative to cwd.
+    data_dir: Path = Field(
+        default=Path("data"),
+        validation_alias=AliasChoices("HELIOS_DATA_DIR", "DATA_DIR"),
+    )
 
     # Database — derived from data_dir unless explicitly set
     db_path: Path | None = None

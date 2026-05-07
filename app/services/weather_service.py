@@ -807,6 +807,9 @@ def add_rows(
             )
 
     # ── Write ──
+    # Empty values are written as NaN (preserves the row at this timestamp
+    # for every column). Non-numeric values are rejected with 400 rather
+    # than silently skipped — that catches typos like "abc" instead of "1.5".
     added_rows = 0
     for row_data in rows:
         cells: dict[str, float] = {}
@@ -814,14 +817,16 @@ def add_rows(
             if k in ("date", "time"):
                 continue
             vstr = v if isinstance(v, str) else str(v)
-            if _is_numeric_value(v) or (
-                isinstance(v, str)
-                and _is_numeric_or_empty(vstr)
-                and vstr.strip()
-            ):
+            if vstr.strip() == "":
+                cells[k] = float("nan")
+            elif _is_numeric_or_empty(vstr):
                 cells[k] = float(vstr)
-        if cells:
-            _add_row(ctx, row_data["date"], row_data["time"], cells)
+            else:
+                raise HTTPException(
+                    400,
+                    f"value '{v}' for column '{k}' is not numeric or empty",
+                )
+        _add_row(ctx, row_data["date"], row_data["time"], cells)
         added_rows += 1
 
     return {

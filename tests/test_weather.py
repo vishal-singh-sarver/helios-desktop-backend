@@ -1653,3 +1653,150 @@ def test_updatecol_missing_session_id_returns_400(client):
         json={"column": [{"name": "temperature", "values": []}]},
     )
     assert r.status_code == 400
+
+
+# ─────────────────────────── NaN-fill rule (uniform empty handling) ─────────
+
+
+def test_addcol_with_no_values_no_default_fills_scenario_with_nan(client):
+    """A new column added with empty values[] and no default_value gets a
+    NaN cell at every existing scenario timestamp — keeps the column aligned
+    with the scenario's row count instead of leaving it sparse."""
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+
+    # Add a new empty column.
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "empty_col", "values": []}]},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["columns"][0]["id"]
+
+    # All scenario timestamps should have a cell — NaN renders as JSON null.
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    assert r.json()["row_count"] == 3
+    for row in r.json()["rows"]:
+        assert row[str(new_id)] is None  # NaN -> null
+
+
+def test_addcol_with_explicit_empty_value_writes_nan(client):
+    """An entry in values[] with value="" writes a NaN cell (not skipped)."""
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "mixed",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": ""},
+                {"date": "2023-07-13", "time": "11:00:00", "value": "26"},
+            ],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["columns"][0]["id"]
+
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(new_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] is None       # explicit empty -> NaN
+    assert by_time["11:00:00"] == 26.0       # explicit value
+    assert by_time["12:00:00"] is None       # not in values[], no default -> NaN
+
+
+def test_addcol_empty_scenario_no_default_creates_empty_column(client):
+    """Sanity: a new column on a scenario with NO existing rows AND no
+    default_value AND no values[] creates an empty column (no cells)."""
+    sid, pid, scn = _make_project(client)
+
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "empty", "values": []}]},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_updatecol_no_values_no_default_fills_missing_with_nan_only(client):
+    """PATCH /updateCol with empty values[] and no default_value should:
+       - leave existing cells alone (non-destructive)
+       - fill missing scenario timestamps with NaN
+    This keeps the column aligned without destroying user data."""
+    sid, pid, scn = _make_project(client)
+    # Seed a 3-timestamp scenario.
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "anchor",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "1"},
+                {"date": "2023-07-13", "time": "11:00:00", "value": "2"},
+                {"date": "2023-07-13", "time": "12:00:00", "value": "3"},
+            ],
+        }]},
+    )
+    # Add a column with one cell out of three.
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "partial",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "100"},
+            ],
+        }]},
+    )
+    partial_id = r.json()["columns"][0]["id"]
+    # Note: addCol now ALSO fills missing timestamps with NaN, so partial
+    # already has 3 cells: 100, NaN, NaN. The PATCH below should be a no-op.
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "partial", "values": []}]},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(partial_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] == 100.0      # original value preserved
+    assert by_time["11:00:00"] is None       # was NaN, still NaN
+    assert by_time["12:00:00"] is None       # was NaN, still NaN
+
+
+def test_updatecol_with_explicit_empty_value_writes_nan(client):
+    """An empty value in updateCol values[] overwrites the existing cell with NaN."""
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": ""},
+            ],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(temp_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] is None             # overwritten with NaN
+    assert by_time["11:00:00"] == pytest.approx(23.8, abs=0.01)   # untouched
+    assert by_time["12:00:00"] == pytest.approx(25.3, abs=0.01)   # untouched

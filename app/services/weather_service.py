@@ -738,27 +738,32 @@ def add_columns(
 
             label = str(header.id)
 
-            # Track explicit (date, time) keys so default_value knows which
-            # scenario timestamps to skip.
+            # Track explicit (date, time) keys so the fill loop knows which
+            # scenario timestamps the user already covered via values[].
+            # Empty value ("") still counts as explicit — written as NaN.
             explicit_keys: set[tuple[str, str]] = set()
             for v in col.values:
-                if v.value == "":
-                    continue  # empty cells are no-ops
                 d, t = _helios_date_time(v.date, v.time)
-                ctx.addTimeseriesData(label, float(v.value), d, t)
+                cell_value = float("nan") if v.value == "" else float(v.value)
+                ctx.addTimeseriesData(label, cell_value, d, t)
                 written_cells.append((label, d, t))
                 explicit_keys.add((v.date, v.time))
 
-            # default_value: fill any scenario timestamp not covered by
-            # `values[]` with the default. Skip silently when the scenario
-            # has no rows yet (header gets created, no cells written).
-            if col.default_value is not None:
-                for d_obj, t_obj in scenario_ts:
-                    key = (str(d_obj), str(t_obj))
-                    if key in explicit_keys:
-                        continue
-                    ctx.addTimeseriesData(label, float(col.default_value), d_obj, t_obj)
-                    written_cells.append((label, d_obj, t_obj))
+            # Fill every scenario timestamp not covered by values[]:
+            #   - default_value if provided
+            #   - else NaN (placeholder so the column is always aligned with
+            #     the scenario's row count; matches addRow's NaN convention).
+            fill_value = (
+                float(col.default_value)
+                if col.default_value is not None
+                else float("nan")
+            )
+            for d_obj, t_obj in scenario_ts:
+                key = (str(d_obj), str(t_obj))
+                if key in explicit_keys:
+                    continue
+                ctx.addTimeseriesData(label, fill_value, d_obj, t_obj)
+                written_cells.append((label, d_obj, t_obj))
 
             created_columns.append(
                 {
@@ -925,42 +930,49 @@ def update_columns(
             # Track keys provided in `values[]` so default_value skips them.
             explicit_keys: set[tuple[str, str]] = set()
 
+            # Process explicit values[]. Empty value ("") writes NaN —
+            # consistent with addRow's empty-cell convention.
             for v in col.values:
-                if v.value == "":
-                    continue  # empty = no-op (matches addCol convention)
                 d, t = _helios_date_time(v.date, v.time)
                 key = (str(d), str(t))
                 explicit_keys.add(key)
+                cell_value = float("nan") if v.value == "" else float(v.value)
 
                 if key in existing_cell_keys:
-                    # Overwrite existing cell.
-                    ctx.updateTimeseriesData(label, d, t, float(v.value))
+                    ctx.updateTimeseriesData(label, d, t, cell_value)
                 else:
-                    # Create new cell.
-                    ctx.addTimeseriesData(label, float(v.value), d, t)
+                    ctx.addTimeseriesData(label, cell_value, d, t)
                     written_cells.append((label, d, t))
                     existing_cell_keys.add(key)
 
-            # default_value writes — for every scenario timestamp NOT in
-            # `values[]`, write `default_value`. This OVERWRITES existing
-            # cells (use case: select-all / deselect-all on a check column,
-            # where one PATCH call should set every row to 1 or 0). Cells
-            # explicitly listed in `values[]` keep their explicit value.
+            # Fill scenario timestamps not in values[]:
+            #   - default_value provided  → OVERWRITE every such cell
+            #     (use case: select-all / deselect-all on a check column).
+            #   - default_value missing   → fill ONLY missing cells with NaN
+            #     (so the column stays aligned with the scenario timeline,
+            #     but existing data is left alone — non-destructive PATCH).
             if col.default_value is not None:
+                fill_value = float(col.default_value)
                 for d_obj, t_obj in scenario_ts:
                     key = (str(d_obj), str(t_obj))
                     if key in explicit_keys:
                         continue  # explicit value wins
                     if key in existing_cell_keys:
-                        ctx.updateTimeseriesData(
-                            label, d_obj, t_obj, float(col.default_value)
-                        )
+                        ctx.updateTimeseriesData(label, d_obj, t_obj, fill_value)
                     else:
-                        ctx.addTimeseriesData(
-                            label, float(col.default_value), d_obj, t_obj
-                        )
+                        ctx.addTimeseriesData(label, fill_value, d_obj, t_obj)
                         written_cells.append((label, d_obj, t_obj))
                         existing_cell_keys.add(key)
+            else:
+                for d_obj, t_obj in scenario_ts:
+                    key = (str(d_obj), str(t_obj))
+                    if key in explicit_keys or key in existing_cell_keys:
+                        continue  # don't overwrite existing data
+                    ctx.addTimeseriesData(
+                        label, float("nan"), d_obj, t_obj
+                    )
+                    written_cells.append((label, d_obj, t_obj))
+                    existing_cell_keys.add(key)
 
             updated_columns.append(
                 {

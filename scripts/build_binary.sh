@@ -100,10 +100,34 @@ pip install -r requirements.txt >/dev/null
 echo "[*] Installing PyInstaller..."
 pip install pyinstaller >/dev/null
 
+# Step 4.5: Build pyhelios native library if missing
+LIBHELIOS_PATH="$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/$LIBHELIOS_NAME"
+if [ ! -f "$LIBHELIOS_PATH" ]; then
+    BUILD_SCRIPT="$BACKEND_DIR/scripts/build_pyhelios.sh"
+    if [ -f "$BUILD_SCRIPT" ]; then
+        echo "[*] Native library ($LIBHELIOS_NAME) not found — building pyhelios from source..."
+        bash "$BUILD_SCRIPT"
+        if [ -f "$LIBHELIOS_PATH" ]; then
+            echo "[*] pyhelios native library built successfully"
+        else
+            echo "[!] WARNING: pyhelios build completed but $LIBHELIOS_NAME not found — pyhelios will be unavailable"
+        fi
+    else
+        echo "[!] WARNING: $LIBHELIOS_NAME not found and build script missing — pyhelios will be unavailable"
+    fi
+else
+    echo "[*] Native library found: $LIBHELIOS_PATH"
+fi
+
 # Step 5: Clean old dist directory
 if [ -d "dist" ]; then
     echo "[*] Removing old build artifacts..."
-    rm -rf dist
+    xattr -rc dist 2>/dev/null || true
+    # macOS Finder/.DS_Store locks can cause rm -rf to fail; retry after a short wait
+    if ! /bin/rm -rf dist 2>/dev/null; then
+        sleep 1
+        /bin/rm -rf dist
+    fi
 fi
 
 # Step 6: Build with PyInstaller
@@ -133,13 +157,43 @@ done
 # NOTE: Using --onedir instead of --onefile for significantly faster startup:
 #   --onefile: Extracts entire binary to temp directory on each run (5-30s overhead)
 #   --onedir:  Directory structure, no extraction needed on subsequent runs (~0.5s startup)
-LIBHELIOS_PATH="$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/$LIBHELIOS_NAME"
 
-PYHELIOS_ADD_BINARY=""
+# Selectively bundle only runtime-needed parts of pyhelios instead of the entire
+# directory (~719 MB). This excludes helios-core/ C++ source (516 MB), build
+# artifacts (.a, .o, CMake files ~150 MB), docs, and tests.
+PYHELIOS_DATA_ARGS=""
+
+# 1. Python package (the actual importable code, ~3.4 MB)
+if [ -d "$BACKEND_DIR/pyhelios/pyhelios" ]; then
+    PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $BACKEND_DIR/pyhelios/pyhelios:pyhelios/pyhelios"
+fi
+
+# 2. Top-level pyhelios files (__init__.py, etc.)
+for f in "$BACKEND_DIR/pyhelios"/*.py; do
+    [ -f "$f" ] && PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $f:pyhelios/"
+done
+
+# 3. Native library (.dylib/.so/.dll)
+LIBHELIOS_PATH="$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/$LIBHELIOS_NAME"
 if [ -f "$LIBHELIOS_PATH" ]; then
-    PYHELIOS_ADD_BINARY="--add-binary $LIBHELIOS_PATH:pyhelios/pyhelios_build/build/lib/"
+    PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-binary $LIBHELIOS_PATH:pyhelios/pyhelios_build/build/lib/"
 else
     echo "[!] WARNING: $LIBHELIOS_PATH not found — pyhelios native library will not be bundled"
+fi
+
+# 4. Runtime asset images (textures needed by C++ core, ~28 KB)
+if [ -d "$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/images" ]; then
+    PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $BACKEND_DIR/pyhelios/pyhelios_build/build/lib/images:pyhelios/pyhelios_build/build/lib/images"
+fi
+
+# 5. Plugin assets (shaders, textures, spectral data, ~126 MB)
+if [ -d "$BACKEND_DIR/pyhelios/pyhelios_build/build/plugins" ]; then
+    PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $BACKEND_DIR/pyhelios/pyhelios_build/build/plugins:pyhelios/pyhelios_build/build/plugins"
+fi
+
+# 6. Built binaries in bin/ (if any)
+if [ -d "$BACKEND_DIR/pyhelios/pyhelios_build/build/bin" ]; then
+    PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $BACKEND_DIR/pyhelios/pyhelios_build/build/bin:pyhelios/pyhelios_build/build/bin"
 fi
 
 pyinstaller \
@@ -154,8 +208,7 @@ pyinstaller \
     --collect-all fastapi \
     --collect-all pydantic \
     --collect-all sqlalchemy \
-    --add-data "$BACKEND_DIR/pyhelios:pyhelios" \
-    $PYHELIOS_ADD_BINARY \
+    $PYHELIOS_DATA_ARGS \
     $HIDDEN_IMPORTS_STR \
     backend_wrapper.py
 

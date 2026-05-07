@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git blame:*)",
+      "Bash(git stash list)",
+      "Bash(git remote -v)",
+      "Bash(git config --get:*)",
+      "Bash(git submodule status)",
+
+      "Bash(python -m pytest:*)",
+      "Bash(pytest:*)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format --check:*)",
+      "Bash(mypy:*)",
+
+      "Bash(python --version)",
+      "Bash(python3 --version)",
+      "Bash(pip show:*)",
+      "Bash(pip list)",
+      "Bash(pip list --outdated)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean -f:*)",
+      "Bash(git clean -fd:*)",
+      "Bash(git branch -D:*)",
+      "Bash(rm -rf:*)",
+      "Bash(sudo:*)",
+      "Edit(./pyhelios/**)",
+      "Write(./pyhelios/**)"
+    ]
+  }
+}

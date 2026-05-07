@@ -1081,6 +1081,9 @@ def add_rows(
             )
 
     # ── Write ──
+    # Empty values are written as NaN (preserves the row at this timestamp
+    # for every column). Non-numeric values are rejected with 400 rather
+    # than silently skipped — that catches typos like "abc" instead of "1.5".
     added_rows = 0
     for row_data in rows:
         cells: dict[str, float] = {}

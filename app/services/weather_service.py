@@ -84,10 +84,10 @@ def _label_has_timestamp(ctx, label: str, date_obj, time_obj) -> bool:
 
 
 def _clean_float(v: float) -> float | None:
-    """NaN → None so JSON serialization doesn't choke. Otherwise float."""
+    """NaN → None so JSON serialization doesn't choke. Otherwise float rounded to max 7 decimals."""
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return None
-    return float(v)
+    return round(float(v), 7)
 
 
 def _is_numeric_value(v: Any) -> bool:

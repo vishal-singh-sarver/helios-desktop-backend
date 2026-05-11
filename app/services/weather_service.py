@@ -108,6 +108,35 @@ def _is_numeric_value(v: Any) -> bool:
     return False
 
 
+def _has_excess_decimals(v: Any) -> bool:
+    """True if numeric string or float has more than 7 decimal places."""
+    if v is None:
+        return False
+    vstr = str(v).strip().upper()
+    if vstr in ("", "NAN"):
+        return False
+    if "." in vstr:
+        # e.g. "123.45678901" -> "45678901"
+        decimal_part = vstr.split(".")[1]
+        # Ignore exponent part if present
+        if "E" in decimal_part:
+            decimal_part = decimal_part.split("E")[0]
+        return len(decimal_part) > 7
+    return False
+
+
+def _truncate_decimals(vstr: str) -> str:
+    """Truncate to 7 decimal places if needed."""
+    if vstr is None:
+        return vstr
+    vstr = str(vstr).strip()
+    if "." in vstr:
+        integer_part, decimal_part = vstr.split(".")
+        if len(decimal_part) > 7:
+            return f"{integer_part}.{decimal_part[:7]}"
+    return vstr
+
+
 # ─── Auto-transform: any-format CSV → standard (date, time, numeric...) ──────
 
 
@@ -286,8 +315,8 @@ def _find_time_column(
     return None
 
 
-def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
-    """Take raw CSV bytes in any reasonable format, return (header, rows) in
+def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
+    """Take raw CSV bytes in any reasonable format, return (header, rows, truncated_flag) in
     our standard: first column 'date' (YYYY-MM-DD), second 'time' (HH:MM:SS),
     then numeric data columns with slugified names. Drops text/qc-flag cols."""
     text = raw_bytes.decode("utf-8-sig", errors="replace")
@@ -341,6 +370,7 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
 
     new_header = ["date", "time"] + [s for _, s in data_cols]
     new_rows: list[list[str]] = []
+    truncated_any = False
     for r in data_rows:
         max_idx = max([date_idx, time_idx] + [i for i, _ in data_cols])
         if max_idx >= len(r):
@@ -362,7 +392,14 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
             f"{h:02d}:{m:02d}:{sec:02d}",
         ]
         for i, _ in data_cols:
-            new_row.append(r[i].strip() if i < len(r) else "")
+            if i < len(r):
+                val = r[i].strip()
+                if _has_excess_decimals(val):
+                    val = _truncate_decimals(val)
+                    truncated_any = True
+                new_row.append(val)
+            else:
+                new_row.append("")
         new_rows.append(new_row)
 
     # Deduplicate by (date, time). Keep the LAST row for each pair — PyHelios
@@ -374,7 +411,7 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
     if len(seen) < len(new_rows):
         new_rows = [new_rows[i] for i in sorted(seen.values())]
 
-    return new_header, new_rows
+    return new_header, new_rows, truncated_any
 
 
 # ─── Read endpoints ──────────────────────────────────────────────────────────
@@ -510,7 +547,7 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
     if not file_bytes:
         raise HTTPException(400, "uploaded file is empty")
 
-    header, rows = _transform_csv(file_bytes)
+    header, rows, truncated_any = _transform_csv(file_bytes)
 
     if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is not None:
         ctx = sctx.context
@@ -533,11 +570,15 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
             except OSError:
                 pass
 
-    return {
+    response = {
         "success": True,
         "row_count": len(rows),
         "column_count": len(header),
     }
+    if truncated_any:
+        response["message"] = "Some values contained more than 7 decimal places and were truncated."
+    
+    return response
 
 
 # ─── add — the only place with row/column wrappers ───────────────────────────
@@ -704,6 +745,17 @@ def add_columns(
                     f"column[{i}].values[{j}]: value '{v.value}' "
                     f"is not numeric or empty",
                 )
+            if _has_excess_decimals(v.value):
+                raise HTTPException(
+                    400,
+                    f"column[{i}].values[{j}]: value '{v.value}' contains more than 7 decimal places"
+                )
+
+        if _has_excess_decimals(col.default_value):
+            raise HTTPException(
+                400,
+                f"column[{i}]: default_value '{col.default_value}' contains more than 7 decimal places"
+            )
 
         # Track newly-added names so a follow-up item in the same request
         # collides too (Pydantic also catches this, defence-in-depth).
@@ -899,6 +951,17 @@ def update_columns(
                     f"column[{i}].values[{j}]: value '{v.value}' "
                     f"is not numeric or empty",
                 )
+            if _has_excess_decimals(v.value):
+                raise HTTPException(
+                    400,
+                    f"column[{i}].values[{j}]: value '{v.value}' contains more than 7 decimal places"
+                )
+
+        if _has_excess_decimals(col.default_value):
+            raise HTTPException(
+                400,
+                f"column[{i}]: default_value '{col.default_value}' contains more than 7 decimal places"
+            )
 
     # ── Apply changes ──
     written_cells: list[tuple[str, Any, Any]] = []
@@ -1094,6 +1157,10 @@ def add_rows(
             if vstr.strip() == "":
                 cells[k] = float("nan")
             elif _is_numeric_or_empty(vstr):
+                if _has_excess_decimals(vstr):
+                    raise HTTPException(
+                        400, f"value '{v}' for column '{k}' contains more than 7 decimal places"
+                    )
                 cells[k] = float(vstr)
             else:
                 raise HTTPException(
@@ -1148,6 +1215,10 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
         #   - missing cell at (d, t)  → HeliosRuntimeError
         #   - non-numeric value       → ValueError (from float() cast)
         try:
+            if _has_excess_decimals(item.value):
+                raise HTTPException(
+                    400, f"updates[{i}]: value '{item.value}' contains more than 7 decimal places"
+                )
             new_value = float("nan") if item.value == "" else float(item.value)
             ctx.updateTimeseriesData(item.col, date_obj, time_obj, new_value)
         except ValueError as exc:

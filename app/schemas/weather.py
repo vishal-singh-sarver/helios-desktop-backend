@@ -29,7 +29,7 @@ class ColumnValue(BaseModel):
 
     date: str
     time: str
-    value: str = ""   # empty string allowed; written as a no-op
+    value: str = "NAN"   # "NAN" is treated as empty/NaN
 
 
 class AddColumn(BaseModel):
@@ -50,7 +50,7 @@ class AddColumn(BaseModel):
     datatype: int | None = None
     data_unit: int | None = None
     values: list[ColumnValue] = Field(default_factory=list)
-    default_value: float | None = None
+    default_value: float | str | None = "NAN"
 
     @field_validator("name")
     @classmethod
@@ -73,8 +73,8 @@ class AddColumn(BaseModel):
             return float(v)
         if isinstance(v, str):
             s = v.strip()
-            if s == "":
-                return None
+            if s == "" or s.upper() == "NAN":
+                return float("nan")
             try:
                 return float(s)
             except ValueError:
@@ -146,7 +146,7 @@ class UpdateValue(BaseModel):
 
     col: str
     row: RowRef
-    value: str = ""
+    value: str = "NAN"
 
 
 class UpdateRequest(BaseModel):

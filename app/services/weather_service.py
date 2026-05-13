@@ -639,19 +639,14 @@ def _label_timestamp_set(ctx, label: str) -> set[tuple[str, str]]:
 
 
 def _cleanup_pyhelios_cells(ctx, cells: list[tuple[str, Any, Any]]) -> None:
-    """Best-effort cleanup: write NaN to cells we partially wrote during a
+    """Best-effort cleanup: wipe variables we partially wrote during a
     column add that's now being rolled back.
-
-    PyHelios v0.1.19 has no true delete; NaN is the closest workaround. If
-    this cleanup itself fails, we swallow it — the SQL rollback already
-    happened, so we accept a small PyHelios leak rather than crash.
-
-    This is the "for later" atomicity gap noted in the design doc.
     """
-    for label, d, t in cells:
+    labels_to_wipe = set(label for label, d, t, in cells)
+    for label in labels_to_wipe:
         try:
-            ctx.updateTimeseriesData(label, d, t, float("nan"))
-        except Exception:
+            ctx.deleteTimeseriesVariable(label)
+        except (HeliosRuntimeError, AttributeError):
             pass
 
 
@@ -1286,17 +1281,17 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         if not h_row:
             raise HTTPException(404, f"column '{name}' not found")
 
-        # 2. Delete from DB (UI)
-        db.delete(h_row)
-        db.commit()
-
-        # 3. Delete from Simulation (RAM) using the new v0.1.19 method.
+        # 1. Delete from Simulation (RAM) using the new v0.1.19 method.
+        # If this fails, we want to know before we lose the DB record.
         # We use str(h_row.id) because that is the internal label.
         try:
             ctx.deleteTimeseriesVariable(str(h_row.id))
         except HeliosRuntimeError:
-            # If it's missing in RAM but deleted in DB, we consider it a success
             pass
+
+        # 2. Delete from DB (UI)
+        db.delete(h_row)
+        db.commit()
 
     labels_after = list(ctx.listTimeseriesVariables())
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0

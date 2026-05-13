@@ -77,7 +77,7 @@ def replace_headers(
     nothing). Pydantic-level validation (duplicate name / display_order)
     happens BEFORE this function runs.
     """
-    _resolve_scenario(session_id, project_id, scenario_id, db)
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
 
     # ── Per-item consistency check (DB-aware) ──
     # Run BEFORE any mutation so a bad item doesn't half-delete the existing set.
@@ -111,6 +111,12 @@ def replace_headers(
         db.rollback()
         raise HTTPException(500, "Failed to replace headers")
 
+    if sctx.context is not None:
+        try:
+            sctx.context.clearTimeseriesData()
+        except Exception:
+            pass
+
     rows = (
         db.query(WeatherDataHeader)
         .filter_by(scenario_id=scenario_id)
@@ -128,7 +134,7 @@ def clear_headers(
     session_id: str, project_id: str, scenario_id: str, db: Session
 ) -> dict:
     """Remove all headers for the scenario. Returns the count removed."""
-    _resolve_scenario(session_id, project_id, scenario_id, db)
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
 
     try:
         removed = (
@@ -141,6 +147,12 @@ def clear_headers(
         db.rollback()
         raise HTTPException(500, "Failed to clear headers")
 
+    if sctx.context is not None:
+        try:
+            sctx.context.clearTimeseriesData()
+        except Exception:
+            pass
+
     return {"success": True, "count": removed}
 
 
@@ -151,18 +163,10 @@ def delete_header(
     header_id: int,
     db: Session,
 ) -> dict:
-    """Delete one header row and best-effort NaN-clear its PyHelios cells.
+    """Delete one header row and wipe its variable from simulation memory.
 
-    PyHelios v0.1.19 has no remove API, so the cells under the header's
-    `str(id)` label are overwritten with NaN — same approach as
-    `weather_service.delete()` for column-clear. The label itself stays
-    visible in `listTimeseriesVariables()`; that's a known limitation of
-    the PyHelios version.
-
-    Order: SQL delete first (transactional), then PyHelios NaN as
-    best-effort. If the PyHelios cleanup throws (label never registered
-    because the column was created with values=[]), we swallow it — the
-    SQL row is the source of truth.
+    Order: SQL delete first (transactional), then PyHelios delete as
+    best-effort.
     """
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
 
@@ -183,16 +187,9 @@ def delete_header(
         db.rollback()
         raise HTTPException(500, "Failed to delete header")
 
-    # Best-effort PyHelios cleanup. A column with values=[] never registered
-    # a label, in which case getTimeseriesLength raises — that's fine, swallow.
     if sctx.context is not None:
-        ctx = sctx.context
         try:
-            n = ctx.getTimeseriesLength(label)
-            for i in range(n):
-                d = ctx.queryTimeseriesDate(label, i)
-                t = ctx.queryTimeseriesTime(label, i)
-                ctx.updateTimeseriesData(label, d, t, float("nan"))
+            sctx.context.deleteTimeseriesVariable(label)
         except Exception:
             pass
 

@@ -8,6 +8,7 @@ from app.core.timezone import utc_offset_from_coords
 from app.core.session_store import registry
 from app.core.config import settings
 from app.helios import context as helios_ctx
+from app.helios.persistence import trigger_autosave
 from app.services.weather_header_service import serialize as serialize_header
 
 
@@ -52,6 +53,7 @@ def create_project(session_id: str, name: str, latitude: float,
     if helios_ctx.PYHELIOS_AVAILABLE:
         pctx.reset()
         pctx.context = helios_ctx.Context()
+        trigger_autosave(pctx.context, project.id)
 
     pctx.initialized = True
 

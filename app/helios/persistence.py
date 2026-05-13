@@ -16,15 +16,27 @@ Compression tiers:
 """
 import gzip
 import json
+import logging
 import lzma
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from app.core.config import settings
 
 
+logger = logging.getLogger(__name__)
+MAX_AUTOSAVE_ARCHIVES = 10
+
+
 def _project_dir(project_id: str) -> Path:
     d = settings.resolved_projects_dir / project_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _autosave_archives_dir(project_id: str) -> Path:
+    d = _project_dir(project_id) / "autosave_archives"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -63,6 +75,62 @@ def save_snapshot(project_id: str, ctx, registry: dict, metadata: dict) -> None:
 
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+# ── Autosave ──────────────────────────────────────────────────────────────────
+
+def _rotate_current(project_id: str) -> None:
+    """
+    Move existing current.xml.gz → autosave_archives/autosave_TIMESTAMP.xml.gz
+    Delete oldest archive if over MAX_AUTOSAVE_ARCHIVES.
+    """
+    current_gz = settings.resolved_projects_dir / project_id / "current.xml.gz"
+    if not current_gz.exists():
+        return
+
+    archives_dir = _autosave_archives_dir(project_id)
+
+    # Enforce cap (sort oldest → newest by mtime)
+    existing = sorted(archives_dir.glob("autosave_*.xml.gz"), key=lambda p: p.stat().st_mtime)
+    while len(existing) >= MAX_AUTOSAVE_ARCHIVES:
+        existing[0].unlink(missing_ok=True)
+        existing = existing[1:]
+
+    # Rename current.xml.gz → timestamped archive
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    current_gz.replace(archives_dir / f"autosave_{ts}.xml.gz")
+
+
+def trigger_autosave(ctx, project_id: str) -> None:
+    """
+    Fire-and-forget autosave. Called after every context mutation.
+    Overwrites current.xml.gz and rotates the previous one into archives.
+    """
+    # Stub guard: no-op if writeXML is not available
+    if not hasattr(ctx, "writeXML"):
+        return
+
+    proj_dir = _project_dir(project_id)
+
+    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        ctx.writeXML(str(tmp_path))
+        raw_xml = tmp_path.read_bytes()
+    except Exception:
+        logger.exception("[autosave] writeXML failed for project %s", project_id)
+        return
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    try:
+        _rotate_current(project_id)
+        gz_data = gzip.compress(raw_xml, compresslevel=6)
+        (proj_dir / "current.xml.gz").write_bytes(gz_data)
+        logger.debug("[autosave] saved project %s (%d bytes)", project_id, len(raw_xml))
+    except Exception:
+        logger.exception("[autosave] rotation/write failed for project %s", project_id)
 
 
 def save_version(project_id: str, label: str, ctx, registry: dict,

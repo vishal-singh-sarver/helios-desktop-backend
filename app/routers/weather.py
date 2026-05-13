@@ -208,15 +208,13 @@ def update_weather_data_header(
     db: Session = Depends(get_db),
 ):
     """Partial update of a single header — name, datatype, unit, or order."""
+    update_data = body.model_dump(exclude_unset=True)
     return weather_header_service.update_header(
         session_id,
         project_id,
         scenario_id,
         header_id,
-        body.name,
-        body.helios_data_type_id,
-        body.unit_id,
-        body.display_order,
+        update_data,
         db,
     )
 

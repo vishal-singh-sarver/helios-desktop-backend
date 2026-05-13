@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
 from app.helios import context as helios_ctx
+from app.helios.persistence import trigger_autosave
 
 # PyHelios's specific exception for "thing not found" errors (missing label,
 # missing cell, etc.). Defensive import: if PyHelios isn't available, define
@@ -578,6 +579,7 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
     if truncated_any:
         response["message"] = "Some values contained more than 7 decimal places and were truncated."
     
+    trigger_autosave(sctx.context, sctx.project_id)
     return response
 
 
@@ -827,6 +829,7 @@ def add_columns(
             )
 
         db.commit()
+        trigger_autosave(ctx, sctx.project_id)
 
     except HTTPException:
         db.rollback()
@@ -1047,6 +1050,7 @@ def update_columns(
             )
 
         db.commit()
+        trigger_autosave(ctx, sctx.project_id)
 
     except HTTPException:
         db.rollback()
@@ -1170,6 +1174,7 @@ def add_rows(
         _add_row(ctx, row_data["date"], row_data["time"], cells)
         added_rows += 1
 
+    trigger_autosave(ctx, sctx.project_id)
     return {
         "success": True,
         "row_count": len(existing_timestamps) + len(rows),
@@ -1228,6 +1233,7 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
         except HeliosRuntimeError as exc:
             raise HTTPException(404, f"updates[{i}]: {exc}")
 
+    trigger_autosave(ctx, sctx.project_id)
     return {"success": True, "updated_count": len(req.updates)}
 
 
@@ -1285,6 +1291,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest") -> dict:
     labels_after = list(ctx.listTimeseriesVariables())
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0
     column_count = 2 + len(labels_after)
+    trigger_autosave(ctx, sctx.project_id)
     return {
         "success": True,
         "row_count": row_count,
@@ -1323,6 +1330,7 @@ def clear_data(sctx: "ScenarioContext", db: Session) -> dict:
     except Exception:
         pass  # SQL is the source of truth; orphan cells will be invisible to /addRow
 
+    trigger_autosave(sctx.context, sctx.project_id)
     return {
         "success": True,
         "headers_removed": headers_removed,

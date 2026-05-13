@@ -204,10 +204,7 @@ def update_header(
     project_id: str,
     scenario_id: str,
     header_id: int,
-    name: str | None,
-    helios_data_type_id: int | None,
-    unit_id: int | None,
-    display_order: int | None,
+    data: dict,
     db: Session,
 ) -> dict:
     """Partial update of one header. Editable fields: name, datatype FK,
@@ -231,6 +228,12 @@ def update_header(
     )
     if row is None:
         raise HTTPException(404, f"header {header_id} not found in scenario")
+
+    # Extract values from data dict for validation
+    name = data.get("name")
+    helios_data_type_id = data.get("helios_data_type_id")
+    unit_id = data.get("unit_id")
+    display_order = data.get("display_order")
 
     # Reserved-name guard mirrors the column-add flow.
     if name is not None and name in ("date", "time"):
@@ -283,10 +286,12 @@ def update_header(
 
     # Consistency check against the POST-update pair. Only enforced when both
     # FKs end up non-null; one-sided partial mapping stays legal.
+    # Note: we use "in data" to check if the user is explicitly setting a field.
     final_dt = (
-        helios_data_type_id if helios_data_type_id is not None else row.helios_data_type_id
+        helios_data_type_id if "helios_data_type_id" in data else row.helios_data_type_id
     )
-    final_unit = unit_id if unit_id is not None else row.unit_id
+    final_unit = unit_id if "unit_id" in data else row.unit_id
+
     if final_dt is not None and final_unit is not None:
         unit_for_check = new_unit_row if new_unit_row is not None else db.get(DataUnit, final_unit)
         if unit_for_check.data_type_id != final_dt:
@@ -296,14 +301,9 @@ def update_header(
                 f"{unit_for_check.data_type_id}, not {final_dt}",
             )
 
-    if name is not None:
-        row.name = name
-    if helios_data_type_id is not None:
-        row.helios_data_type_id = helios_data_type_id
-    if unit_id is not None:
-        row.unit_id = unit_id
-    if display_order is not None:
-        row.display_order = display_order
+    # ── Apply Updates ──
+    for key, val in data.items():
+        setattr(row, key, val)
 
     try:
         db.commit()

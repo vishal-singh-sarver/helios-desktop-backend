@@ -178,7 +178,8 @@ def delete_header(
     if row is None:
         raise HTTPException(404, f"header {header_id} not found in scenario")
 
-    label = str(row.id)
+    label_id = str(row.id)
+    label_name = row.name
 
     try:
         db.delete(row)
@@ -188,10 +189,12 @@ def delete_header(
         raise HTTPException(500, "Failed to delete header")
 
     if sctx.context is not None:
-        try:
-            sctx.context.deleteTimeseriesVariable(label)
-        except Exception:
-            pass
+        # Attempt to delete both possible labels (ID and Name)
+        for label in [label_id, label_name]:
+            try:
+                sctx.context.deleteTimeseriesVariable(label)
+            except Exception:
+                pass
 
     return {"success": True, "header_id": header_id}
 

@@ -1281,13 +1281,14 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         if not h_row:
             raise HTTPException(404, f"column '{name}' not found")
 
-        # 1. Delete from Simulation (RAM) using the new v0.1.19 method.
-        # If this fails, we want to know before we lose the DB record.
-        # We use str(h_row.id) because that is the internal label.
-        try:
-            ctx.deleteTimeseriesVariable(str(h_row.id))
-        except HeliosRuntimeError:
-            pass
+        # 1. Delete from Simulation (RAM).
+        # We try both the ID and the Name to handle both manual and CSV-uploaded labels.
+        if sctx.context is not None:
+            for label in [str(h_row.id), h_row.name]:
+                try:
+                    sctx.context.deleteTimeseriesVariable(label)
+                except Exception:
+                    pass
 
         # 2. Delete from DB (UI)
         db.delete(h_row)

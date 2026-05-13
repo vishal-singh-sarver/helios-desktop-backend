@@ -1,4 +1,4 @@
--- Migration 011 — seed default weather data types and their units.
+-- Migration 016 — seed default weather data types and their units.
 --
 -- Per the design doc: standard weather parameters used by the simulation
 -- models (radiation, energy balance, photosynthesis, etc.) along with
@@ -29,6 +29,14 @@
 --     ppm, not a simple linear transform.
 --   These are intentionally omitted; add later if a non-linear conversion
 --   path is wired up.
+
+-- ── Standardize existing units (Renames instead of Deletes to avoid FK errors) ──
+UPDATE data_units SET unit = '0-1'   WHERE data_type_id = 5 AND unit = 'fraction';
+UPDATE data_units SET unit = '0-100' WHERE data_type_id = 5 AND unit = '%';
+UPDATE data_units SET unit = '0-1'   WHERE data_type_id = 7 AND unit = 'unitless';
+UPDATE data_units SET unit = '0-1'   WHERE data_type_id = 8 AND unit = 'unitless';
+UPDATE data_units SET unit = 'ppm'   WHERE data_type_id = 9 AND unit = 'umol/mol';
+UPDATE data_units SET unit = 'kg/m³' WHERE data_type_id = 9 AND unit = 'kg/m^3';
 
 INSERT OR IGNORE INTO helios_data_types (data_type, description) VALUES
     ('Direct Normal Radiation',      'Radiative flux normal to the direction of radiation propagation'),
@@ -71,8 +79,8 @@ INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_
 
 -- ── air_humidity: base = fraction (0-1) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'air_humidity'), 'fraction', NULL,      1.0,  0.0, 1, 0, 1),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'air_humidity'), '%',        'percent', 0.01, 0.0, 0, NULL, NULL);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_humidity'), '0-1',   NULL,      1.0,  0.0, 1, 0, 1),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_humidity'), '0-100', 'percent', 0.01, 0.0, 0, NULL, NULL);
 
 -- ── wind_speed: base = m/s ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
@@ -84,15 +92,17 @@ INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_
 
 -- ── turbidity: base = unitless (single unit) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'turbidity'), 'unitless', NULL, 1.0, 0.0, 1, 0, 10);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'turbidity'), '0-1', NULL, 1.0, 0.0, 1, 0, 10),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'turbidity'), '>1',  NULL, 1.0, 0.0, 0, NULL, NULL);
 
 -- ── beta_soil: base = unitless (single unit, coefficient 0-1) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'beta_soil'), 'unitless', NULL, 1.0, 0.0, 1, 0, 1);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'beta_soil'), '0-1', NULL, 1.0, 0.0, 1, 0, 1);
 
 -- ── air_CO2: base = umol/mol (== ppm) ──
 INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_base_offset, is_base, min, max) VALUES
-    ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'umol/mol', 'ppm', 1.0,   0.0, 1, 0, 3000),
-    ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'ppb',      NULL,  0.001, 0.0, 0, NULL, NULL);
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'ppm',   NULL, 1.0,   0.0, 1, 0, 3000),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'ppb',   NULL, 0.001, 0.0, 0, NULL, NULL),
+    ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'kg/m³', NULL, 1.0,   0.0, 0, NULL, NULL);
 
-INSERT OR IGNORE INTO schema_migrations(version) VALUES (11);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (17);

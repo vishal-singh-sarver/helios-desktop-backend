@@ -141,7 +141,7 @@ def delete_weather(
 ):
     """Delete a row, a column, or wipe everything."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.delete(sctx, body)
+    return weather_service.delete(sctx, body, db)
 
 
 @router.delete("/project/{project_id}/scenario/{scenario_id}/clear_data")

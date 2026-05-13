@@ -1240,20 +1240,22 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
 # ─── delete — direct updateTimeseriesData calls (no wrappers) ────────────────
 
 
-def delete(sctx: "ScenarioContext", req: "DeleteRequest") -> dict:
+def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
     """Remove a row, a column, or wipe everything.
 
-    CAVEAT: partial deletes write NaN via updateTimeseriesData. The data point
-    stays in PyHelios memory (label still listed, length unchanged, queries
-    return NaN). A true remove would need removeTimeseriesData /
-    removeTimeseriesVariable — not in v0.1.19.
+    - Whole wipe: clearTimeseriesData (PyHelios) + delete all headers (SQL).
+    - Row delete: updateTimeseriesData(..., NaN) for that timestamp across all vars.
+    - Column delete: deleteTimeseriesVariable (PyHelios) + delete header (SQL).
     """
     if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
         raise HTTPException(503, "PyHelios not available")
     ctx = sctx.context
 
     if req.row is None and req.column is None:
+        # Wipe EVERYTHING for this scenario
         ctx.clearTimeseriesData()
+        db.query(WeatherDataHeader).filter_by(scenario_id=sctx.scenario_id).delete()
+        db.commit()
         return {"success": True, "row_count": 0, "column_count": 2}
 
     # STEP A — clear one row
@@ -1269,24 +1271,32 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest") -> dict:
             if _label_has_timestamp(ctx, label, date_obj, time_obj):
                 ctx.updateTimeseriesData(label, date_obj, time_obj, float("nan"))
 
-    # STEP B — clear one column
+    # STEP B — delete one column
     if req.column is not None:
         name = req.column.columnname
-        # Business rule — PyHelios doesn't reserve these names, we do.
         if name in ("date", "time"):
             raise HTTPException(400, "cannot delete the date/time column")
 
-        # PyHelios validates: getTimeseriesLength raises HeliosRuntimeError on
-        # missing label. The remaining loop is safe — date/time come from
-        # PyHelios's own data, so updateTimeseriesData won't error per cell.
+        # 1. Find the header in DB
+        h_row = (
+            db.query(WeatherDataHeader)
+            .filter_by(scenario_id=sctx.scenario_id, name=name)
+            .first()
+        )
+        if not h_row:
+            raise HTTPException(404, f"column '{name}' not found")
+
+        # 2. Delete from DB (UI)
+        db.delete(h_row)
+        db.commit()
+
+        # 3. Delete from Simulation (RAM) using the new v0.1.19 method.
+        # We use str(h_row.id) because that is the internal label.
         try:
-            n = ctx.getTimeseriesLength(name)
-            for i in range(n):
-                date_obj = ctx.queryTimeseriesDate(name, i)
-                time_obj = ctx.queryTimeseriesTime(name, i)
-                ctx.updateTimeseriesData(name, date_obj, time_obj, float("nan"))
-        except HeliosRuntimeError as exc:
-            raise HTTPException(404, str(exc))
+            ctx.deleteTimeseriesVariable(str(h_row.id))
+        except HeliosRuntimeError:
+            # If it's missing in RAM but deleted in DB, we consider it a success
+            pass
 
     labels_after = list(ctx.listTimeseriesVariables())
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0

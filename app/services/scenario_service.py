@@ -23,7 +23,7 @@ from app.core.scenario_context import ScenarioContext
 from app.core.session_store import registry
 from app.db.models import Project, Scenario
 from app.helios import context as helios_ctx
-from app.helios.persistence import trigger_autosave
+from app.helios.persistence import trigger_autosave, load_scenario_snapshot
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -80,7 +80,8 @@ def _resolve_scenario(
     sctx = registry.get_or_create_scenario_context(session_id, pid, sid)
     if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
         sctx.context = helios_ctx.Context()
-        trigger_autosave(sctx.context, pid)
+        # Restore weather data from scenario-specific XML if it exists
+        load_scenario_snapshot(sctx)
     return sctx
 
 

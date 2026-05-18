@@ -866,26 +866,25 @@ def update_columns(
 
     ctx = sctx.context
 
-    # ── Pre-load existing headers for this scenario, keyed by name ──
-    existing_by_name = {
-        h.name: h
-        for h in db.query(WeatherDataHeader)
-        .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
-        .all()
-    }
-
     # ── Validation pass (fail-fast before any mutation) ──
     for i, col in enumerate(columns):
-        if col.name in ("date", "time"):
+        if col.id is None:
             raise HTTPException(
-                400, f"column[{i}]: name '{col.name}' is reserved"
+                400,
+                f"column[{i}]: 'id' is required for updateCol",
             )
 
-        existing = existing_by_name.get(col.name)
-        if existing is None:
+        existing = db.get(WeatherDataHeader, col.id)
+        if existing is None or existing.scenario_id != sctx.scenario_id:
             raise HTTPException(
                 404,
-                f"column[{i}]: name '{col.name}' not found in scenario",
+                f"column[{i}]: id {col.id} not found in this scenario",
+            )
+
+        # Guard reserved names only when explicitly renaming
+        if col.name is not None and col.name in ("date", "time"):
+            raise HTTPException(
+                400, f"column[{i}]: name '{col.name}' is reserved"
             )
 
         # FK existence checks (only for fields the user is actually
@@ -974,10 +973,12 @@ def update_columns(
 
     try:
         for i, col in enumerate(columns):
-            existing = existing_by_name[col.name]
+            existing = db.get(WeatherDataHeader, col.id)
             label = str(existing.id)
 
             # SQL header field updates (PATCH semantics — None = no change).
+            if col.name is not None:
+                existing.name = col.name
             if col.datatype is not None:
                 existing.helios_data_type_id = col.datatype
             if col.data_unit is not None:
@@ -1251,6 +1252,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         ctx.clearTimeseriesData()
         db.query(WeatherDataHeader).filter_by(scenario_id=sctx.scenario_id).delete()
         db.commit()
+        trigger_scenario_autosave(sctx)
         return {"success": True, "row_count": 0, "column_count": 2}
 
     # STEP A — clear one row
@@ -1272,7 +1274,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         if name in ("date", "time"):
             raise HTTPException(400, "cannot delete the date/time column")
 
-        # 1. Find the header in DB
+        # Find the header in DB
         h_row = (
             db.query(WeatherDataHeader)
             .filter_by(scenario_id=sctx.scenario_id, name=name)
@@ -1281,7 +1283,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         if not h_row:
             raise HTTPException(404, f"column '{name}' not found")
 
-        # 1. Delete from Simulation (RAM).
+        # Delete from Simulation (RAM).
         # We try both the ID and the Name to handle both manual and CSV-uploaded labels.
         if sctx.context is not None:
             for label in [str(h_row.id), h_row.name]:
@@ -1290,7 +1292,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
                 except Exception:
                     pass
 
-        # 2. Delete from DB (UI)
+        # Delete from DB (UI)
         db.delete(h_row)
         db.commit()
 

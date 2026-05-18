@@ -45,11 +45,11 @@ def test_writes_current_gz(temp_projects_dir):
     project_id = "test_project"
     trigger_autosave(ctx, project_id)
     
-    current_gz = temp_projects_dir / project_id / "current.xml.gz"
-    assert current_gz.exists()
-    
-    with gzip.open(current_gz, "rt") as f:
-        assert f.read() == "<helios>data</helios>"
+    current_xml = temp_projects_dir / project_id / "current.xml"
+    assert current_xml.exists()
+
+    content = current_xml.read_text()
+    assert "<helios>data</helios>" in content
 
 def test_rotation_creates_archive(temp_projects_dir):
     """A second save should move the previous current.xml.gz to archives."""
@@ -67,8 +67,8 @@ def test_rotation_creates_archive(temp_projects_dir):
     archives = list(archives_dir.glob("autosave_*.xml.gz"))
     assert len(archives) == 1
     
-    current_gz = temp_projects_dir / project_id / "current.xml.gz"
-    assert current_gz.exists()
+    current_xml = temp_projects_dir / project_id / "current.xml"
+    assert current_xml.exists()
 
 def test_cap_at_10(temp_projects_dir):
     """After 11 archives (12 saves), the oldest should be deleted."""
@@ -79,11 +79,12 @@ def test_cap_at_10(temp_projects_dir):
     
     # 12 saves = 1 current.xml.gz + 11 potential archives
     # But rotation happens BEFORE the new save.
-    # 1st save: creates current.xml.gz (0 archives)
-    # 2nd save: rotates current to archive, creates new current (1 archive)
+    # 1st save: creates current.xml (0 archives)
+    # 2nd save: compresses current to archive, creates new current.xml (1 archive)
     # ...
-    # 11th save: rotates current to archive (now 10 archives), creates new current
-    # 12th save: rotates current to archive. Before adding, it sees 10 archives, deletes oldest, then adds new one (stays at 10 archives).
+    # 11th save: compresses current to archive (now 10 archives), creates new current.xml
+    # 12th save: compresses current to archive. Before adding, it sees 10 archives,
+    # deletes oldest, then adds new one (stays at 10 archives).
     
     for _ in range(12):
         trigger_autosave(ctx, project_id)

@@ -63,9 +63,8 @@ def save_snapshot(project_id: str, ctx, registry: dict, metadata: dict) -> None:
 
         raw_xml = Path(tmp_path).read_bytes()
 
-        # Tier 1 — gzip for fast working-file reads
-        gz_data = gzip.compress(raw_xml, compresslevel=6)
-        (proj_dir / "current.xml.gz").write_bytes(gz_data)
+        # Save as raw XML per ticket requirements
+        (proj_dir / "current.xml").write_bytes(raw_xml)
 
         # Registry sidecar
         (proj_dir / "registry.json").write_text(
@@ -81,11 +80,11 @@ def save_snapshot(project_id: str, ctx, registry: dict, metadata: dict) -> None:
 
 def _rotate_current(project_id: str) -> None:
     """
-    Move existing current.xml.gz → autosave_archives/autosave_TIMESTAMP.xml.gz
+    Compress existing current.xml → autosave_archives/autosave_TIMESTAMP.xml.gz
     Delete oldest archive if over MAX_AUTOSAVE_ARCHIVES.
     """
-    current_gz = settings.resolved_projects_dir / project_id / "current.xml.gz"
-    if not current_gz.exists():
+    current_xml = settings.resolved_projects_dir / project_id / "current.xml"
+    if not current_xml.exists():
         return
 
     archives_dir = _autosave_archives_dir(project_id)
@@ -96,9 +95,13 @@ def _rotate_current(project_id: str) -> None:
         existing[0].unlink(missing_ok=True)
         existing = existing[1:]
 
-    # Rename current.xml.gz → timestamped archive
+    # Compress current.xml into the timestamped archive
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    current_gz.replace(archives_dir / f"autosave_{ts}.xml.gz")
+    archive_path = archives_dir / f"autosave_{ts}.xml.gz"
+    
+    raw_xml = current_xml.read_bytes()
+    archive_path.write_bytes(gzip.compress(raw_xml, compresslevel=6))
+    current_xml.unlink(missing_ok=True)
 
 
 def trigger_autosave(ctx, project_id: str) -> None:
@@ -126,8 +129,8 @@ def trigger_autosave(ctx, project_id: str) -> None:
 
     try:
         _rotate_current(project_id)
-        gz_data = gzip.compress(raw_xml, compresslevel=6)
-        (proj_dir / "current.xml.gz").write_bytes(gz_data)
+        # Write new current file as raw XML
+        (proj_dir / "current.xml").write_bytes(raw_xml)
         logger.debug("[autosave] saved project %s (%d bytes)", project_id, len(raw_xml))
     except Exception:
         logger.exception("[autosave] rotation/write failed for project %s", project_id)
@@ -143,7 +146,7 @@ def trigger_scenario_autosave(sctx) -> None:
 
     scenario_dir = settings.resolved_scenarios_dir / sctx.scenario_id
     scenario_dir.mkdir(parents=True, exist_ok=True)
-    gz_path = scenario_dir / "weather_context.xml.gz"
+    xml_path = scenario_dir / "weather_context.xml"
 
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -151,8 +154,8 @@ def trigger_scenario_autosave(sctx) -> None:
     try:
         sctx.context.writeXML(str(tmp_path))
         raw_xml = tmp_path.read_bytes()
-        gz_data = gzip.compress(raw_xml, compresslevel=6)
-        gz_path.write_bytes(gz_data)
+        # Save as raw XML
+        xml_path.write_bytes(raw_xml)
         logger.debug("[scenario-autosave] saved scenario %s (%d bytes)",
                      sctx.scenario_id, len(raw_xml))
     except Exception:
@@ -220,26 +223,31 @@ def save_version(project_id: str, label: str, ctx, registry: dict,
 
 def load_snapshot(project_id: str, ctx) -> dict:
     """
-    Restore context from current.xml.gz on disk.
+    Restore context from current.xml on disk.
     Returns the registry dict (metadata + objects).
     """
     proj_dir = _project_dir(project_id)
-    gz_path = proj_dir / "current.xml.gz"
+    xml_path = proj_dir / "current.xml"
     registry_path = proj_dir / "registry.json"
 
-    if not gz_path.exists():
-        raise FileNotFoundError(f"No saved snapshot for project {project_id}")
+    # Fallback to old compressed file if it exists during migration
+    legacy_gz_path = proj_dir / "current.xml.gz"
 
-    raw_xml = gzip.decompress(gz_path.read_bytes())
-
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
-        tmp.write(raw_xml)
-        tmp_path = tmp.name
-
-    try:
-        ctx.loadXML(tmp_path)
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+    if not xml_path.exists():
+        if legacy_gz_path.exists():
+            raw_xml = gzip.decompress(legacy_gz_path.read_bytes())
+            with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+                tmp.write(raw_xml)
+                tmp_path = tmp.name
+            try:
+                ctx.loadXML(tmp_path)
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+        else:
+            raise FileNotFoundError(f"No saved snapshot for project {project_id}")
+    else:
+        # Load raw XML directly (fast path)
+        ctx.loadXML(str(xml_path))
 
     if registry_path.exists():
         return json.loads(registry_path.read_text(encoding="utf-8"))
@@ -248,24 +256,29 @@ def load_snapshot(project_id: str, ctx) -> dict:
 
 def load_scenario_snapshot(sctx) -> None:
     """
-    Restore scenario weather context from weather_context.xml.gz on disk.
+    Restore scenario weather context from weather_context.xml on disk.
     """
-    gz_path = settings.resolved_scenarios_dir / sctx.scenario_id / "weather_context.xml.gz"
-    if not gz_path.exists():
-        return
-
-    raw_xml = gzip.decompress(gz_path.read_bytes())
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
-        tmp.write(raw_xml)
-        tmp_path = tmp.name
+    xml_path = settings.resolved_scenarios_dir / sctx.scenario_id / "weather_context.xml"
+    legacy_gz_path = settings.resolved_scenarios_dir / sctx.scenario_id / "weather_context.xml.gz"
 
     try:
-        sctx.context.loadXML(tmp_path)
-        logger.info("[scenario-load] restored weather data for scenario %s", sctx.scenario_id)
+        if xml_path.exists():
+            # Load raw XML directly (fast path)
+            sctx.context.loadXML(str(xml_path))
+            logger.info("[scenario-load] restored weather data for scenario %s", sctx.scenario_id)
+        elif legacy_gz_path.exists():
+            # Fallback for old compressed files
+            raw_xml = gzip.decompress(legacy_gz_path.read_bytes())
+            with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+                tmp.write(raw_xml)
+                tmp_path = tmp.name
+            try:
+                sctx.context.loadXML(tmp_path)
+                logger.info("[scenario-load] restored weather data (legacy gz) for scenario %s", sctx.scenario_id)
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
     except Exception:
         logger.exception("[scenario-load] failed for scenario %s", sctx.scenario_id)
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
 
 
 def restore_version(project_id: str, version_id: int, ctx, db) -> dict:

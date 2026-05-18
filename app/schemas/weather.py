@@ -46,6 +46,7 @@ class AddColumn(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
 
+    id: int | None = None  # Required for updateCol (lookup key); ignored by addCol
     name: str
     datatype: int | None = None
     data_unit: int | None = None
@@ -104,24 +105,23 @@ class AddColumnsRequest(BaseModel):
 class UpdateColumnsRequest(BaseModel):
     """Body for PATCH /updateCol — update one or more existing columns.
 
-    Same shape as AddColumnsRequest. Each column item identifies an existing
-    column by `name` (must exist for the scenario; 404 otherwise). Per-item:
+    Each column item identifies the target by `id` (the DB primary key
+    returned by addCol). `name` is optional and only used if you also
+    want to rename the column. Per-item:
       - `datatype` / `data_unit`: PATCH semantics — only updated when non-null.
       - `values[]`: each cell upserts (creates if missing, overwrites if exists).
       - `default_value`: writes the default at every scenario timestamp NOT
         listed in `values[]`, OVERWRITING any existing cell at that timestamp.
-        Use case: select-all / deselect-all on a `check` column with one
-        PATCH call — `default_value: 1` flips every row to 1.
     """
     model_config = ConfigDict(extra="forbid")
 
     column: list[AddColumn]
 
     @model_validator(mode="after")
-    def _no_dup_column_names(self):
-        names = [c.name for c in self.column]
-        if len(names) != len(set(names)):
-            raise ValueError("duplicate column name in request body")
+    def _no_dup_column_ids(self):
+        ids = [c.id for c in self.column if c.id is not None]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate column id in request body")
         return self
 
 

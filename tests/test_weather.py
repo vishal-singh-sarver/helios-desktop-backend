@@ -68,7 +68,7 @@ CIMIS_CSV = (
 
 
 def test_transform_already_clean_format_is_idempotent():
-    header, rows = _transform_csv(CLEAN_CSV)
+    header, rows, _ = _transform_csv(CLEAN_CSV)
     assert header == ["date", "time", "temperature", "humidity"]
     assert rows[0] == ["2023-07-13", "10:00:00", "22.5", "65"]
     assert len(rows) == 3
@@ -76,7 +76,7 @@ def test_transform_already_clean_format_is_idempotent():
 
 def test_transform_cimis_format():
     """Split date+HHMM, qc flag columns, Stn Name as text, '2400' rollover."""
-    header, rows = _transform_csv(CIMIS_CSV)
+    header, rows, _ = _transform_csv(CIMIS_CSV)
 
     assert header == ["date", "time", "stn_id", "eto_mm", "air_temp_c", "rel_hum"]
     assert "stn_name" not in header
@@ -95,14 +95,14 @@ def test_transform_iso_8601_combined_datetime():
         b"KDVO,2023-07-13T10:00:00Z,225,150\n"
         b"KDVO,2023-07-13T11:00:00Z,240,148\n"
     )
-    header, rows = _transform_csv(raw)
+    header, rows, _ = _transform_csv(raw)
     assert header == ["date", "time", "tmp", "dew"]
     assert rows[0] == ["2023-07-13", "10:00:00", "225", "150"]
 
 
 def test_transform_semicolon_delimiter():
     raw = b"Date;Time;Temp\n2023-07-13;10:00:00;22.5\n2023-07-13;11:00:00;23.8\n"
-    header, rows = _transform_csv(raw)
+    header, rows, _ = _transform_csv(raw)
     assert header == ["date", "time", "temp"]
     assert rows[0] == ["2023-07-13", "10:00:00", "22.5"]
 
@@ -114,7 +114,7 @@ def test_transform_am_pm_time():
         b"7/13/2023,2:30:00 PM,28.1\n"
         b"7/13/2023,11:45:00 PM,18.2\n"
     )
-    header, rows = _transform_csv(raw)
+    header, rows, _ = _transform_csv(raw)
     assert rows[0][1] == "10:00:00"
     assert rows[1][1] == "14:30:00"
     assert rows[2][1] == "23:45:00"
@@ -127,7 +127,7 @@ def test_transform_content_based_fallback_when_headers_dont_match():
         b"2023-07-13,10:00:00,22.5\n"
         b"2023-07-13,11:00:00,23.8\n"
     )
-    header, rows = _transform_csv(raw)
+    header, rows, _ = _transform_csv(raw)
     assert header[:2] == ["date", "time"]
     assert rows[0][0] == "2023-07-13"
     assert rows[0][1] == "10:00:00"
@@ -155,7 +155,7 @@ def test_transform_deduplicates_by_timestamp_keeps_last():
         b"2023-07-13,10:00:00,99.9\n"
         b"2023-07-13,11:00:00,23.8\n"
     )
-    header, rows = _transform_csv(raw)
+    header, rows, _ = _transform_csv(raw)
     assert len(rows) == 2
     assert rows[0] == ["2023-07-13", "10:00:00", "99.9"]
     assert rows[1] == ["2023-07-13", "11:00:00", "23.8"]
@@ -167,7 +167,7 @@ def test_transform_drops_columns_with_non_numeric_values():
         b"2023-07-13,10:00:00,1.5,hello\n"
         b"2023-07-13,11:00:00,2.5,world\n"
     )
-    header, _ = _transform_csv(raw)
+    header, _, _ = _transform_csv(raw)
     assert "good_col" in header
     assert "bad_col" not in header
 
@@ -356,7 +356,7 @@ def test_update_single_cell(client):
     sid, pid, scn = _make_project(client)
     a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
 
-    r = client.post(
+    r = client.patch(
         _url(pid, scn, "update"),
         headers=_session_headers(sid),
         json={"updates": [
@@ -373,7 +373,7 @@ def test_update_many_cells_in_one_call(client):
     sid, pid, scn = _make_project(client)
     a_id, b_id = _seed_two_cell_column(client, sid, pid, scn)
 
-    r = client.post(
+    r = client.patch(
         _url(pid, scn, "update"),
         headers=_session_headers(sid),
         json={"updates": [
@@ -389,7 +389,7 @@ def test_update_many_cells_in_one_call(client):
 
 def test_update_empty_list_returns_400(client):
     sid, pid, scn = _make_project(client)
-    r = client.post(
+    r = client.patch(
         _url(pid, scn, "update"),
         headers=_session_headers(sid),
         json={"updates": []},
@@ -402,7 +402,7 @@ def test_update_reserved_column_name_returns_400(client):
     sid, pid, scn = _make_project(client)
     a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
 
-    r = client.post(
+    r = client.patch(
         _url(pid, scn, "update"),
         headers=_session_headers(sid),
         json={"updates": [
@@ -418,7 +418,7 @@ def test_update_unknown_column_returns_404(client):
     sid, pid, scn = _make_project(client)
     a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
 
-    r = client.post(
+    r = client.patch(
         _url(pid, scn, "update"),
         headers=_session_headers(sid),
         json={"updates": [
@@ -434,7 +434,7 @@ def test_update_unknown_cell_returns_404(client):
     sid, pid, scn = _make_project(client)
     a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
 
-    r = client.post(
+    r = client.patch(
         _url(pid, scn, "update"),
         headers=_session_headers(sid),
         json={"updates": [
@@ -448,7 +448,7 @@ def test_update_non_numeric_value_returns_400(client):
     sid, pid, scn = _make_project(client)
     a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
 
-    r = client.post(
+    r = client.patch(
         _url(pid, scn, "update"),
         headers=_session_headers(sid),
         json={"updates": [
@@ -464,7 +464,7 @@ def test_update_partial_failure_leaves_earlier_items_applied(client):
     sid, pid, scn = _make_project(client)
     a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
 
-    r = client.post(
+    r = client.patch(
         _url(pid, scn, "update"),
         headers=_session_headers(sid),
         json={"updates": [
@@ -1193,3 +1193,694 @@ def test_addrow_unknown_scenario_returns_404(client):
         json={"rows": [{"date": "2024-01-01", "time": "10:00:00"}]},
     )
     assert r.status_code == 404
+
+
+# ─────────────────────────── addCol default_value ────────────────────────────
+
+
+def test_addcol_default_value_fills_all_timestamps_when_values_empty(client):
+    sid, pid, scn = _make_project(client)
+    client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("seed.csv", CLEAN_CSV, "text/csv")},
+    )
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "with_default",
+            "values": [],
+            "default_value": 42.0,
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["columns"][0]["id"]
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    body = r.json()
+    assert body["row_count"] == 3
+    for row in body["rows"]:
+        assert row[str(new_id)] == 42.0
+
+
+def test_addcol_default_value_with_values_fills_only_missing_timestamps(client):
+    sid, pid, scn = _make_project(client)
+    client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("seed.csv", CLEAN_CSV, "text/csv")},
+    )
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "mixed",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "100"},
+            ],
+            "default_value": 7,
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["columns"][0]["id"]
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    rows = r.json()["rows"]
+    by_time = {row["time"]: row[str(new_id)] for row in rows}
+    assert by_time["10:00:00"] == 100.0
+    assert by_time["11:00:00"] == 7.0
+    assert by_time["12:00:00"] == 7.0
+
+
+def test_addcol_default_value_silent_noop_when_no_timestamps(client):
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "no_rows_yet",
+            "values": [],
+            "default_value": 99,
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/weather_data_header",
+        headers=_session_headers(sid),
+    )
+    assert any(h["name"] == "no_rows_yet" for h in r.json()["headers"])
+
+
+def test_addcol_default_value_numeric_string_accepted(client):
+    sid, pid, scn = _make_project(client)
+    client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("seed.csv", CLEAN_CSV, "text/csv")},
+    )
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "str_default",
+            "values": [],
+            "default_value": "5.5",
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["columns"][0]["id"]
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    for row in r.json()["rows"]:
+        assert row[str(new_id)] == 5.5
+
+
+def test_addcol_default_value_non_numeric_returns_422(client):
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "bad",
+            "values": [],
+            "default_value": "not-a-number",
+        }]},
+    )
+    assert r.status_code == 422
+
+
+# ─────────────────────────── PATCH /updateCol ────────────────────────────────
+
+
+def _seed_scenario_with_one_column(client):
+    """Scenario with 3 timestamps + one SQL-tracked column 'temperature'.
+
+    Uses addCol so the SQL `weather_data_headers` row exists alongside the
+    PyHelios cells.
+    """
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "22.5"},
+                {"date": "2023-07-13", "time": "11:00:00", "value": "23.8"},
+                {"date": "2023-07-13", "time": "12:00:00", "value": "25.3"},
+            ],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    return sid, pid, scn, {"temperature": r.json()["columns"][0]["id"]}
+
+
+def test_updatecol_with_values_overwrites_existing_cells(client):
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "111"},
+                {"date": "2023-07-13", "time": "11:00:00", "value": "222"},
+            ],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["columns"][0]["id"] == temp_id
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(temp_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] == 111.0
+    assert by_time["11:00:00"] == 222.0
+    assert by_time["12:00:00"] is None
+
+
+def test_updatecol_default_value_fills_missing_cells_only(client):
+    sid, pid, scn = _make_project(client)
+    client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("seed.csv", CLEAN_CSV, "text/csv")},
+    )
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "extra", "values": []}]},
+    )
+    extra_id = r.json()["columns"][0]["id"]
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "extra",
+            "values": [],
+            "default_value": 50,
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    for row in r.json()["rows"]:
+        assert row[str(extra_id)] == 50.0
+
+
+def test_updatecol_default_value_overwrites_existing_cells(client):
+    """default_value sets every scenario timestamp's cell to the default,
+    overwriting any existing value. Use case: select-all / deselect-all on
+    a check column with one PATCH call."""
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [],
+            "default_value": 999,
+        }]},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    # Every cell now holds 999 (overwritten — was 22.5, 23.8, 25.3).
+    for row in r.json()["rows"]:
+        assert row[str(temp_id)] == 999.0
+
+
+def test_updatecol_explicit_values_win_over_default(client):
+    """When both `values[]` and `default_value` are given, listed timestamps
+    keep their explicit value; everything else gets default_value (overwriting)."""
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "111"},
+            ],
+            "default_value": 5,
+        }]},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(temp_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] == 111.0   # explicit wins
+    assert by_time["11:00:00"] == 5.0     # default overwrote 23.8
+    assert by_time["12:00:00"] == 5.0     # default overwrote 25.3
+
+
+def test_updatecol_values_plus_default_value_together(client):
+    sid, pid, scn = _make_project(client)
+    client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("seed.csv", CLEAN_CSV, "text/csv")},
+    )
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "extra", "values": []}]},
+    )
+    extra_id = r.json()["columns"][0]["id"]
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "extra",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "1"},
+            ],
+            "default_value": 9,
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(extra_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] == 1.0
+    assert by_time["11:00:00"] == 9.0
+    assert by_time["12:00:00"] == 9.0
+
+
+def test_updatecol_unknown_column_returns_404(client):
+    sid, pid, scn = _make_project(client)
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "nonexistent",
+            "values": [{"date": "2024-01-01", "time": "10:00:00", "value": "1"}],
+        }]},
+    )
+    assert r.status_code == 404
+    assert "not found" in r.json()["detail"].lower()
+
+
+def test_updatecol_reserved_name_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "date", "values": []}]},
+    )
+    assert r.status_code == 400
+
+
+def test_updatecol_empty_list_returns_400(client):
+    sid, pid, scn = _make_project(client)
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": []},
+    )
+    assert r.status_code == 400
+
+
+def test_updatecol_duplicate_name_in_batch_returns_422(client):
+    sid, pid, scn = _make_project(client)
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "x", "values": []},
+            {"name": "x", "values": []},
+        ]},
+    )
+    assert r.status_code == 422
+
+
+def test_updatecol_updates_datatype_and_unit_in_place(client):
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
+    r = client.get("/api/data-types/")
+    dt = next(t for t in r.json()["data_types"] if t["data_type"] == "air_temperature")
+    base_unit_id = next(u["id"] for u in dt["units"] if u["is_base"])
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "datatype": dt["id"],
+            "data_unit": base_unit_id,
+        }]},
+    )
+    assert r.status_code == 200
+    body = r.json()["columns"][0]
+    assert body["id"] == temp_id
+    assert body["datatype_id"] == dt["id"]
+    assert body["data_unit_id"] == base_unit_id
+
+
+def test_updatecol_inconsistent_unit_and_datatype_returns_400(client):
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    r = client.get("/api/data-types/")
+    by_name = {t["data_type"]: t for t in r.json()["data_types"]}
+    temp_dt = by_name["air_temperature"]
+    pressure_dt = by_name["air_pressure"]
+    pressure_unit = next(u["id"] for u in pressure_dt["units"] if u["is_base"])
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "datatype": temp_dt["id"],
+            "data_unit": pressure_unit,
+        }]},
+    )
+    assert r.status_code == 400
+    assert "belongs to" in r.json()["detail"].lower()
+
+
+def test_updatecol_bad_date_format_returns_400(client):
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [{"date": "13-07-2023", "time": "10:00:00", "value": "1"}],
+        }]},
+    )
+    assert r.status_code == 400
+
+
+def test_updatecol_non_numeric_value_returns_400(client):
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [{"date": "2023-07-13", "time": "10:00:00", "value": "hello"}],
+        }]},
+    )
+    assert r.status_code == 400
+
+
+def test_updatecol_creates_cell_at_new_timestamp(client):
+    sid, pid, scn = _make_project(client)
+    client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("seed.csv", CLEAN_CSV, "text/csv")},
+    )
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "newcol", "values": []}]},
+    )
+    new_id = r.json()["columns"][0]["id"]
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "newcol",
+            "values": [{"date": "2023-07-13", "time": "10:00:00", "value": "42"}],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(new_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] == 42.0
+
+
+def test_updatecol_other_session_returns_404(client):
+    sid_a, pid, scn, ids = _seed_scenario_with_one_column(client)
+    sid_b = f"session_{uuid4().hex[:8]}"
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid_b),
+        json={"column": [{"name": "temperature", "values": []}]},
+    )
+    assert r.status_code == 404
+
+
+def test_updatecol_missing_session_id_returns_400(client):
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        json={"column": [{"name": "temperature", "values": []}]},
+    )
+    assert r.status_code == 400
+
+
+# ─────────────────────────── NaN-fill rule (uniform empty handling) ─────────
+
+
+def test_addcol_with_no_values_no_default_fills_scenario_with_nan(client):
+    """A new column added with empty values[] and no default_value gets a
+    NaN cell at every existing scenario timestamp — keeps the column aligned
+    with the scenario's row count instead of leaving it sparse."""
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+
+    # Add a new empty column.
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "empty_col", "values": []}]},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["columns"][0]["id"]
+
+    # All scenario timestamps should have a cell — NaN renders as JSON null.
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    assert r.json()["row_count"] == 3
+    for row in r.json()["rows"]:
+        assert row[str(new_id)] is None  # NaN -> null
+
+
+def test_addcol_with_explicit_empty_value_writes_nan(client):
+    """An entry in values[] with value="" writes a NaN cell (not skipped)."""
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "mixed",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": ""},
+                {"date": "2023-07-13", "time": "11:00:00", "value": "26"},
+            ],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+    new_id = r.json()["columns"][0]["id"]
+
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(new_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] is None       # explicit empty -> NaN
+    assert by_time["11:00:00"] == 26.0       # explicit value
+    assert by_time["12:00:00"] is None       # not in values[], no default -> NaN
+
+
+def test_addcol_empty_scenario_no_default_creates_empty_column(client):
+    """Sanity: a new column on a scenario with NO existing rows AND no
+    default_value AND no values[] creates an empty column (no cells)."""
+    sid, pid, scn = _make_project(client)
+
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "empty", "values": []}]},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_updatecol_no_values_no_default_fills_missing_with_nan_only(client):
+    """PATCH /updateCol with empty values[] and no default_value should:
+       - leave existing cells alone (non-destructive)
+       - fill missing scenario timestamps with NaN
+    This keeps the column aligned without destroying user data."""
+    sid, pid, scn = _make_project(client)
+    # Seed a 3-timestamp scenario.
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "anchor",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "1"},
+                {"date": "2023-07-13", "time": "11:00:00", "value": "2"},
+                {"date": "2023-07-13", "time": "12:00:00", "value": "3"},
+            ],
+        }]},
+    )
+    # Add a column with one cell out of three.
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "partial",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": "100"},
+            ],
+        }]},
+    )
+    partial_id = r.json()["columns"][0]["id"]
+    # Note: addCol now ALSO fills missing timestamps with NaN, so partial
+    # already has 3 cells: 100, NaN, NaN. The PATCH below should be a no-op.
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{"name": "partial", "values": []}]},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(partial_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] is None       # overwritten by default_value="NAN"
+    assert by_time["11:00:00"] is None       # was NaN, still NaN
+    assert by_time["12:00:00"] is None       # was NaN, still NaN
+
+
+def test_updatecol_with_explicit_empty_value_writes_nan(client):
+    """An empty value in updateCol values[] overwrites the existing cell with NaN."""
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [
+                {"date": "2023-07-13", "time": "10:00:00", "value": ""},
+            ],
+        }]},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        f"/api/weather/project/{pid}/scenario/{scn}/getAllTimeSeriesData",
+        headers=_session_headers(sid),
+    )
+    by_time = {row["time"]: row[str(temp_id)] for row in r.json()["rows"]}
+    assert by_time["10:00:00"] is None             # overwritten with NaN
+    assert by_time["11:00:00"] is None             # overwritten by default_value="NAN"
+    assert by_time["12:00:00"] is None             # overwritten by default_value="NAN"
+
+
+def test_addCol_decimal_validation_limit_exceeded(client):
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "humidity",
+            "values": [
+                {"date": "2024-01-01", "time": "10:00:00", "value": "1.12345678"} # 8 decimals
+            ],
+        }]},
+    )
+    assert r.status_code == 400
+    assert "contains more than 7 decimal places" in r.text
+
+
+def test_addrow_decimal_validation_limit_exceeded(client):
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
+    
+    r = client.post(
+        _url(pid, scn, "addRow"),
+        headers=_session_headers(sid),
+        json={"rows": [
+            {
+                "date": "2024-01-01",
+                "time": "10:00:00",
+                str(temp_id): "1.12345678"  # 8 decimals
+            }
+        ]},
+    )
+    assert r.status_code == 400
+    assert "contains more than 7 decimal places" in r.text
+
+
+def test_updatecol_decimal_validation_limit_exceeded(client):
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
+
+    r = client.patch(
+        _url(pid, scn, "update"),
+        headers=_session_headers(sid),
+        json={"updates": [
+            {
+                "col": str(temp_id),
+                "row": {"date": "2023-07-13", "time": "10:00:00"},
+                "value": "1.12345678" # 8 decimals
+            }
+        ]},
+    )
+    assert r.status_code == 400
+    assert "contains more than 7 decimal places" in r.text
+
+
+def test_upload_csv_decimal_truncation(client):
+    sid, pid, scn = _make_project(client)
+    # CSV with 8 decimal places
+    csv_content = b"Date,Time,Air Temp\n2026-05-11,12:00:00,25.12345678\n"
+
+    r = client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("test.csv", csv_content, "text/csv")},
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is True
+    assert "truncated" in body["message"].lower()
+
+    # Verify that the value written is truncated
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    rows = r.json()["rows"]
+    assert len(rows) == 1
+    # Check that value matches 25.1234567 (truncated, not rounded up)
+    # Note: float comparison, but 25.1234567 should be close enough
+    # PyHelios returns 32-bit float but the truncation happened beforehand.
+    val = list(rows[0].values())[-1] # The last column should be Air Temp
+    assert abs(val - 25.1234567) < 0.000001

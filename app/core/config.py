@@ -64,6 +64,10 @@ class Settings(BaseSettings):
         return self.projects_dir or self.data_dir / "projects"
 
     @property
+    def resolved_scenarios_dir(self) -> Path:
+        return self.data_dir / "scenarios"
+
+    @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 

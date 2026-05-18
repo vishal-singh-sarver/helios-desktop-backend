@@ -76,14 +76,28 @@ else:
 
 # ── PyHelios imports ──────────────────────────────────────────────────────────
 try:
-    from pyhelios import Context, WeberPennTree, WPTType
+    import pyhelios
+    # If it's a namespace package (common on Windows editable installs), 
+    # we need to force import from the submodules
+    if getattr(pyhelios, "__file__", None) is None:
+        from pyhelios import Context, WeberPennTree, WPTType
+    else:
+        from pyhelios import Context, WeberPennTree, WPTType
+    
     from pyhelios.types import vec2, vec3, int2, RGBcolor, RGBAcolor, SphericalCoord, Date, Time
     PYHELIOS_AVAILABLE: bool = True
 except Exception as e:
-    PYHELIOS_AVAILABLE = False
-    Context = WeberPennTree = WPTType = None
-    vec2 = vec3 = int2 = RGBcolor = RGBAcolor = SphericalCoord = Date = Time = None
-    print(f"[pyhelios] WARNING: Not available — {e}")
+    # Final fallback attempt: try direct submodule imports
+    try:
+        from pyhelios.Context import Context
+        from pyhelios.WeberPennTree import WeberPennTree, WPTType
+        from pyhelios.types import vec2, vec3, int2, RGBcolor, RGBAcolor, SphericalCoord, Date, Time
+        PYHELIOS_AVAILABLE = True
+    except Exception as e2:
+        PYHELIOS_AVAILABLE = False
+        Context = WeberPennTree = WPTType = None
+        vec2 = vec3 = int2 = RGBcolor = RGBAcolor = SphericalCoord = Date = Time = None
+        print(f"[pyhelios] WARNING: Not available — {e}")
 
 try:
     from pyhelios import PlantArchitecture

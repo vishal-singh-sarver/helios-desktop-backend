@@ -38,6 +38,20 @@ async def get_project(
     return project_service.get_project_with_scenarios(session_id, project_id, db)
 
 
+@router.patch("/{project_id}")
+async def update_project(
+    project_id: str,
+    req: ProjectCreateRequest,
+    db: Session = Depends(get_db),
+    session_id: str = Depends(get_session_id),
+):
+    """Partial update of a project. Editable: name, latitude, longitude.
+    When latitude or longitude changes, utc_offset is recomputed."""
+    return project_service.update_project(
+        session_id, project_id, req.name, req.latitude, req.longitude, db
+    )
+
+
 @router.delete("/{project_id}")
 async def delete_project(
     project_id: str,

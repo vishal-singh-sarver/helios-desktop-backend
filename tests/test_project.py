@@ -414,3 +414,220 @@ def test_get_project_does_not_collide_with_recent_route(client):
     r = client.get("/api/project/recent", headers={"session-id": sid})
     assert r.status_code == 200
     assert "projects" in r.json()
+
+
+
+# ─── PATCH /api/project/{project_id} ────────────────────────────────────────
+
+
+def _make_simple_project(client, session_id: str | None = None) -> tuple[str, str]:
+    """Create one project; return (session_id, project_id)."""
+    sid = session_id or f"session_{uuid4().hex[:8]}"
+    r = client.post(
+        "/api/project/create",
+        json={"name": f"P_{uuid4().hex[:8]}", "latitude": 38.5, "longitude": -121.7},
+        headers={"session-id": sid},
+    )
+    assert r.status_code == 201, r.text
+    return sid, r.json()["project_id"]
+
+
+def test_patch_name_only_succeeds(client):
+    sid, pid = _make_simple_project(client)
+    new_name = f"Renamed_{uuid4().hex[:8]}"
+
+    r = client.patch(f"/api/project/{pid}", json={"name": new_name},
+                     headers={"session-id": sid})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is True
+    assert body["project"]["name"] == new_name
+    assert body["project"]["latitude"] == 38.5  # unchanged
+
+    # Confirm via GET
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid})
+    assert r.json()["project"]["name"] == new_name
+
+
+def test_patch_coords_recomputes_utc_offset(client):
+    """Move from California (-121.7, UTC-8/-7) to Delhi (77.2, UTC+5:30).
+    utc_offset must change."""
+    sid, pid = _make_simple_project(client)
+
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid})
+    original_offset = r.json()["project"]["utc_offset"]
+
+    r = client.patch(
+        f"/api/project/{pid}",
+        json={"latitude": 28.6, "longitude": 77.2},
+        headers={"session-id": sid},
+    )
+    assert r.status_code == 200
+    new_offset = r.json()["project"]["utc_offset"]
+    assert new_offset != original_offset
+    # Delhi is UTC+5:30
+    assert new_offset.startswith("+05:30") or new_offset == "+05:30"
+
+
+def test_patch_all_fields_at_once(client):
+    sid, pid = _make_simple_project(client)
+    new_name = f"All_{uuid4().hex[:8]}"
+
+    r = client.patch(
+        f"/api/project/{pid}",
+        json={"name": new_name, "latitude": 51.5, "longitude": -0.12},
+        headers={"session-id": sid},
+    )
+    assert r.status_code == 200
+    p = r.json()["project"]
+    assert p["name"] == new_name
+    assert p["latitude"] == 51.5
+    assert p["longitude"] == -0.12
+
+
+def test_patch_empty_body_is_noop(client):
+    sid, pid = _make_simple_project(client)
+
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid})
+    before = r.json()["project"]
+
+    r = client.patch(f"/api/project/{pid}", json={}, headers={"session-id": sid})
+    assert r.status_code == 200
+    after = r.json()["project"]
+    assert after["name"] == before["name"]
+    assert after["latitude"] == before["latitude"]
+    assert after["longitude"] == before["longitude"]
+    assert after["utc_offset"] == before["utc_offset"]
+
+
+def test_patch_rename_to_self_is_not_409(client):
+    """PATCH name to the project's current name → 200 no-op, not collision."""
+    sid, pid = _make_simple_project(client)
+    r = client.get(f"/api/project/{pid}", headers={"session-id": sid})
+    current_name = r.json()["project"]["name"]
+
+    r = client.patch(f"/api/project/{pid}", json={"name": current_name},
+                     headers={"session-id": sid})
+    assert r.status_code == 200
+    assert r.json()["project"]["name"] == current_name
+
+
+def test_patch_name_collision_in_session_returns_409(client):
+    """Two projects in the same session; renaming one to the other's name → 409."""
+    sid = f"session_{uuid4().hex[:8]}"
+    r1 = client.post(
+        "/api/project/create",
+        json={"name": "FirstProj", "latitude": 38.5, "longitude": -121.7},
+        headers={"session-id": sid},
+    )
+    r2 = client.post(
+        "/api/project/create",
+        json={"name": "SecondProj", "latitude": 38.5, "longitude": -121.7},
+        headers={"session-id": sid},
+    )
+    second_pid = r2.json()["project_id"]
+
+    r = client.patch(
+        f"/api/project/{second_pid}",
+        json={"name": "FirstProj"},
+        headers={"session-id": sid},
+    )
+    assert r.status_code == 409
+    assert "already exists" in r.json()["detail"].lower()
+
+
+def test_patch_same_name_in_different_session_succeeds(client):
+    """Project name uniqueness is per-session — two sessions can have the
+    same name without collision."""
+    sid_a = f"session_{uuid4().hex[:8]}"
+    sid_b = f"session_{uuid4().hex[:8]}"
+
+    client.post(
+        "/api/project/create",
+        json={"name": "SharedName", "latitude": 38.5, "longitude": -121.7},
+        headers={"session-id": sid_a},
+    )
+    rb = client.post(
+        "/api/project/create",
+        json={"name": "OtherProj", "latitude": 38.5, "longitude": -121.7},
+        headers={"session-id": sid_b},
+    )
+    pid_b = rb.json()["project_id"]
+
+    r = client.patch(
+        f"/api/project/{pid_b}",
+        json={"name": "SharedName"},
+        headers={"session-id": sid_b},
+    )
+    assert r.status_code == 200
+    assert r.json()["project"]["name"] == "SharedName"
+
+
+def test_patch_invalid_lat_returns_422(client):
+    sid, pid = _make_simple_project(client)
+    r = client.patch(f"/api/project/{pid}", json={"latitude": 91.0},
+                     headers={"session-id": sid})
+    assert r.status_code == 422
+
+
+def test_patch_invalid_long_returns_422(client):
+    sid, pid = _make_simple_project(client)
+    r = client.patch(f"/api/project/{pid}", json={"longitude": -181.0},
+                     headers={"session-id": sid})
+    assert r.status_code == 422
+
+
+def test_patch_oversize_name_returns_422(client):
+    sid, pid = _make_simple_project(client)
+    r = client.patch(f"/api/project/{pid}", json={"name": "X" * 31},
+                     headers={"session-id": sid})
+    assert r.status_code == 422
+
+
+def test_patch_empty_name_returns_422(client):
+    sid, pid = _make_simple_project(client)
+    r = client.patch(f"/api/project/{pid}", json={"name": "   "},
+                     headers={"session-id": sid})
+    assert r.status_code == 422
+
+
+def test_patch_string_coords_are_coerced(client):
+    """Mirror create's behavior: numeric strings are accepted and coerced."""
+    sid, pid = _make_simple_project(client)
+    r = client.patch(
+        f"/api/project/{pid}",
+        json={"latitude": "40.0", "longitude": "-74.0"},
+        headers={"session-id": sid},
+    )
+    assert r.status_code == 200
+    assert r.json()["project"]["latitude"] == 40.0
+    assert r.json()["project"]["longitude"] == -74.0
+
+
+def test_patch_unknown_project_returns_404(client):
+    sid = f"session_{uuid4().hex[:8]}"
+    r = client.patch(
+        f"/api/project/{uuid4().hex}",
+        json={"name": "X"},
+        headers={"session-id": sid},
+    )
+    assert r.status_code == 404
+
+
+def test_patch_other_session_project_returns_404(client):
+    """Project owned by session A → session B PATCHing it sees 404."""
+    sid_a, pid = _make_simple_project(client)
+    sid_b = f"session_{uuid4().hex[:8]}"
+
+    r = client.patch(
+        f"/api/project/{pid}",
+        json={"name": "hijacked"},
+        headers={"session-id": sid_b},
+    )
+    assert r.status_code == 404
+
+
+def test_patch_missing_session_id_returns_400(client):
+    sid, pid = _make_simple_project(client)
+    r = client.patch(f"/api/project/{pid}", json={"name": "X"})
+    assert r.status_code == 400

@@ -23,6 +23,7 @@ from app.core.scenario_context import ScenarioContext
 from app.core.session_store import registry
 from app.db.models import Project, Scenario
 from app.helios import context as helios_ctx
+from app.helios.persistence import trigger_autosave, load_scenario_snapshot
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -76,9 +77,12 @@ def _resolve_scenario(
     if scenario is None:
         raise HTTPException(404, f"Scenario {sid} not found in this project")
 
-    sctx = registry.get_or_create_scenario_context(session_id, pid, sid)
-    if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
-        sctx.context = helios_ctx.Context()
+    with registry._scenario_lock:
+        sctx = registry.get_or_create_scenario_context(session_id, pid, sid)
+        if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
+            sctx.context = helios_ctx.Context()
+            # Restore weather data from scenario-specific XML if it exists
+            load_scenario_snapshot(sctx)
     return sctx
 
 

@@ -1,3 +1,4 @@
+import threading
 from app.core.project_context import ProjectContext
 from app.core.scenario_context import ScenarioContext
 
@@ -22,6 +23,8 @@ class SessionRegistry:
         self._store: dict[str, dict[str, ProjectContext]] = {}
         # {session_id: {project_id: {scenario_id: ScenarioContext}}}
         self._scenarios: dict[str, dict[str, dict[str, ScenarioContext]]] = {}
+        # Lock to prevent race conditions during scenario initialization/loading
+        self._scenario_lock = threading.Lock()
 
     # ── Session level ────────────────────────────────────────────────
 

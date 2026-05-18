@@ -16,15 +16,27 @@ Compression tiers:
 """
 import gzip
 import json
+import logging
 import lzma
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from app.core.config import settings
 
 
+logger = logging.getLogger(__name__)
+MAX_AUTOSAVE_ARCHIVES = 10
+
+
 def _project_dir(project_id: str) -> Path:
     d = settings.resolved_projects_dir / project_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _autosave_archives_dir(project_id: str) -> Path:
+    d = _project_dir(project_id) / "autosave_archives"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -63,6 +75,90 @@ def save_snapshot(project_id: str, ctx, registry: dict, metadata: dict) -> None:
 
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+# ── Autosave ──────────────────────────────────────────────────────────────────
+
+def _rotate_current(project_id: str) -> None:
+    """
+    Move existing current.xml.gz → autosave_archives/autosave_TIMESTAMP.xml.gz
+    Delete oldest archive if over MAX_AUTOSAVE_ARCHIVES.
+    """
+    current_gz = settings.resolved_projects_dir / project_id / "current.xml.gz"
+    if not current_gz.exists():
+        return
+
+    archives_dir = _autosave_archives_dir(project_id)
+
+    # Enforce cap (sort oldest → newest by mtime)
+    existing = sorted(archives_dir.glob("autosave_*.xml.gz"), key=lambda p: p.stat().st_mtime)
+    while len(existing) >= MAX_AUTOSAVE_ARCHIVES:
+        existing[0].unlink(missing_ok=True)
+        existing = existing[1:]
+
+    # Rename current.xml.gz → timestamped archive
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    current_gz.replace(archives_dir / f"autosave_{ts}.xml.gz")
+
+
+def trigger_autosave(ctx, project_id: str) -> None:
+    """
+    Fire-and-forget autosave. Called after every context mutation.
+    Overwrites current.xml.gz and rotates the previous one into archives.
+    """
+    # Stub guard: no-op if writeXML is not available
+    if not hasattr(ctx, "writeXML"):
+        return
+
+    proj_dir = _project_dir(project_id)
+
+    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        ctx.writeXML(str(tmp_path))
+        raw_xml = tmp_path.read_bytes()
+    except Exception:
+        logger.exception("[autosave] writeXML failed for project %s", project_id)
+        return
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    try:
+        _rotate_current(project_id)
+        gz_data = gzip.compress(raw_xml, compresslevel=6)
+        (proj_dir / "current.xml.gz").write_bytes(gz_data)
+        logger.debug("[autosave] saved project %s (%d bytes)", project_id, len(raw_xml))
+    except Exception:
+        logger.exception("[autosave] rotation/write failed for project %s", project_id)
+
+
+def trigger_scenario_autosave(sctx) -> None:
+    """
+    Persist scenario-specific weather context to disk.
+    Path: data/scenarios/{scenario_id}/weather_context.xml.gz
+    """
+    if not sctx.context or not hasattr(sctx.context, "writeXML"):
+        return
+
+    scenario_dir = settings.resolved_scenarios_dir / sctx.scenario_id
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    gz_path = scenario_dir / "weather_context.xml.gz"
+
+    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        sctx.context.writeXML(str(tmp_path))
+        raw_xml = tmp_path.read_bytes()
+        gz_data = gzip.compress(raw_xml, compresslevel=6)
+        gz_path.write_bytes(gz_data)
+        logger.debug("[scenario-autosave] saved scenario %s (%d bytes)",
+                     sctx.scenario_id, len(raw_xml))
+    except Exception:
+        logger.exception("[scenario-autosave] failed for scenario %s", sctx.scenario_id)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def save_version(project_id: str, label: str, ctx, registry: dict,
@@ -121,6 +217,7 @@ def save_version(project_id: str, label: str, ctx, registry: dict,
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
+
 def load_snapshot(project_id: str, ctx) -> dict:
     """
     Restore context from current.xml.gz on disk.
@@ -147,6 +244,28 @@ def load_snapshot(project_id: str, ctx) -> dict:
     if registry_path.exists():
         return json.loads(registry_path.read_text(encoding="utf-8"))
     return {"metadata": {}, "objects": {}}
+
+
+def load_scenario_snapshot(sctx) -> None:
+    """
+    Restore scenario weather context from weather_context.xml.gz on disk.
+    """
+    gz_path = settings.resolved_scenarios_dir / sctx.scenario_id / "weather_context.xml.gz"
+    if not gz_path.exists():
+        return
+
+    raw_xml = gzip.decompress(gz_path.read_bytes())
+    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+        tmp.write(raw_xml)
+        tmp_path = tmp.name
+
+    try:
+        sctx.context.loadXML(tmp_path)
+        logger.info("[scenario-load] restored weather data for scenario %s", sctx.scenario_id)
+    except Exception:
+        logger.exception("[scenario-load] failed for scenario %s", sctx.scenario_id)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 def restore_version(project_id: str, version_id: int, ctx, db) -> dict:

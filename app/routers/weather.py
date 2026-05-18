@@ -128,7 +128,7 @@ def update_weather(
 ):
     """Update one or more existing cells in one call (fail-fast)."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.update_cells(sctx, body)
+    return weather_service.update_cells(sctx, body, db)
 
 
 @router.post("/project/{project_id}/scenario/{scenario_id}/delete")

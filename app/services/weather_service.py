@@ -109,6 +109,18 @@ def _is_numeric_value(v: Any) -> bool:
     return False
 
 
+def _validate_cell_range(v: float, col_name: str, location_hint: str = "") -> None:
+    """Validate cell value is within -1e6 to +1e6 when no data type is assigned."""
+    if math.isnan(v):
+        return
+    if not (-1_000_000 <= v <= 1_000_000):
+        prefix = f"{location_hint}: " if location_hint else ""
+        raise HTTPException(
+            400, f"{prefix}value '{v}' for column '{col_name}' must be between -1,000,000 and 1,000,000 when no data type is assigned"
+        )
+
+
+
 def _has_excess_decimals(v: Any) -> bool:
     """True if numeric string or float has more than 7 decimal places."""
     if v is None:
@@ -392,9 +404,11 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
             d.strftime("%Y-%m-%d"),
             f"{h:02d}:{m:02d}:{sec:02d}",
         ]
-        for i, _ in data_cols:
+        for i, col_name in data_cols:
             if i < len(r):
                 val = r[i].strip()
+                if val and val.upper() != "NAN":
+                    _validate_cell_range(float(val), col_name, "uploadfile")
                 if _has_excess_decimals(val):
                     val = _truncate_decimals(val)
                     truncated_any = True
@@ -747,12 +761,18 @@ def add_columns(
                     400,
                     f"column[{i}].values[{j}]: value '{v.value}' contains more than 7 decimal places"
                 )
+            if col.datatype is None and v.value != "" and v.value.upper() != "NAN":
+                _validate_cell_range(float(v.value), col.name, f"column[{i}].values[{j}]")
 
         if _has_excess_decimals(col.default_value):
             raise HTTPException(
                 400,
                 f"column[{i}]: default_value '{col.default_value}' contains more than 7 decimal places"
             )
+        
+        if col.datatype is None and col.default_value is not None:
+            if not math.isnan(float(col.default_value)):
+                _validate_cell_range(float(col.default_value), col.name, f"column[{i}] default_value")
 
         # Track newly-added names so a follow-up item in the same request
         # collides too (Pydantic also catches this, defence-in-depth).
@@ -866,26 +886,25 @@ def update_columns(
 
     ctx = sctx.context
 
-    # ── Pre-load existing headers for this scenario, keyed by name ──
-    existing_by_name = {
-        h.name: h
-        for h in db.query(WeatherDataHeader)
-        .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
-        .all()
-    }
-
     # ── Validation pass (fail-fast before any mutation) ──
     for i, col in enumerate(columns):
-        if col.name in ("date", "time"):
+        if col.id is None:
             raise HTTPException(
-                400, f"column[{i}]: name '{col.name}' is reserved"
+                400,
+                f"column[{i}]: 'id' is required for updateCol",
             )
 
-        existing = existing_by_name.get(col.name)
-        if existing is None:
+        existing = db.get(WeatherDataHeader, col.id)
+        if existing is None or existing.scenario_id != sctx.scenario_id:
             raise HTTPException(
                 404,
-                f"column[{i}]: name '{col.name}' not found in scenario",
+                f"column[{i}]: id {col.id} not found in this scenario",
+            )
+
+        # Guard reserved names only when explicitly renaming
+        if col.name is not None and col.name in ("date", "time"):
+            raise HTTPException(
+                400, f"column[{i}]: name '{col.name}' is reserved"
             )
 
         # FK existence checks (only for fields the user is actually
@@ -954,12 +973,18 @@ def update_columns(
                     400,
                     f"column[{i}].values[{j}]: value '{v.value}' contains more than 7 decimal places"
                 )
+            if final_dt is None and v.value != "" and v.value.upper() != "NAN":
+                _validate_cell_range(float(v.value), existing.name, f"column[{i}].values[{j}]")
 
         if _has_excess_decimals(col.default_value):
             raise HTTPException(
                 400,
                 f"column[{i}]: default_value '{col.default_value}' contains more than 7 decimal places"
             )
+        
+        if final_dt is None and col.default_value is not None:
+            if not math.isnan(float(col.default_value)):
+                _validate_cell_range(float(col.default_value), existing.name, f"column[{i}] default_value")
 
     # ── Apply changes ──
     written_cells: list[tuple[str, Any, Any]] = []
@@ -974,10 +999,12 @@ def update_columns(
 
     try:
         for i, col in enumerate(columns):
-            existing = existing_by_name[col.name]
+            existing = db.get(WeatherDataHeader, col.id)
             label = str(existing.id)
 
             # SQL header field updates (PATCH semantics — None = no change).
+            if col.name is not None:
+                existing.name = col.name
             if col.datatype is not None:
                 existing.helios_data_type_id = col.datatype
             if col.data_unit is not None:
@@ -1087,14 +1114,19 @@ def add_rows(
     # reserved as row keys, not data columns. addCol/PATCH refuse to
     # create them, but the bulk PUT doesn't enforce that, so a sideloaded
     # row could exist; this filter keeps add_rows robust either way. ──
-    header_ids = [
-        row[0]
-        for row in db.query(WeatherDataHeader.id)
+    headers = (
+        db.query(
+            WeatherDataHeader.id,
+            WeatherDataHeader.name,
+            WeatherDataHeader.helios_data_type_id,
+        )
         .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
         .filter(WeatherDataHeader.name.notin_(("date", "time")))
         .all()
-    ]
-    existing_label_set = {str(hid) for hid in header_ids}
+    )
+    existing_label_set = {str(r.id) for r in headers}
+    cols_without_datatype = {str(r.id) for r in headers if r.helios_data_type_id is None}
+    header_names_by_id = {str(r.id): r.name for r in headers}
 
     # ── Existing timestamps still come from PyHelios (SQL doesn't track
     # row timestamps). We can only anchor on a label PyHelios actually
@@ -1160,7 +1192,10 @@ def add_rows(
                     raise HTTPException(
                         400, f"value '{v}' for column '{k}' contains more than 7 decimal places"
                     )
-                cells[k] = float(vstr)
+                new_val = float(vstr)
+                if k in cols_without_datatype:
+                    _validate_cell_range(new_val, header_names_by_id.get(k, k), "addRow")
+                cells[k] = new_val
             else:
                 raise HTTPException(
                     400,
@@ -1181,7 +1216,7 @@ def add_rows(
 # ─── update — batch update of existing cells ────────────────────────────────
 
 
-def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
+def update_cells(sctx: "ScenarioContext", req: "UpdateRequest", db: Session) -> dict:
     """Update one or more existing cells in a single call.
 
     Used by the frontend when changing a column's data_unit — every cell
@@ -1200,6 +1235,19 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
 
     if len(req.updates) == 0:
         raise HTTPException(400, "updates list cannot be empty")
+
+    headers = (
+        db.query(
+            WeatherDataHeader.id,
+            WeatherDataHeader.name,
+            WeatherDataHeader.helios_data_type_id,
+        )
+        .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
+        .filter(WeatherDataHeader.name.notin_(("date", "time")))
+        .all()
+    )
+    cols_without_datatype = {str(r.id) for r in headers if r.helios_data_type_id is None}
+    header_names_by_id = {str(r.id): r.name for r in headers}
 
     for i, item in enumerate(req.updates):
         # Business rule — PyHelios doesn't reserve these names, we do.
@@ -1220,6 +1268,10 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
                     400, f"updates[{i}]: value '{item.value}' contains more than 7 decimal places"
                 )
             new_value = float("nan") if item.value == "" else float(item.value)
+            
+            if item.col in cols_without_datatype:
+                _validate_cell_range(new_value, header_names_by_id.get(item.col, item.col), f"updates[{i}]")
+
             ctx.updateTimeseriesData(item.col, date_obj, time_obj, new_value)
         except ValueError as exc:
             raise HTTPException(
@@ -1251,6 +1303,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         ctx.clearTimeseriesData()
         db.query(WeatherDataHeader).filter_by(scenario_id=sctx.scenario_id).delete()
         db.commit()
+        trigger_scenario_autosave(sctx)
         return {"success": True, "row_count": 0, "column_count": 2}
 
     # STEP A — clear one row
@@ -1272,7 +1325,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         if name in ("date", "time"):
             raise HTTPException(400, "cannot delete the date/time column")
 
-        # 1. Find the header in DB
+        # Find the header in DB
         h_row = (
             db.query(WeatherDataHeader)
             .filter_by(scenario_id=sctx.scenario_id, name=name)
@@ -1281,7 +1334,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         if not h_row:
             raise HTTPException(404, f"column '{name}' not found")
 
-        # 1. Delete from Simulation (RAM).
+        # Delete from Simulation (RAM).
         # We try both the ID and the Name to handle both manual and CSV-uploaded labels.
         if sctx.context is not None:
             for label in [str(h_row.id), h_row.name]:
@@ -1290,7 +1343,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
                 except Exception:
                     pass
 
-        # 2. Delete from DB (UI)
+        # Delete from DB (UI)
         db.delete(h_row)
         db.commit()
 

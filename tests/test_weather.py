@@ -1349,6 +1349,7 @@ def test_updatecol_with_values_overwrites_existing_cells(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": temp_id,
             "name": "temperature",
             "values": [
                 {"date": "2023-07-13", "time": "10:00:00", "value": "111"},
@@ -1385,6 +1386,7 @@ def test_updatecol_default_value_fills_missing_cells_only(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": extra_id,
             "name": "extra",
             "values": [],
             "default_value": 50,
@@ -1410,6 +1412,7 @@ def test_updatecol_default_value_overwrites_existing_cells(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": temp_id,
             "name": "temperature",
             "values": [],
             "default_value": 999,
@@ -1436,6 +1439,7 @@ def test_updatecol_explicit_values_win_over_default(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": temp_id,
             "name": "temperature",
             "values": [
                 {"date": "2023-07-13", "time": "10:00:00", "value": "111"},
@@ -1472,6 +1476,7 @@ def test_updatecol_values_plus_default_value_together(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": extra_id,
             "name": "extra",
             "values": [
                 {"date": "2023-07-13", "time": "10:00:00", "value": "1"},
@@ -1496,6 +1501,7 @@ def test_updatecol_unknown_column_returns_404(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": 999999,
             "name": "nonexistent",
             "values": [{"date": "2024-01-01", "time": "10:00:00", "value": "1"}],
         }]},
@@ -1530,8 +1536,8 @@ def test_updatecol_duplicate_name_in_batch_returns_422(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [
-            {"name": "x", "values": []},
-            {"name": "x", "values": []},
+            {"id": 1, "name": "x", "values": []},
+            {"id": 1, "name": "x", "values": []},
         ]},
     )
     assert r.status_code == 422
@@ -1547,6 +1553,7 @@ def test_updatecol_updates_datatype_and_unit_in_place(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": temp_id,
             "name": "temperature",
             "datatype": dt["id"],
             "data_unit": base_unit_id,
@@ -1570,6 +1577,7 @@ def test_updatecol_inconsistent_unit_and_datatype_returns_400(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": ids["temperature"],
             "name": "temperature",
             "datatype": temp_dt["id"],
             "data_unit": pressure_unit,
@@ -1585,6 +1593,7 @@ def test_updatecol_bad_date_format_returns_400(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": ids["temperature"],
             "name": "temperature",
             "values": [{"date": "13-07-2023", "time": "10:00:00", "value": "1"}],
         }]},
@@ -1598,6 +1607,7 @@ def test_updatecol_non_numeric_value_returns_400(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": ids["temperature"],
             "name": "temperature",
             "values": [{"date": "2023-07-13", "time": "10:00:00", "value": "hello"}],
         }]},
@@ -1622,6 +1632,7 @@ def test_updatecol_creates_cell_at_new_timestamp(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": new_id,
             "name": "newcol",
             "values": [{"date": "2023-07-13", "time": "10:00:00", "value": "42"}],
         }]},
@@ -1761,7 +1772,7 @@ def test_updatecol_no_values_no_default_fills_missing_with_nan_only(client):
     r = client.patch(
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
-        json={"column": [{"name": "partial", "values": []}]},
+        json={"column": [{"id": partial_id, "name": "partial", "values": []}]},
     )
     assert r.status_code == 200, r.text
 
@@ -1784,6 +1795,7 @@ def test_updatecol_with_explicit_empty_value_writes_nan(client):
         _url(pid, scn, "updateCol"),
         headers=_session_headers(sid),
         json={"column": [{
+            "id": temp_id,
             "name": "temperature",
             "values": [
                 {"date": "2023-07-13", "time": "10:00:00", "value": ""},
@@ -1884,3 +1896,75 @@ def test_upload_csv_decimal_truncation(client):
     # PyHelios returns 32-bit float but the truncation happened beforehand.
     val = list(rows[0].values())[-1] # The last column should be Air Temp
     assert abs(val - 25.1234567) < 0.000001
+
+
+# ──────────────────── updateCol — ID-based lookup ────────────────────────────
+
+
+def test_update_col_by_id_succeeds(client):
+    """updateCol with a valid id updates the column metadata."""
+    sid, pid, scn = _make_project(client)
+    a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
+
+    dt = _make_data_type(client)
+    u = _make_data_unit(client, dt)
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"id": a_id, "name": "a", "datatype": dt, "data_unit": u},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["columns"][0]["id"] == a_id
+
+
+def test_update_col_without_id_returns_400(client):
+    """updateCol without id field must return 400."""
+    sid, pid, scn = _make_project(client)
+    _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"name": "a"},   # missing id
+        ]},
+    )
+    assert r.status_code == 400
+    assert "id" in r.json()["detail"].lower()
+
+
+def test_update_col_with_wrong_id_returns_404(client):
+    """updateCol with an id that doesn't belong to this scenario returns 404."""
+    sid, pid, scn = _make_project(client)
+    _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"id": 999999, "name": "a"},   # non-existent id
+        ]},
+    )
+    assert r.status_code == 404
+
+
+def test_update_col_renames_column_via_id(client):
+    """updateCol with id + new name renames the column."""
+    sid, pid, scn = _make_project(client)
+    a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
+
+    r = client.patch(
+        _url(pid, scn, "updateCol"),
+        headers=_session_headers(sid),
+        json={"column": [
+            {"id": a_id, "name": "Renamed_Column"},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["columns"][0]["name"] == "Renamed_Column"

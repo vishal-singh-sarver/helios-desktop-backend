@@ -23,6 +23,7 @@ import csv
 import io
 import math
 import os
+import shutil
 import tempfile
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -32,7 +33,10 @@ from sqlalchemy.orm import Session
 
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
 from app.helios import context as helios_ctx
-from app.helios.persistence import trigger_scenario_autosave
+from app.helios.persistence import (
+    _ensure_scenario_structure,
+    trigger_scenario_autosave,
+)
 
 # PyHelios's specific exception for "thing not found" errors (missing label,
 # missing cell, etc.). Defensive import: if PyHelios isn't available, define
@@ -569,6 +573,7 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
         ctx.clearTimeseriesData()
 
         temp_path = _write_temp_csv(header, rows)
+        load_ok = False
         try:
             ctx.loadTabularTimeseriesData(
                 temp_path,
@@ -577,9 +582,24 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
                 "YYYY-MM-DD",
                 1,
             )
+            load_ok = True
         except Exception as exc:
             raise HTTPException(503, f"PyHelios load failed: {exc}")
         finally:
+            # Persist a copy of the normalized CSV under the scenario's
+            # weather/ folder if PyHelios accepted it. Best-effort —
+            # never fails the request if the disk write trips on something.
+            if load_ok:
+                try:
+                    weather_dir = (
+                        _ensure_scenario_structure(sctx.project_id, sctx.scenario_id)
+                        / "weather"
+                    )
+                    weather_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(temp_path, weather_dir / "weather.csv")
+                except Exception:
+                    pass
+
             try:
                 os.unlink(temp_path)
             except OSError:

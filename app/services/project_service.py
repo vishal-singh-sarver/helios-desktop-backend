@@ -8,7 +8,6 @@ from app.core.timezone import utc_offset_from_coords
 from app.core.session_store import registry
 from app.core.config import settings
 from app.helios import context as helios_ctx
-from app.helios.persistence import trigger_autosave
 from app.services.weather_header_service import serialize as serialize_header
 
 
@@ -53,12 +52,12 @@ def create_project(session_id: str, name: str, latitude: float,
     if helios_ctx.PYHELIOS_AVAILABLE:
         pctx.reset()
         pctx.context = helios_ctx.Context()
-        trigger_autosave(pctx.context, project.id)
 
     pctx.initialized = True
 
     # Register the main scenario's ScenarioContext so the first request
-    # that targets it is instant.
+    # that targets it is instant. Scenario autosave kicks in once the
+    # user does their first weather mutation.
     registry.get_or_create_scenario_context(session_id, project.id, main_scenario.id)
 
     return {
@@ -263,8 +262,14 @@ def delete_project(session_id: str, project_id: str, db: Session) -> dict:
     # remove_project also wipes all scenarios for this project from memory.
     registry.remove_project(session_id, project_id)
 
-    # Disk cleanup — legacy project snapshot tree + scenario data tree.
+    # Disk cleanup — one rmtree handles the entire project tree (scenes,
+    # scenarios, weather, archives, everything) since scenarios live nested
+    # under the project folder.
     shutil.rmtree(settings.resolved_projects_dir / project_id, ignore_errors=True)
+
+    # Belt-and-suspenders: also remove the legacy `data/<pid>/` top-level
+    # folder if it survived a partial migration. No-op when the migration
+    # has already cleaned it.
     shutil.rmtree(settings.data_dir / project_id, ignore_errors=True)
 
     return {"success": True, "project_id": project_id}

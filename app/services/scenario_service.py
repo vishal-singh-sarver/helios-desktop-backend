@@ -23,15 +23,18 @@ from app.core.scenario_context import ScenarioContext
 from app.core.session_store import registry
 from app.db.models import Project, Scenario
 from app.helios import context as helios_ctx
-from app.helios.persistence import trigger_autosave, load_scenario_snapshot
+from app.helios.persistence import (
+    _ensure_scenario_structure,
+    load_scenario_snapshot,
+)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 
 def _scenario_dir(project_id: str, scenario_id: str) -> Path:
-    """On-disk folder for a scenario's data."""
-    return settings.data_dir / project_id / scenario_id
+    """Per-scenario folder, nested under its parent project."""
+    return settings.scenario_dir(project_id, scenario_id)
 
 
 def _assert_project_owned(
@@ -144,14 +147,19 @@ def create_scenario(
         db.rollback()
         raise HTTPException(500, "Failed to create scenario")
 
-    new_dir = _scenario_dir(project_id, scenario.id)
-    new_dir.mkdir(parents=True, exist_ok=True)
+    # Scaffold the canonical per-scenario folder shape:
+    #   <new_dir>/
+    #     context_file/  (+ archives/)
+    #     weather/
+    #     metadata/
+    #     export_files/
+    new_dir = _ensure_scenario_structure(project_id, scenario.id)
 
-    # Fork weather CSV from the source, if any
+    # Fork weather CSV from the source, if any → land it under weather/.
     if source and source.weather_file_path:
         src_path = Path(source.weather_file_path)
         if src_path.exists():
-            dst_path = new_dir / "weather.csv"
+            dst_path = new_dir / "weather" / "weather.csv"
             shutil.copyfile(src_path, dst_path)
             scenario.weather_file_path = str(dst_path)
             try:

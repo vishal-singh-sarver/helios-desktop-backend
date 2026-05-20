@@ -63,9 +63,22 @@ class Settings(BaseSettings):
     def resolved_projects_dir(self) -> Path:
         return self.projects_dir or self.data_dir / "projects"
 
-    @property
-    def resolved_scenarios_dir(self) -> Path:
-        return self.data_dir / "scenarios"
+    def scenario_dir(self, project_id: str, scenario_id: str) -> Path:
+        """Canonical per-scenario folder nested under its parent project.
+
+        Layout under this folder:
+            context_file/
+                context.xml         PyHelios state
+                archives/           rotated autosaves (.gz)
+            weather/                uploaded weather CSVs
+            metadata/               reserved for future use
+            export_files/           reserved for future use
+        """
+        return self.resolved_projects_dir / project_id / "scenarios" / scenario_id
+
+    def scenario_context_file_dir(self, project_id: str, scenario_id: str) -> Path:
+        """`context_file/` subfolder where context.xml + archives live."""
+        return self.scenario_dir(project_id, scenario_id) / "context_file"
 
     @property
     def cors_origins_list(self) -> list[str]:

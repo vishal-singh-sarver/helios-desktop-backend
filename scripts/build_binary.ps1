@@ -205,10 +205,18 @@ $buildRootDir = Join-Path $pyheliosSrc 'pyhelios_build\build'
 $runtimeDlls = @(
   @{ Path = Join-Path $libBuildDir  'libhelios.dll';   Required = $true  }
   @{ Path = Join-Path $libBuildDir  'optix.6.5.0.dll'; Required = $false }
+  @{ Path = Join-Path $libBuildDir  'optix.51.dll';    Required = $false } 
   @{ Path = Join-Path $buildRootDir 'glew32.dll';      Required = $false }
 )
-if (-not $libheliosBundled) {
-  Write-Host "[!] WARNING: libhelios.dll missing - backend will fail at runtime. Build it first with 'python build_scripts\build_helios.py' in pyhelios/."
+foreach ($dll in $runtimeDlls) {
+  if (Test-Path $dll.Path) {
+    $pyInstallerArgs += @('--add-binary', "$($dll.Path);pyhelios\pyhelios_build\build\lib")
+    Write-Host "[*] Bundling DLL: $($dll.Path)"
+  } elseif ($dll.Required) {
+    throw "Required DLL missing: $($dll.Path)"
+  } else {
+    Write-Host "[!] Optional DLL not found, skipping: $($dll.Path)"
+  }
 }
 
 # Runtime asset images (textures needed by C++ core)

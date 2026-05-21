@@ -2,9 +2,10 @@
 """
 Request bodies for weather endpoints.
 
-    POST /addCol  body: AddColumnsRequest
-    POST /addRow  body: AddRowsRequest
-    POST /update  body: UpdateRequest
+    POST  /addCol                   body: AddColumnsRequest
+    PATCH /updateCol/{column_id}    body: UpdateColumn  (single)
+    POST  /addRow                   body: AddRowsRequest
+    POST  /update                   body: UpdateRequest
     POST /delete  body: DeleteRequest
 
 The `addCol` flow links each new column to the metadata catalog
@@ -32,21 +33,21 @@ class ColumnValue(BaseModel):
     value: str = "NAN"   # "NAN" is treated as empty/NaN
 
 
-class AddColumn(BaseModel):
-    """One column spec inside the AddRequest.column list.
+class _ColumnFields(BaseModel):
+    """Shared per-column fields + validators for addCol / updateCol bodies.
 
-    Two optional FKs link the column to the master catalog:
+    Two optional FKs link a column to the master catalog:
       datatype  -> helios_data_types.id
       data_unit -> data_units.id
     When non-null and both present, the unit must belong to the type
     (service-level invariant; the schema doesn't enforce cross-table CHECKs).
 
     `default_value` (optional) fills any scenario timestamp NOT covered by
-    `values[]`. Numeric (or numeric string). Null/absent = no fill.
+    `values[]`. Numeric (or numeric string). Null/absent = no fill on add;
+    on update, see UpdateColumn for the overwrite-vs-fill semantics.
     """
     model_config = ConfigDict(extra="forbid")
 
-    id: int | None = None  # Required for updateCol (lookup key); ignored by addCol
     name: str
     datatype: int | None = None
     data_unit: int | None = None
@@ -83,6 +84,25 @@ class AddColumn(BaseModel):
         raise ValueError("default_value must be numeric")
 
 
+class AddColumn(_ColumnFields):
+    """One column spec inside the AddColumnsRequest.column list."""
+    pass
+
+
+class UpdateColumn(_ColumnFields):
+    """Body for PATCH /updateCol/{column_id} — update one existing column.
+
+    The target column is identified by `column_id` in the URL path. Per field:
+      - `datatype` / `data_unit`: PATCH semantics — only updated when non-null.
+      - `values[]`: each cell upserts (creates if missing, overwrites if exists).
+      - `default_value`: when provided, writes the default at every scenario
+        timestamp NOT listed in `values[]`, OVERWRITING any existing cell at
+        that timestamp. When absent/null, only missing cells are filled (NaN)
+        — existing data is preserved.
+    """
+    pass
+
+
 class AddColumnsRequest(BaseModel):
     """Body for POST /addCol — add one or more columns in a single batch.
 
@@ -99,29 +119,6 @@ class AddColumnsRequest(BaseModel):
         names = [c.name for c in self.column]
         if len(names) != len(set(names)):
             raise ValueError("duplicate column name in request body")
-        return self
-
-
-class UpdateColumnsRequest(BaseModel):
-    """Body for PATCH /updateCol — update one or more existing columns.
-
-    Each column item identifies the target by `id` (the DB primary key
-    returned by addCol). `name` is optional and only used if you also
-    want to rename the column. Per-item:
-      - `datatype` / `data_unit`: PATCH semantics — only updated when non-null.
-      - `values[]`: each cell upserts (creates if missing, overwrites if exists).
-      - `default_value`: writes the default at every scenario timestamp NOT
-        listed in `values[]`, OVERWRITING any existing cell at that timestamp.
-    """
-    model_config = ConfigDict(extra="forbid")
-
-    column: list[AddColumn]
-
-    @model_validator(mode="after")
-    def _no_dup_column_ids(self):
-        ids = [c.id for c in self.column if c.id is not None]
-        if len(ids) != len(set(ids)):
-            raise ValueError("duplicate column id in request body")
         return self
 
 

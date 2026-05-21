@@ -327,17 +327,18 @@ def test_co2_conversion_factors(client):
 
 
 def test_default_units_min_max_set_on_base(client):
-    """Each base unit carries the design-doc min/max range; secondary
-    units leave them null (the range is meaningful in the canonical unit)."""
+    """Every unit (base + secondary) carries a min/max range per the
+    Weather Parameter Unit Conversion Reference doc (migration 018)."""
     by_name = _by_name(client)
 
-    # air_temperature K base: 223–350
+    # air_temperature: K (base) 223–350, C (secondary) -50.15–76.85
     units = {u["unit"]: u for u in by_name["air_temperature"]["units"]}
     assert units["K"]["min"] == 223
     assert units["K"]["max"] == 350
-    assert units["C"]["min"] is None  # secondary unit — no range
+    assert units["C"]["min"] == -50.15
+    assert units["C"]["max"] == 76.85
 
-    # air_humidity fraction base: 0–1
+    # air_humidity: 0-1 (base) 0–1
     units = {u["unit"]: u for u in by_name["air_humidity"]["units"]}
-    assert units["fraction"]["min"] == 0
-    assert units["fraction"]["max"] == 1
+    assert units["0-1"]["min"] == 0
+    assert units["0-1"]["max"] == 1

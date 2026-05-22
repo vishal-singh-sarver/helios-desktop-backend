@@ -184,6 +184,17 @@ $pyInstallerArgs = @(
   '--collect-all', 'sqlalchemy'
 )
 
+# SQL migration files. run_migrations() reads these at runtime; they are never
+# imported and the folder has no __init__.py, so neither --collect-submodules
+# nor --collect-data app picks them up. Without bundling them verbatim the
+# packaged DB has no tables and every API call fails with "no such table".
+$migrationsDir = Join-Path $backendApiDir 'app\db\migrations'
+if (-not (Test-Path $migrationsDir)) {
+  Write-Host "ERROR: migrations folder not found at $migrationsDir"
+  exit 1
+}
+$pyInstallerArgs += @('--add-data', "$migrationsDir;app\db\migrations")
+
 # Bundle the pyhelios Python package and its native runtime DLLs only.
 # We deliberately do NOT bundle the entire pyhelios/ submodule (helios-core/,
 # pyhelios_build/build/, tests/, docs/, build_scripts/) - those aren't needed

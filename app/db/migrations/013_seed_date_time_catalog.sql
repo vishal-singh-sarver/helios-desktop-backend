@@ -1,4 +1,4 @@
--- Migration 019 — seed the date_time data type and its format units.
+-- Migration 013 — seed the date_time data type and its format units.
 --
 -- A single new data_type, 'date_time', whose "units" are not numeric
 -- units in the conventional sense — they're pattern strings describing
@@ -22,14 +22,12 @@
 --   - YYYY DOY / DOY YYYY day-of-year formats — flagged as uncommon by
 --     the source doc and not worth the extra parsing complexity yet.
 --
--- Out of scope here (future cleanup):
---   helios_data_types.parameter_type exists on the live DB with default
---   'linear_factor' but is not currently tracked in any migration file
---   and is not read by any backend code. The new 'date_time' row will
---   inherit 'linear_factor' which is semantically wrong for format
---   strings, but harmless until someone wires parameter_type into
---   behavior. Track the column properly + override it for this row in
---   the same migration that introduces the wiring.
+-- Note on parameter_type:
+--   helios_data_types.parameter_type is added by migration 014, which
+--   runs after this one. The 'date_time' row created here therefore
+--   inherits the column default ('linear_factor') once 014 adds it.
+--   That's semantically loose for format strings — revisit and set an
+--   appropriate parameter_type when parameter_type is wired into behavior.
 
 INSERT OR IGNORE INTO helios_data_types (data_type, description) VALUES
     ('date_time',
@@ -54,4 +52,4 @@ INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, is_base) VALUES
     ((SELECT id FROM helios_data_types WHERE data_type = 'date_time'),
         'MM-DD-YYYY HH:MM',          'US dash 24-hour',      0);
 
-INSERT OR IGNORE INTO schema_migrations(version) VALUES (19);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (13);

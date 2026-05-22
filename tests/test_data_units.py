@@ -293,7 +293,7 @@ def test_cascade_delete_parent_removes_unit(client):
 
 # ─── Conversion fields (factor / offset / is_base) ──────────────────────────
 #
-# Migration 010 adds three columns describing the affine map back to the
+# Migration 009 adds three columns describing the affine map back to the
 # data_type's canonical unit:
 #     value_in_base = value * to_base_factor + to_base_offset
 # A partial unique index enforces at most one is_base=1 row per data_type.

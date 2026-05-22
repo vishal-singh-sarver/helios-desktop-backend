@@ -218,7 +218,7 @@ def update_header(
     excluding the row being updated so a no-op patch doesn't self-collide.
     The unit/type consistency invariant is verified against the post-update
     state and only when BOTH are non-null (partial mappings remain legal
-    per migration 009).
+    per migration 008).
     """
     _resolve_scenario(session_id, project_id, scenario_id, db)
 

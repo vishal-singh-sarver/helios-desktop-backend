@@ -1,6 +1,6 @@
--- Migration 018 — set min/max on all secondary (non-base) weather data units.
+-- Migration 012 — set min/max on all secondary (non-base) weather data units.
 --
--- Migration 017 seeded data types and units but only filled min/max on the
+-- Migration 011 seeded data types and units but only filled min/max on the
 -- base unit of each parameter. This migration populates the per-unit
 -- ranges for every other unit, using the Weather Parameter Unit
 -- Conversion Reference doc as the source of truth.
@@ -86,4 +86,4 @@ UPDATE data_units SET min = 0, max = 3000000
     WHERE data_type_id = (SELECT id FROM helios_data_types WHERE data_type = 'air_CO2')
       AND unit = 'ppb';
 
-INSERT OR IGNORE INTO schema_migrations(version) VALUES (18);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (12);

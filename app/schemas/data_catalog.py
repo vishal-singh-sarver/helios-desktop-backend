@@ -57,7 +57,7 @@ class DataUnitCreateRequest(BaseModel):
     the affine map back to the data type's canonical unit:
         value_in_base = value * to_base_factor + to_base_offset
     Only one unit per data_type may have is_base=True (enforced by a
-    partial unique index in migration 010).
+    partial unique index in migration 009).
     """
 
     unit: str

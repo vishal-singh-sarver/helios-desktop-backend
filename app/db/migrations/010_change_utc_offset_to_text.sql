@@ -1,4 +1,4 @@
--- Migration 012 — change projects.utc_offset from REAL (fractional hours)
+-- Migration 010 — change projects.utc_offset from REAL (fractional hours)
 -- to TEXT (ISO 8601 offset, e.g. "+05:30", "-07:00").
 --
 -- Why: matches the offset suffix that datetime.isoformat() already emits
@@ -60,4 +60,4 @@ ALTER TABLE projects_new RENAME TO projects;
 
 CREATE INDEX IF NOT EXISTS idx_projects_session_id ON projects(session_id);
 
-INSERT OR IGNORE INTO schema_migrations(version) VALUES (12);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (10);

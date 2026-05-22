@@ -1,4 +1,4 @@
--- Migration 016 — seed default weather data types and their units.
+-- Migration 011 — seed default weather data types and their units.
 --
 -- Per the design doc: standard weather parameters used by the simulation
 -- models (radiation, energy balance, photosynthesis, etc.) along with
@@ -23,12 +23,9 @@
 -- Out of scope here:
 --   - UTC, latitude, longitude, Date, Time — project/scenario metadata,
 --     not measured weather data.
---   - Wh/m^2 / kWh/m^2/day / micromol/m^2/s under radiation — these are
---     energy or photon flux, not linearly convertible to W/m^2.
---   - kg/m^3 under CO2 — needs molar mass / ideal gas law to convert to
---     ppm, not a simple linear transform.
---   These are intentionally omitted; add later if a non-linear conversion
---   path is wired up.
+--   - Wh/m^2 / kWh/m^2/day / micromol/m^2/s under radiation, and kg/m^3
+--     under CO2 — non-linear / non-trivial conversions. These are seeded
+--     by migration 014, not here.
 
 -- ── Standardize existing units (Renames instead of Deletes to avoid FK errors) ──
 UPDATE data_units SET unit = '0-1'   WHERE data_type_id = 5 AND unit = 'fraction';
@@ -105,4 +102,4 @@ INSERT OR IGNORE INTO data_units (data_type_id, unit, alias, to_base_factor, to_
     ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'ppb',   NULL, 0.001, 0.0, 0, NULL, NULL),
     ((SELECT id FROM helios_data_types WHERE data_type = 'air_CO2'), 'kg/m³', NULL, 1.0,   0.0, 0, NULL, NULL);
 
-INSERT OR IGNORE INTO schema_migrations(version) VALUES (17);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (11);

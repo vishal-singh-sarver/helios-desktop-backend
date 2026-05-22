@@ -1,5 +1,5 @@
 """
-Context persistence — scenario-level save, load, and migration.
+Context persistence — scenario-level save + load.
 
 Storage layout (per scenario):
   data/projects/{project_id}/scenarios/{scenario_id}/
@@ -12,7 +12,7 @@ Storage layout (per scenario):
       metadata/                   ← reserved for future use
       export_files/               ← reserved for future use
 
-  SQLite project_versions table:
+  SQLite project_versions table (defined in migrations/001_initial.sql):
       scene_xml BLOB              ← lzma-compressed XML (archived versions)
       registry_json TEXT
 
@@ -30,7 +30,6 @@ import gzip
 import json
 import logging
 import lzma
-import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -153,40 +152,19 @@ def load_scenario_snapshot(sctx) -> None:
     """
     Restore a scenario's PyHelios context from disk.
 
-    Read order (first match wins):
-      1. New nested path:
-            data/projects/<pid>/scenarios/<sid>/context_file/context.xml
-      2. Legacy flat path:
-            data/scenarios/<sid>/weather_context.xml
-            data/scenarios/<sid>/weather_context.xml.gz
+    Reads:
+        data/projects/<pid>/scenarios/<sid>/context_file/context.xml
 
-    Legacy paths exist only for files that haven't been migrated yet by
-    `migrate_disk_layout()`. They'll be cleaned up automatically the next
-    time the migration runs (next server startup).
+    No-op (silent) when the file doesn't exist — a fresh scenario has
+    nothing to restore.
     """
     new_xml = _scenario_context_xml(sctx.project_id, sctx.scenario_id)
-
-    legacy_root = settings.data_dir / "scenarios" / sctx.scenario_id
-    legacy_xml = legacy_root / "weather_context.xml"
-    legacy_gz = legacy_root / "weather_context.xml.gz"
+    if not new_xml.exists():
+        return
 
     try:
-        if new_xml.exists():
-            sctx.context.loadXML(str(new_xml))
-            logger.info("[scenario-load] restored scenario %s", sctx.scenario_id)
-        elif legacy_xml.exists():
-            sctx.context.loadXML(str(legacy_xml))
-            logger.info("[scenario-load] restored (legacy xml) scenario %s", sctx.scenario_id)
-        elif legacy_gz.exists():
-            raw_xml = gzip.decompress(legacy_gz.read_bytes())
-            with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
-                tmp.write(raw_xml)
-                tmp_path = tmp.name
-            try:
-                sctx.context.loadXML(tmp_path)
-                logger.info("[scenario-load] restored (legacy gz) scenario %s", sctx.scenario_id)
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
+        sctx.context.loadXML(str(new_xml))
+        logger.info("[scenario-load] restored scenario %s", sctx.scenario_id)
     except Exception:
         logger.exception("[scenario-load] failed for scenario %s", sctx.scenario_id)
 
@@ -302,156 +280,3 @@ def list_versions(project_id: str, db) -> list:
     ]
 
 
-# ── One-time migration to nested layout ──────────────────────────────────────
-
-
-def migrate_disk_layout() -> None:
-    """
-    One-time migration from legacy parallel-tree layout into nested.
-
-    Old paths (any combination may exist):
-      data/projects/<pid>/current.xml(.gz)         → discarded (project autosave dropped)
-      data/projects/<pid>/autosave_archives/*      → discarded
-      data/scenarios/<sid>/weather_context.xml(.gz) → moved
-      data/<pid>/<sid>/weather.csv                  → moved
-
-    New paths:
-      data/projects/<pid>/scenarios/<sid>/context_file/context.xml
-      data/projects/<pid>/scenarios/<sid>/weather/weather.csv
-
-    Idempotent — skips files already at the new path. Safe to call on
-    every startup. Logs the number of items moved.
-
-    Wrapped in a top-level guard: any unexpected error logs but does NOT
-    crash startup. Migration retries next time the server boots.
-    """
-    try:
-        _migrate_disk_layout_impl()
-    except Exception:
-        logger.exception("[disk-migration] unexpected error; will retry on next startup")
-
-
-def _migrate_disk_layout_impl() -> None:
-    """Inner migration body — see migrate_disk_layout() for the contract."""
-    from sqlalchemy.orm import Session
-    from app.db.database import SessionLocal
-    from app.db.models import Scenario, Project
-
-    db: Session = SessionLocal()
-    try:
-        scenarios = list(db.query(Scenario).all())
-        projects = list(db.query(Project).all())
-    finally:
-        db.close()
-
-    moved = 0
-
-    # ── (1) Per-scenario weather XML → scenarios/<sid>/context_file/context.xml
-    legacy_scenarios_root = settings.data_dir / "scenarios"
-    if legacy_scenarios_root.exists():
-        for s in scenarios:
-            new_ctx_dir = settings.scenario_context_file_dir(s.project_id, s.id)
-            legacy_dir = legacy_scenarios_root / s.id
-
-            for fname, is_gz in (
-                ("weather_context.xml", False),
-                ("weather_context.xml.gz", True),
-            ):
-                src = legacy_dir / fname
-                if not src.exists():
-                    continue
-
-                new_ctx_dir.mkdir(parents=True, exist_ok=True)
-                (new_ctx_dir / "archives").mkdir(exist_ok=True)
-                dst = new_ctx_dir / "context.xml"
-
-                if dst.exists():
-                    # Already migrated — discard the legacy copy
-                    try:
-                        src.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    continue
-
-                try:
-                    if is_gz:
-                        raw = gzip.decompress(src.read_bytes())
-                        dst.write_bytes(raw)
-                        try:
-                            src.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                    else:
-                        src.replace(dst)
-                    moved += 1
-                except Exception:
-                    logger.debug("[disk-migration] could not move %s (will retry next startup)", src)
-
-            # Remove now-empty legacy scenario dir
-            try:
-                legacy_dir.rmdir()
-            except OSError:
-                pass
-
-        # Remove now-empty legacy_scenarios_root
-        try:
-            legacy_scenarios_root.rmdir()
-        except OSError:
-            pass
-
-    # ── (2) Per-scenario weather CSV → scenarios/<sid>/weather/weather.csv
-    for s in scenarios:
-        legacy_csv = settings.data_dir / s.project_id / s.id / "weather.csv"
-        if not legacy_csv.exists():
-            continue
-
-        try:
-            new_weather_dir = settings.scenario_dir(s.project_id, s.id) / "weather"
-            new_weather_dir.mkdir(parents=True, exist_ok=True)
-            dst = new_weather_dir / "weather.csv"
-
-            if dst.exists():
-                try:
-                    legacy_csv.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            else:
-                legacy_csv.replace(dst)
-                moved += 1
-        except Exception:
-            logger.debug("[disk-migration] could not move CSV %s (will retry next startup)", legacy_csv)
-
-        # Try to remove the now-empty legacy parent folders
-        for legacy_parent in (legacy_csv.parent, legacy_csv.parent.parent):
-            try:
-                legacy_parent.rmdir()
-            except OSError:
-                pass
-
-    # ── (3) Discard legacy project-level current.xml + autosave_archives
-    # Phase 1 drops project-level autosave entirely — these files are no
-    # longer useful and would just clutter the projects folder.
-    #
-    # All cleanup is best-effort: skip anything that errors (e.g. a Windows
-    # file lock on a file currently held open by another process). Migration
-    # is idempotent so the next startup will try again.
-    for project in projects:
-        proj_dir = settings.resolved_projects_dir / project.id
-        for legacy_name in ("current.xml", "current.xml.gz", "registry.json"):
-            legacy = proj_dir / legacy_name
-            if legacy.exists():
-                try:
-                    legacy.unlink(missing_ok=True)
-                    moved += 1
-                except OSError:
-                    logger.debug("[disk-migration] could not remove %s (will retry next startup)", legacy)
-        legacy_archives = proj_dir / "autosave_archives"
-        if legacy_archives.exists() and legacy_archives.is_dir():
-            try:
-                shutil.rmtree(legacy_archives)
-                moved += 1
-            except OSError:
-                logger.debug("[disk-migration] could not remove %s (will retry next startup)", legacy_archives)
-
-    if moved:
-        logger.info("[disk-migration] moved/cleaned %d items into nested layout", moved)

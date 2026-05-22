@@ -28,12 +28,7 @@ async def lifespan(app: FastAPI):
     from app.db.database import run_migrations
     run_migrations()
 
-    # 4. Disk layout migration (one-time move into nested per-scenario tree).
-    #    Idempotent — safe to call every startup.
-    from app.helios.persistence import migrate_disk_layout
-    migrate_disk_layout()
-
-    # 5. PyHelios availability check
+    # 4. PyHelios availability check
     from app.helios.context import init_pyhelios
     init_pyhelios()
 

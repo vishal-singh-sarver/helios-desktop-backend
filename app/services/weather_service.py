@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover
 
 if TYPE_CHECKING:
     from app.core.scenario_context import ScenarioContext
-    from app.schemas.weather import AddColumn, DeleteRequest, UpdateRequest
+    from app.schemas.weather import AddColumn, DeleteRequest, UpdateColumn, UpdateRequest
 
 
 # ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -879,217 +879,180 @@ def add_columns(
 
 
 def update_columns(
-    sctx: "ScenarioContext", columns: list["AddColumn"], db: Session
+    sctx: "ScenarioContext", column_id: int, column: "UpdateColumn", db: Session
 ) -> dict:
-    """PATCH /updateCol — update one or more existing columns.
+    """PATCH /updateCol/{column_id} — update one existing column.
 
-    Each item identifies the target column by `name` (must exist for this
-    scenario; 404 otherwise). Per item:
+    Target column is identified by `column_id` (URL path). Per field:
       - `datatype` / `data_unit`: PATCH semantics — only updated when non-null.
         Consistency check (`unit.data_type_id == helios_data_type_id`) runs
         against the post-update pair when both are non-null.
       - `values[]`: each cell upserts. If a cell at (date, time) exists,
         overwrite via `updateTimeseriesData`; if not, create via
         `addTimeseriesData`.
-      - `default_value`: for every scenario timestamp not in `values[]`
-        where the column has no cell yet, write `default_value`. Does NOT
-        overwrite existing cells — fill-only.
+      - `default_value`: when provided, OVERWRITES every scenario timestamp
+        not in `values[]`. When absent/null, only missing cells are NaN-filled.
 
-    Atomic: a per-item failure rolls back SQL and best-effort NaN-clears
-    cells written during this batch.
+    Atomic: a failure rolls back SQL and best-effort NaN-clears cells
+    written during this call.
     """
     if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
         raise HTTPException(503, "PyHelios not available")
 
-    if len(columns) == 0:
-        raise HTTPException(400, "column list cannot be empty")
-
     ctx = sctx.context
 
-    # ── Validation pass (fail-fast before any mutation) ──
-    for i, col in enumerate(columns):
-        if col.id is None:
+    # ── Validation (fail-fast before any mutation) ──
+    existing = db.get(WeatherDataHeader, column_id)
+    if existing is None or existing.scenario_id != sctx.scenario_id:
+        raise HTTPException(
+            404, f"column id {column_id} not found in this scenario"
+        )
+
+    if column.name in ("date", "time"):
+        raise HTTPException(400, f"name '{column.name}' is reserved")
+
+    # FK existence checks (only for fields the user is actually sending).
+    if column.datatype is not None:
+        if db.get(HeliosDataType, column.datatype) is None:
+            raise HTTPException(404, f"datatype {column.datatype} not found")
+
+    new_unit_row = None
+    if column.data_unit is not None:
+        new_unit_row = db.get(DataUnit, column.data_unit)
+        if new_unit_row is None:
+            raise HTTPException(404, f"data_unit {column.data_unit} not found")
+
+    # Consistency check against post-update pair. Only enforced when both
+    # end up non-null; one-sided partial mappings remain legal.
+    final_dt = (
+        column.datatype if column.datatype is not None
+        else existing.helios_data_type_id
+    )
+    final_unit = (
+        column.data_unit if column.data_unit is not None
+        else existing.unit_id
+    )
+    if final_dt is not None and final_unit is not None:
+        unit_for_check = (
+            new_unit_row if new_unit_row is not None
+            else db.get(DataUnit, final_unit)
+        )
+        if unit_for_check.data_type_id != final_dt:
             raise HTTPException(
                 400,
-                f"column[{i}]: 'id' is required for updateCol",
+                f"unit '{unit_for_check.unit}' belongs to "
+                f"data_type {unit_for_check.data_type_id}, not {final_dt}",
             )
 
-        existing = db.get(WeatherDataHeader, col.id)
-        if existing is None or existing.scenario_id != sctx.scenario_id:
+    for j, v in enumerate(column.values):
+        if not v.date or not v.time:
             raise HTTPException(
-                404,
-                f"column[{i}]: id {col.id} not found in this scenario",
+                400, f"values[{j}]: date and time are required"
             )
-
-        # Guard reserved names only when explicitly renaming
-        if col.name is not None and col.name in ("date", "time"):
-            raise HTTPException(
-                400, f"column[{i}]: name '{col.name}' is reserved"
-            )
-
-        # FK existence checks (only for fields the user is actually
-        # sending — true PATCH semantics).
-        if col.datatype is not None:
-            if db.get(HeliosDataType, col.datatype) is None:
-                raise HTTPException(
-                    404, f"column[{i}]: datatype {col.datatype} not found"
-                )
-
-        new_unit_row = None
-        if col.data_unit is not None:
-            new_unit_row = db.get(DataUnit, col.data_unit)
-            if new_unit_row is None:
-                raise HTTPException(
-                    404,
-                    f"column[{i}]: data_unit {col.data_unit} not found",
-                )
-
-        # Consistency check against post-update pair. Only enforced when
-        # both end up non-null; one-sided partial mappings remain legal.
-        final_dt = (
-            col.datatype if col.datatype is not None
-            else existing.helios_data_type_id
-        )
-        final_unit = (
-            col.data_unit if col.data_unit is not None
-            else existing.unit_id
-        )
-        if final_dt is not None and final_unit is not None:
-            unit_for_check = (
-                new_unit_row if new_unit_row is not None
-                else db.get(DataUnit, final_unit)
-            )
-            if unit_for_check.data_type_id != final_dt:
-                raise HTTPException(
-                    400,
-                    f"column[{i}]: unit '{unit_for_check.unit}' belongs to "
-                    f"data_type {unit_for_check.data_type_id}, not {final_dt}",
-                )
-
-        # Per-value parsing (same shape checks as addCol).
-        for j, v in enumerate(col.values):
-            if not v.date or not v.time:
-                raise HTTPException(
-                    400,
-                    f"column[{i}].values[{j}]: date and time are required",
-                )
-            try:
-                list(int(p) for p in v.date.split("-"))
-                list(int(p) for p in v.time.split(":"))
-            except (ValueError, AttributeError):
-                raise HTTPException(
-                    400,
-                    f"column[{i}].values[{j}]: bad date/time format "
-                    f"'{v.date}' '{v.time}'",
-                )
-            if v.value != "" and not _is_numeric_or_empty(v.value):
-                raise HTTPException(
-                    400,
-                    f"column[{i}].values[{j}]: value '{v.value}' "
-                    f"is not numeric or empty",
-                )
-            if _has_excess_decimals(v.value):
-                raise HTTPException(
-                    400,
-                    f"column[{i}].values[{j}]: value '{v.value}' contains more than 7 decimal places"
-                )
-            if final_dt is None and v.value != "" and v.value.upper() != "NAN":
-                _validate_cell_range(float(v.value), existing.name, f"column[{i}].values[{j}]")
-
-        if _has_excess_decimals(col.default_value):
+        try:
+            list(int(p) for p in v.date.split("-"))
+            list(int(p) for p in v.time.split(":"))
+        except (ValueError, AttributeError):
             raise HTTPException(
                 400,
-                f"column[{i}]: default_value '{col.default_value}' contains more than 7 decimal places"
+                f"values[{j}]: bad date/time format '{v.date}' '{v.time}'",
             )
-        
-        if final_dt is None and col.default_value is not None:
-            if not math.isnan(float(col.default_value)):
-                _validate_cell_range(float(col.default_value), existing.name, f"column[{i}] default_value")
+        if v.value != "" and not _is_numeric_or_empty(v.value):
+            raise HTTPException(
+                400,
+                f"values[{j}]: value '{v.value}' is not numeric or empty",
+            )
+        if _has_excess_decimals(v.value):
+            raise HTTPException(
+                400,
+                f"values[{j}]: value '{v.value}' contains more than 7 decimal places",
+            )
+        if final_dt is None and v.value != "" and v.value.upper() != "NAN":
+            _validate_cell_range(float(v.value), existing.name, f"values[{j}]")
+
+    if _has_excess_decimals(column.default_value):
+        raise HTTPException(
+            400,
+            f"default_value '{column.default_value}' contains more than 7 decimal places",
+        )
+
+    if final_dt is None and column.default_value is not None:
+        if not math.isnan(float(column.default_value)):
+            _validate_cell_range(float(column.default_value), existing.name, "default_value")
 
     # ── Apply changes ──
     written_cells: list[tuple[str, Any, Any]] = []
-    updated_columns: list[dict] = []
 
     # Snapshot scenario timestamps once at the top, before any writes.
-    # We INCLUDE the target labels — they hold the pre-mutation state and
-    # any of them is a valid anchor for the scenario's timeline. Excluding
-    # them used to break the case where the only column being updated is
-    # also the only column in the scenario (no other label to anchor on).
+    # The target label is INCLUDED — it holds the pre-mutation state and
+    # is a valid anchor for the scenario's timeline. Excluding it would
+    # break the case where this is the scenario's only column.
     scenario_ts = _scenario_timestamps(ctx)
 
     try:
-        for i, col in enumerate(columns):
-            existing = db.get(WeatherDataHeader, col.id)
-            label = str(existing.id)
+        label = str(existing.id)
 
-            # SQL header field updates (PATCH semantics — None = no change).
-            if col.name is not None:
-                existing.name = col.name
-            if col.datatype is not None:
-                existing.helios_data_type_id = col.datatype
-            if col.data_unit is not None:
-                existing.unit_id = col.data_unit
+        # SQL header field updates (PATCH semantics — None = no change).
+        existing.name = column.name
+        if column.datatype is not None:
+            existing.helios_data_type_id = column.datatype
+        if column.data_unit is not None:
+            existing.unit_id = column.data_unit
 
-            # Cells that already exist for this column (so we know what to
-            # upsert vs. create, and which scenario timestamps default_value
-            # should skip).
-            existing_cell_keys = _label_timestamp_set(ctx, label)
+        # Cells that already exist for this column.
+        existing_cell_keys = _label_timestamp_set(ctx, label)
 
-            # Track keys provided in `values[]` so default_value skips them.
-            explicit_keys: set[tuple[str, str]] = set()
+        # Track keys provided in `values[]` so default_value skips them.
+        explicit_keys: set[tuple[str, str]] = set()
 
-            # Process explicit values[]. Empty value ("") writes NaN —
-            # consistent with addRow's empty-cell convention.
-            for v in col.values:
-                d, t = _helios_date_time(v.date, v.time)
-                key = (str(d), str(t))
-                explicit_keys.add(key)
-                cell_value = float("nan") if v.value == "" else float(v.value)
+        # Process explicit values[]. Empty value ("") writes NaN —
+        # consistent with addRow's empty-cell convention.
+        for v in column.values:
+            d, t = _helios_date_time(v.date, v.time)
+            key = (str(d), str(t))
+            explicit_keys.add(key)
+            cell_value = float("nan") if v.value == "" else float(v.value)
 
-                if key in existing_cell_keys:
-                    ctx.updateTimeseriesData(label, d, t, cell_value)
-                else:
-                    ctx.addTimeseriesData(label, cell_value, d, t)
-                    written_cells.append((label, d, t))
-                    existing_cell_keys.add(key)
-
-            # Fill scenario timestamps not in values[]:
-            #   - default_value provided  → OVERWRITE every such cell
-            #     (use case: select-all / deselect-all on a check column).
-            #   - default_value missing   → fill ONLY missing cells with NaN
-            #     (so the column stays aligned with the scenario timeline,
-            #     but existing data is left alone — non-destructive PATCH).
-            if col.default_value is not None:
-                fill_value = float(col.default_value)
-                for d_obj, t_obj in scenario_ts:
-                    key = (str(d_obj), str(t_obj))
-                    if key in explicit_keys:
-                        continue  # explicit value wins
-                    if key in existing_cell_keys:
-                        ctx.updateTimeseriesData(label, d_obj, t_obj, fill_value)
-                    else:
-                        ctx.addTimeseriesData(label, fill_value, d_obj, t_obj)
-                        written_cells.append((label, d_obj, t_obj))
-                        existing_cell_keys.add(key)
+            if key in existing_cell_keys:
+                ctx.updateTimeseriesData(label, d, t, cell_value)
             else:
-                for d_obj, t_obj in scenario_ts:
-                    key = (str(d_obj), str(t_obj))
-                    if key in explicit_keys or key in existing_cell_keys:
-                        continue  # don't overwrite existing data
-                    ctx.addTimeseriesData(
-                        label, float("nan"), d_obj, t_obj
-                    )
+                ctx.addTimeseriesData(label, cell_value, d, t)
+                written_cells.append((label, d, t))
+                existing_cell_keys.add(key)
+
+        # Fill scenario timestamps not in values[]:
+        #   - default_value provided  → OVERWRITE every such cell
+        #     (use case: select-all / deselect-all on a check column).
+        #   - default_value missing   → fill ONLY missing cells with NaN
+        #     (so the column stays aligned with the scenario timeline,
+        #     but existing data is left alone — non-destructive PATCH).
+        if column.default_value is not None:
+            fill_value = float(column.default_value)
+            for d_obj, t_obj in scenario_ts:
+                key = (str(d_obj), str(t_obj))
+                if key in explicit_keys:
+                    continue  # explicit value wins
+                if key in existing_cell_keys:
+                    ctx.updateTimeseriesData(label, d_obj, t_obj, fill_value)
+                else:
+                    ctx.addTimeseriesData(label, fill_value, d_obj, t_obj)
                     written_cells.append((label, d_obj, t_obj))
                     existing_cell_keys.add(key)
+        else:
+            for d_obj, t_obj in scenario_ts:
+                key = (str(d_obj), str(t_obj))
+                if key in explicit_keys or key in existing_cell_keys:
+                    continue  # don't overwrite existing data
+                ctx.addTimeseriesData(label, float("nan"), d_obj, t_obj)
+                written_cells.append((label, d_obj, t_obj))
+                existing_cell_keys.add(key)
 
-            updated_columns.append(
-                {
-                    "id": existing.id,
-                    "name": existing.name,
-                    "datatype_id": existing.helios_data_type_id,
-                    "data_unit_id": existing.unit_id,
-                }
-            )
+        updated_column = {
+            "id": existing.id,
+            "name": existing.name,
+            "datatype_id": existing.helios_data_type_id,
+            "data_unit_id": existing.unit_id,
+        }
 
         db.commit()
         trigger_scenario_autosave(sctx)
@@ -1101,9 +1064,9 @@ def update_columns(
     except Exception as exc:
         db.rollback()
         _cleanup_pyhelios_cells(ctx, written_cells)
-        raise HTTPException(500, f"Failed to update columns: {exc}")
+        raise HTTPException(500, f"Failed to update column: {exc}")
 
-    return {"success": True, "columns": updated_columns}
+    return {"success": True, "columns": [updated_column]}
 
 
 def add_rows(

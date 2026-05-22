@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.schemas.project import ProjectCreateRequest
+from app.schemas.project import ProjectCreateRequest, ProjectUpdateRequest
 from app.services import project_service
 from app.core.dependencies import get_session_id
 
@@ -41,7 +41,7 @@ async def get_project(
 @router.patch("/{project_id}")
 async def update_project(
     project_id: str,
-    req: ProjectCreateRequest,
+    req: ProjectUpdateRequest,
     db: Session = Depends(get_db),
     session_id: str = Depends(get_session_id),
 ):

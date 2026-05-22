@@ -1346,16 +1346,15 @@ def test_updatecol_with_values_overwrites_existing_cells(client):
     sid, pid, scn, ids = _seed_scenario_with_one_column(client)
     temp_id = ids["temperature"]
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{temp_id}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": temp_id,
+        json={
             "name": "temperature",
             "values": [
                 {"date": "2023-07-13", "time": "10:00:00", "value": "111"},
                 {"date": "2023-07-13", "time": "11:00:00", "value": "222"},
             ],
-        }]},
+        },
     )
     assert r.status_code == 200, r.text
     assert r.json()["columns"][0]["id"] == temp_id
@@ -1383,14 +1382,13 @@ def test_updatecol_default_value_fills_missing_cells_only(client):
     )
     extra_id = r.json()["columns"][0]["id"]
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{extra_id}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": extra_id,
+        json={
             "name": "extra",
             "values": [],
             "default_value": 50,
-        }]},
+        },
     )
     assert r.status_code == 200, r.text
     r = client.get(
@@ -1409,14 +1407,13 @@ def test_updatecol_default_value_overwrites_existing_cells(client):
     temp_id = ids["temperature"]
 
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{temp_id}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": temp_id,
+        json={
             "name": "temperature",
             "values": [],
             "default_value": 999,
-        }]},
+        },
     )
     assert r.status_code == 200, r.text
 
@@ -1436,16 +1433,15 @@ def test_updatecol_explicit_values_win_over_default(client):
     temp_id = ids["temperature"]
 
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{temp_id}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": temp_id,
+        json={
             "name": "temperature",
             "values": [
                 {"date": "2023-07-13", "time": "10:00:00", "value": "111"},
             ],
             "default_value": 5,
-        }]},
+        },
     )
     assert r.status_code == 200, r.text
 
@@ -1473,16 +1469,15 @@ def test_updatecol_values_plus_default_value_together(client):
     )
     extra_id = r.json()["columns"][0]["id"]
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{extra_id}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": extra_id,
+        json={
             "name": "extra",
             "values": [
                 {"date": "2023-07-13", "time": "10:00:00", "value": "1"},
             ],
             "default_value": 9,
-        }]},
+        },
     )
     assert r.status_code == 200, r.text
     r = client.get(
@@ -1498,49 +1493,26 @@ def test_updatecol_values_plus_default_value_together(client):
 def test_updatecol_unknown_column_returns_404(client):
     sid, pid, scn = _make_project(client)
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/999999",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": 999999,
+        json={
             "name": "nonexistent",
             "values": [{"date": "2024-01-01", "time": "10:00:00", "value": "1"}],
-        }]},
+        },
     )
     assert r.status_code == 404
     assert "not found" in r.json()["detail"].lower()
 
 
 def test_updatecol_reserved_name_returns_400(client):
-    sid, pid, scn = _make_project(client)
+    sid, pid, scn, ids = _seed_scenario_with_one_column(client)
+    temp_id = ids["temperature"]
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{temp_id}",
         headers=_session_headers(sid),
-        json={"column": [{"name": "date", "values": []}]},
+        json={"name": "date", "values": []},
     )
     assert r.status_code == 400
-
-
-def test_updatecol_empty_list_returns_400(client):
-    sid, pid, scn = _make_project(client)
-    r = client.patch(
-        _url(pid, scn, "updateCol"),
-        headers=_session_headers(sid),
-        json={"column": []},
-    )
-    assert r.status_code == 400
-
-
-def test_updatecol_duplicate_name_in_batch_returns_422(client):
-    sid, pid, scn = _make_project(client)
-    r = client.patch(
-        _url(pid, scn, "updateCol"),
-        headers=_session_headers(sid),
-        json={"column": [
-            {"id": 1, "name": "x", "values": []},
-            {"id": 1, "name": "x", "values": []},
-        ]},
-    )
-    assert r.status_code == 422
 
 
 def test_updatecol_updates_datatype_and_unit_in_place(client):
@@ -1550,14 +1522,13 @@ def test_updatecol_updates_datatype_and_unit_in_place(client):
     dt = next(t for t in r.json()["data_types"] if t["data_type"] == "air_temperature")
     base_unit_id = next(u["id"] for u in dt["units"] if u["is_base"])
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{temp_id}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": temp_id,
+        json={
             "name": "temperature",
             "datatype": dt["id"],
             "data_unit": base_unit_id,
-        }]},
+        },
     )
     assert r.status_code == 200
     body = r.json()["columns"][0]
@@ -1574,14 +1545,13 @@ def test_updatecol_inconsistent_unit_and_datatype_returns_400(client):
     pressure_dt = by_name["air_pressure"]
     pressure_unit = next(u["id"] for u in pressure_dt["units"] if u["is_base"])
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{ids['temperature']}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": ids["temperature"],
+        json={
             "name": "temperature",
             "datatype": temp_dt["id"],
             "data_unit": pressure_unit,
-        }]},
+        },
     )
     assert r.status_code == 400
     assert "belongs to" in r.json()["detail"].lower()
@@ -1590,13 +1560,12 @@ def test_updatecol_inconsistent_unit_and_datatype_returns_400(client):
 def test_updatecol_bad_date_format_returns_400(client):
     sid, pid, scn, ids = _seed_scenario_with_one_column(client)
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{ids['temperature']}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": ids["temperature"],
+        json={
             "name": "temperature",
             "values": [{"date": "13-07-2023", "time": "10:00:00", "value": "1"}],
-        }]},
+        },
     )
     assert r.status_code == 400
 
@@ -1604,13 +1573,12 @@ def test_updatecol_bad_date_format_returns_400(client):
 def test_updatecol_non_numeric_value_returns_400(client):
     sid, pid, scn, ids = _seed_scenario_with_one_column(client)
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{ids['temperature']}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": ids["temperature"],
+        json={
             "name": "temperature",
             "values": [{"date": "2023-07-13", "time": "10:00:00", "value": "hello"}],
-        }]},
+        },
     )
     assert r.status_code == 400
 
@@ -1629,13 +1597,12 @@ def test_updatecol_creates_cell_at_new_timestamp(client):
     )
     new_id = r.json()["columns"][0]["id"]
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{new_id}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": new_id,
+        json={
             "name": "newcol",
             "values": [{"date": "2023-07-13", "time": "10:00:00", "value": "42"}],
-        }]},
+        },
     )
     assert r.status_code == 200, r.text
     r = client.get(
@@ -1650,9 +1617,9 @@ def test_updatecol_other_session_returns_404(client):
     sid_a, pid, scn, ids = _seed_scenario_with_one_column(client)
     sid_b = f"session_{uuid4().hex[:8]}"
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{ids['temperature']}",
         headers=_session_headers(sid_b),
-        json={"column": [{"name": "temperature", "values": []}]},
+        json={"name": "temperature", "values": []},
     )
     assert r.status_code == 404
 
@@ -1660,8 +1627,8 @@ def test_updatecol_other_session_returns_404(client):
 def test_updatecol_missing_session_id_returns_400(client):
     sid, pid, scn, ids = _seed_scenario_with_one_column(client)
     r = client.patch(
-        _url(pid, scn, "updateCol"),
-        json={"column": [{"name": "temperature", "values": []}]},
+        f"{_url(pid, scn, 'updateCol')}/{ids['temperature']}",
+        json={"name": "temperature", "values": []},
     )
     assert r.status_code == 400
 
@@ -1770,9 +1737,9 @@ def test_updatecol_no_values_no_default_fills_missing_with_nan_only(client):
     # already has 3 cells: 100, NaN, NaN. The PATCH below should be a no-op.
 
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{partial_id}",
         headers=_session_headers(sid),
-        json={"column": [{"id": partial_id, "name": "partial", "values": []}]},
+        json={"name": "partial", "values": []},
     )
     assert r.status_code == 200, r.text
 
@@ -1792,15 +1759,14 @@ def test_updatecol_with_explicit_empty_value_writes_nan(client):
     temp_id = ids["temperature"]
 
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{temp_id}",
         headers=_session_headers(sid),
-        json={"column": [{
-            "id": temp_id,
+        json={
             "name": "temperature",
             "values": [
                 {"date": "2023-07-13", "time": "10:00:00", "value": ""},
             ],
-        }]},
+        },
     )
     assert r.status_code == 200, r.text
 
@@ -1910,32 +1876,14 @@ def test_update_col_by_id_succeeds(client):
     u = _make_data_unit(client, dt)
 
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{a_id}",
         headers=_session_headers(sid),
-        json={"column": [
-            {"id": a_id, "name": "a", "datatype": dt, "data_unit": u},
-        ]},
+        json={"name": "a", "datatype": dt, "data_unit": u},
     )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["success"] is True
     assert body["columns"][0]["id"] == a_id
-
-
-def test_update_col_without_id_returns_400(client):
-    """updateCol without id field must return 400."""
-    sid, pid, scn = _make_project(client)
-    _seed_two_cell_column(client, sid, pid, scn)
-
-    r = client.patch(
-        _url(pid, scn, "updateCol"),
-        headers=_session_headers(sid),
-        json={"column": [
-            {"name": "a"},   # missing id
-        ]},
-    )
-    assert r.status_code == 400
-    assert "id" in r.json()["detail"].lower()
 
 
 def test_update_col_with_wrong_id_returns_404(client):
@@ -1944,11 +1892,9 @@ def test_update_col_with_wrong_id_returns_404(client):
     _seed_two_cell_column(client, sid, pid, scn)
 
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/999999",
         headers=_session_headers(sid),
-        json={"column": [
-            {"id": 999999, "name": "a"},   # non-existent id
-        ]},
+        json={"name": "a"},
     )
     assert r.status_code == 404
 
@@ -1959,11 +1905,9 @@ def test_update_col_renames_column_via_id(client):
     a_id, _ = _seed_two_cell_column(client, sid, pid, scn)
 
     r = client.patch(
-        _url(pid, scn, "updateCol"),
+        f"{_url(pid, scn, 'updateCol')}/{a_id}",
         headers=_session_headers(sid),
-        json={"column": [
-            {"id": a_id, "name": "Renamed_Column"},
-        ]},
+        json={"name": "Renamed_Column"},
     )
     assert r.status_code == 200, r.text
     body = r.json()

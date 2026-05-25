@@ -45,9 +45,28 @@ def run_migrations() -> None:
     Apply all .sql migration files in db/migrations/ in version order.
     Skips migrations already recorded in schema_migrations.
     Called once at startup from lifespan.py.
+
+    Fails fast if the migrations folder is missing or empty — historically a
+    packaging regression (PyInstaller bundle without `--add-data
+    app/db/migrations`) silently produced an empty `schema_migrations` table
+    and no real schema, so the first query crashed with `no such table:
+    projects`. Loud at startup is much easier to debug than a stale binary
+    that "looks healthy" until the first request.
     """
     migrations_dir = Path(__file__).parent / "migrations"
+    if not migrations_dir.is_dir():
+        raise RuntimeError(
+            f"Migrations folder not found at {migrations_dir}. "
+            "If running from a packaged binary, the build is missing "
+            "`--add-data app/db/migrations:app/db/migrations` (see "
+            "scripts/build_binary.sh)."
+        )
     sql_files = sorted(migrations_dir.glob("*.sql"))
+    if not sql_files:
+        raise RuntimeError(
+            f"No .sql migration files found in {migrations_dir}. "
+            "Bundle is incomplete — rebuild the backend."
+        )
 
     with engine.begin() as conn:
         # Ensure tracking table exists before querying it

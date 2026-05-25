@@ -153,14 +153,25 @@ for import in "${HIDDEN_IMPORTS[@]}"; do
     HIDDEN_IMPORTS_STR="$HIDDEN_IMPORTS_STR --hidden-import=$import"
 done
 
-# Run PyInstaller
-# NOTE: Using --onedir instead of --onefile for significantly faster startup:
-#   --onefile: Extracts entire binary to temp directory on each run (5-30s overhead)
-#   --onedir:  Directory structure, no extraction needed on subsequent runs (~0.5s startup)
-
 # Selectively bundle only runtime-needed parts of pyhelios instead of the entire
-# directory (~719 MB). This excludes helios-core/ C++ source (516 MB), build
-# artifacts (.a, .o, CMake files ~150 MB), docs, and tests.
+# directory (~719 MB). Excludes helios-core/ C++ source, build artifacts, docs, tests.
+
+LIBHELIOS_PATH="$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/$LIBHELIOS_NAME"
+
+# Auto-build the native library if missing — running the build here is cheaper
+# than letting PyInstaller produce a binary that crashes at startup.
+if [ ! -f "$LIBHELIOS_PATH" ]; then
+    echo "[*] $LIBHELIOS_NAME not found — building PyHelios from source..."
+    bash "$BACKEND_DIR/scripts/build_pyhelios.sh"
+fi
+
+# Fail loudly if the build didn't produce the lib — silent absence used to ship
+# a broken bundle that crashed only at runtime.
+if [ ! -f "$LIBHELIOS_PATH" ]; then
+    echo "[!] ERROR: $LIBHELIOS_PATH still missing after build. Aborting."
+    exit 1
+fi
+
 PYHELIOS_DATA_ARGS=""
 
 # 1. Python package (the actual importable code, ~3.4 MB)
@@ -173,13 +184,8 @@ for f in "$BACKEND_DIR/pyhelios"/*.py; do
     [ -f "$f" ] && PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $f:pyhelios/"
 done
 
-# 3. Native library (.dylib/.so/.dll)
-LIBHELIOS_PATH="$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/$LIBHELIOS_NAME"
-if [ -f "$LIBHELIOS_PATH" ]; then
-    PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-binary $LIBHELIOS_PATH:pyhelios/pyhelios_build/build/lib/"
-else
-    echo "[!] WARNING: $LIBHELIOS_PATH not found — pyhelios native library will not be bundled"
-fi
+# 3. Native library (libhelios.{dylib,so,dll}) — already verified above
+PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-binary $LIBHELIOS_PATH:pyhelios/pyhelios_build/build/lib/"
 
 # 4. Runtime asset images (textures needed by C++ core, ~28 KB)
 if [ -d "$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/images" ]; then
@@ -196,6 +202,7 @@ if [ -d "$BACKEND_DIR/pyhelios/pyhelios_build/build/bin" ]; then
     PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $BACKEND_DIR/pyhelios/pyhelios_build/build/bin:pyhelios/pyhelios_build/build/bin"
 fi
 
+
 pyinstaller \
     --onedir \
     --name "$BINARY_NAME" \
@@ -208,6 +215,7 @@ pyinstaller \
     --collect-all fastapi \
     --collect-all pydantic \
     --collect-all sqlalchemy \
+    --add-data "$BACKEND_DIR/app/db/migrations:app/db/migrations" \
     $PYHELIOS_DATA_ARGS \
     $HIDDEN_IMPORTS_STR \
     backend_wrapper.py

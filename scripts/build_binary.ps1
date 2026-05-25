@@ -184,6 +184,17 @@ $pyInstallerArgs = @(
   '--collect-all', 'sqlalchemy'
 )
 
+# SQL migration files. run_migrations() reads these at runtime; they are never
+# imported and the folder has no __init__.py, so neither --collect-submodules
+# nor --collect-data app picks them up. Without bundling them verbatim the
+# packaged DB has no tables and every API call fails with "no such table".
+$migrationsDir = Join-Path $backendApiDir 'app\db\migrations'
+if (-not (Test-Path $migrationsDir)) {
+  Write-Host "ERROR: migrations folder not found at $migrationsDir"
+  exit 1
+}
+$pyInstallerArgs += @('--add-data', "$migrationsDir;app\db\migrations")
+
 # Bundle the pyhelios Python package and its native runtime DLLs only.
 # We deliberately do NOT bundle the entire pyhelios/ submodule (helios-core/,
 # pyhelios_build/build/, tests/, docs/, build_scripts/) - those aren't needed
@@ -205,20 +216,38 @@ $buildRootDir = Join-Path $pyheliosSrc 'pyhelios_build\build'
 $runtimeDlls = @(
   @{ Path = Join-Path $libBuildDir  'libhelios.dll';   Required = $true  }
   @{ Path = Join-Path $libBuildDir  'optix.6.5.0.dll'; Required = $false }
+  @{ Path = Join-Path $libBuildDir  'optix.51.dll';    Required = $false } 
   @{ Path = Join-Path $buildRootDir 'glew32.dll';      Required = $false }
 )
-$libheliosBundled = $false
 foreach ($dll in $runtimeDlls) {
   if (Test-Path $dll.Path) {
     $pyInstallerArgs += @('--add-binary', "$($dll.Path);pyhelios\pyhelios_build\build\lib")
-    if ($dll.Path -like '*libhelios.dll') { $libheliosBundled = $true }
+    Write-Host "[*] Bundling DLL: $($dll.Path)"
   } elseif ($dll.Required) {
-    Write-Host "[!] WARNING: required runtime DLL not found at $($dll.Path)"
+    throw "Required DLL missing: $($dll.Path)"
+  } else {
+    Write-Host "[!] Optional DLL not found, skipping: $($dll.Path)"
   }
 }
-if (-not $libheliosBundled) {
-  Write-Host "[!] WARNING: libhelios.dll missing - backend will fail at runtime. Build it first with 'python build_scripts\build_helios.py' in pyhelios/."
+
+# Runtime asset images (textures needed by C++ core)
+$imagesDir = Join-Path $libBuildDir 'images'
+if (Test-Path $imagesDir) {
+  $pyInstallerArgs += @('--add-data', "$imagesDir;pyhelios\pyhelios_build\build\lib\images")
 }
+
+# Plugin assets (shaders, textures, spectral data)
+$pluginsDir = Join-Path $buildRootDir 'plugins'
+if (Test-Path $pluginsDir) {
+  $pyInstallerArgs += @('--add-data', "$pluginsDir;pyhelios\pyhelios_build\build\plugins")
+}
+
+# Built binaries in bin/ (if any)
+$binDir = Join-Path $buildRootDir 'bin'
+if (Test-Path $binDir) {
+  $pyInstallerArgs += @('--add-data', "$binDir;pyhelios\pyhelios_build\build\bin")
+}
+
 
 foreach ($hiddenImport in $hiddenImports) {
   $pyInstallerArgs += @('--hidden-import', $hiddenImport)

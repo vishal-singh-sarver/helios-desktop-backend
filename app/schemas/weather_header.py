@@ -53,7 +53,7 @@ class WeatherDataHeaderUpdateRequest(BaseModel):
 
     Partial update of a single header row. Only the provided fields change.
 
-    `helios_data_type_id` and `unit_id` are optional in the DB (migration 009),
+    `helios_data_type_id` and `unit_id` are optional in the DB (migration 008),
     so partial-mapping rows stay legal: a row may have both null, just one
     set, or both set. When both end up non-null the service still verifies
     `unit.data_type_id == helios_data_type_id`.

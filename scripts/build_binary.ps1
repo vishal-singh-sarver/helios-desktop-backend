@@ -184,45 +184,40 @@ $pyInstallerArgs = @(
   '--collect-all', 'sqlalchemy'
 )
 
-# Selectively bundle only runtime-needed parts of pyhelios instead of the entire
-# directory (~719 MB). Excludes helios-core/ C++ source, build artifacts, docs, tests.
-# Windows uses ';' as PyInstaller path separator.
-
-# 1. Python package (the actual importable code, ~3.4 MB)
-$pyheliosPkg = Join-Path $backendApiDir 'pyhelios\pyhelios'
+# Bundle the pyhelios Python package and its native runtime DLLs only.
+# We deliberately do NOT bundle the entire pyhelios/ submodule (helios-core/,
+# pyhelios_build/build/, tests/, docs/, build_scripts/) - those aren't needed
+# at runtime, and the deep MSBuild .tlog paths under pyhelios_build/build/
+# blow Windows' MAX_PATH (260 chars) during PyInstaller's COLLECT phase.
+$pyheliosSrc = Join-Path $backendApiDir 'pyhelios'
+$pyheliosPkg = Join-Path $pyheliosSrc 'pyhelios'
 if (Test-Path $pyheliosPkg) {
   $pyInstallerArgs += @('--add-data', "$pyheliosPkg;pyhelios\pyhelios")
+} else {
+  Write-Host "[!] WARNING: pyhelios package not found at $pyheliosPkg - pyhelios will not be bundled"
 }
 
-# 2. Top-level pyhelios .py files
-$pyheliosSrc = Join-Path $backendApiDir 'pyhelios'
-foreach ($pyFile in (Get-ChildItem -Path $pyheliosSrc -Filter '*.py' -File -ErrorAction SilentlyContinue)) {
-  $pyInstallerArgs += @('--add-data', "$($pyFile.FullName);pyhelios\")
+# Native runtime DLLs go where the loader expects them:
+#   pyhelios/plugins/loader.py:_find_library_directory() searches
+#   <pyhelios_root>/pyhelios_build/build/lib/ for libhelios.dll.
+$libBuildDir  = Join-Path $pyheliosSrc 'pyhelios_build\build\lib'
+$buildRootDir = Join-Path $pyheliosSrc 'pyhelios_build\build'
+$runtimeDlls = @(
+  @{ Path = Join-Path $libBuildDir  'libhelios.dll';   Required = $true  }
+  @{ Path = Join-Path $libBuildDir  'optix.6.5.0.dll'; Required = $false }
+  @{ Path = Join-Path $buildRootDir 'glew32.dll';      Required = $false }
+)
+$libheliosBundled = $false
+foreach ($dll in $runtimeDlls) {
+  if (Test-Path $dll.Path) {
+    $pyInstallerArgs += @('--add-binary', "$($dll.Path);pyhelios\pyhelios_build\build\lib")
+    if ($dll.Path -like '*libhelios.dll') { $libheliosBundled = $true }
+  } elseif ($dll.Required) {
+    Write-Host "[!] WARNING: required runtime DLL not found at $($dll.Path)"
+  }
 }
-
-# 3. Native library (.dll) — required, must exist by this point
-$libheliosPath = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\libhelios.dll'
-if (-not (Test-Path $libheliosPath)) {
-  throw "libhelios.dll missing at $libheliosPath at PyInstaller stage. The earlier auto-build step should have produced it - this indicates a logic error in this script."
-}
-$pyInstallerArgs += @('--add-binary', "$libheliosPath;pyhelios\pyhelios_build\build\lib\")
-
-# 4. Runtime asset images (textures needed by C++ core)
-$imagesDir = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\lib\images'
-if (Test-Path $imagesDir) {
-  $pyInstallerArgs += @('--add-data', "$imagesDir;pyhelios\pyhelios_build\build\lib\images")
-}
-
-# 5. Plugin assets (shaders, textures, spectral data)
-$pluginsDir = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\plugins'
-if (Test-Path $pluginsDir) {
-  $pyInstallerArgs += @('--add-data', "$pluginsDir;pyhelios\pyhelios_build\build\plugins")
-}
-
-# 6. Built binaries in bin/ (if any)
-$binDir = Join-Path $backendApiDir 'pyhelios\pyhelios_build\build\bin'
-if (Test-Path $binDir) {
-  $pyInstallerArgs += @('--add-data', "$binDir;pyhelios\pyhelios_build\build\bin")
+if (-not $libheliosBundled) {
+  Write-Host "[!] WARNING: libhelios.dll missing - backend will fail at runtime. Build it first with 'python build_scripts\build_helios.py' in pyhelios/."
 }
 
 foreach ($hiddenImport in $hiddenImports) {

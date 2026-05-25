@@ -1,68 +1,175 @@
 """
-Context persistence — save, load, and version snapshots.
+Context persistence — scenario-level save + load.
 
-Storage layout:
-  data/projects/{project_id}/
-      current.xml.gz    ← gzip snapshot of live context  (fast r/w)
-      registry.json     ← _object_registry + project metadata
+Storage layout (per scenario):
+  data/projects/{project_id}/scenarios/{scenario_id}/
+      context_file/
+          context.xml             ← PyHelios state for this scenario
+          archives/
+              autosave_<ts>.xml.gz  ← rotated history, capped at MAX_AUTOSAVE_ARCHIVES
+      weather/
+          *.csv                   ← uploaded weather CSVs persist here
+      metadata/                   ← reserved for future use
+      export_files/               ← reserved for future use
 
-  SQLite project_versions table:
-      scene_xml BLOB    ← lzma-compressed XML  (archived versions, ~85-90% smaller)
+  SQLite project_versions table (defined in migrations/001_initial.sql):
+      scene_xml BLOB              ← lzma-compressed XML (archived versions)
       registry_json TEXT
 
 Compression tiers:
-  gzip  (stdlib) — current working file.  Fast, ~70% reduction.
-  lzma  (stdlib) — archived versions.     Slower, ~85-90% reduction.
+  gzip  (stdlib) — autosave archives.  Fast, ~70% reduction.
+  lzma  (stdlib) — versioned snapshots in SQLite. Slower, ~85-90% reduction.
+
+Phase 1 transitional rule:
+    The project's in-memory PyHelios scene (ProjectContext) is NOT persisted
+    to disk. Only scenario contexts (ScenarioContext) are persisted — they
+    capture weather state today, and will absorb the scene state once
+    Phase 2 collapses ProjectContext into ScenarioContext.
 """
 import gzip
 import json
+import logging
 import lzma
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from app.core.config import settings
 
 
-def _project_dir(project_id: str) -> Path:
-    d = settings.resolved_projects_dir / project_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+logger = logging.getLogger(__name__)
+MAX_AUTOSAVE_ARCHIVES = 10
 
 
-# ── Save ──────────────────────────────────────────────────────────────────────
+# ── Path helpers ─────────────────────────────────────────────────────────────
 
-def save_snapshot(project_id: str, ctx, registry: dict, metadata: dict) -> None:
+
+def _ensure_scenario_structure(project_id: str, scenario_id: str) -> Path:
+    """Create the canonical per-scenario folder shape. Idempotent.
+
+    After this call the following subfolders are guaranteed to exist:
+        context_file/
+        context_file/archives/
+        weather/
+        metadata/
+        export_files/
+
+    Returns the scenario's root folder.
     """
-    Persist current context to disk and archive a version in SQLite.
+    base = settings.scenario_dir(project_id, scenario_id)
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "context_file").mkdir(exist_ok=True)
+    (base / "context_file" / "archives").mkdir(exist_ok=True)
+    (base / "weather").mkdir(exist_ok=True)
+    (base / "metadata").mkdir(exist_ok=True)
+    (base / "export_files").mkdir(exist_ok=True)
+    return base
 
-    Steps:
-      1. ctx.writeXML(tmp)         → write raw XML
-      2. gzip compress              → data/projects/{id}/current.xml.gz
-      3. write registry.json
-      4. lzma compress XML         → INSERT project_versions row
+
+def _scenario_context_xml(project_id: str, scenario_id: str) -> Path:
+    return settings.scenario_context_file_dir(project_id, scenario_id) / "context.xml"
+
+
+def _scenario_archives_dir(project_id: str, scenario_id: str) -> Path:
+    return settings.scenario_context_file_dir(project_id, scenario_id) / "archives"
+
+
+# ── Autosave ──────────────────────────────────────────────────────────────────
+
+
+def _rotate_scenario_current(project_id: str, scenario_id: str) -> None:
     """
-    proj_dir = _project_dir(project_id)
+    Compress existing context.xml → archives/autosave_<TIMESTAMP>.xml.gz
+    Delete oldest archive if over MAX_AUTOSAVE_ARCHIVES.
+    """
+    current_xml = _scenario_context_xml(project_id, scenario_id)
+    if not current_xml.exists():
+        return
+
+    archives_dir = _scenario_archives_dir(project_id, scenario_id)
+    archives_dir.mkdir(parents=True, exist_ok=True)
+
+    # Enforce cap (sort oldest → newest by mtime)
+    existing = sorted(archives_dir.glob("autosave_*.xml.gz"), key=lambda p: p.stat().st_mtime)
+    while len(existing) >= MAX_AUTOSAVE_ARCHIVES:
+        existing[0].unlink(missing_ok=True)
+        existing = existing[1:]
+
+    # Compress current.xml into the timestamped archive
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    archive_path = archives_dir / f"autosave_{ts}.xml.gz"
+
+    raw_xml = current_xml.read_bytes()
+    archive_path.write_bytes(gzip.compress(raw_xml, compresslevel=6))
+    current_xml.unlink(missing_ok=True)
+
+
+def trigger_scenario_autosave(sctx) -> None:
+    """
+    Persist a scenario's PyHelios context to disk.
+
+    Path:
+        data/projects/<pid>/scenarios/<sid>/context_file/context.xml
+
+    Rotates the previous context.xml into archives/ as a gzipped backup.
+    No-op when PyHelios isn't available or the context lacks writeXML.
+    """
+    if not sctx.context or not hasattr(sctx.context, "writeXML"):
+        return
+
+    _ensure_scenario_structure(sctx.project_id, sctx.scenario_id)
 
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
-        tmp_path = tmp.name
+        tmp_path = Path(tmp.name)
 
     try:
-        ctx.writeXML(tmp_path)
+        sctx.context.writeXML(str(tmp_path))
+        raw_xml = tmp_path.read_bytes()
+    except Exception:
+        logger.exception("[scenario-autosave] writeXML failed for scenario %s", sctx.scenario_id)
+        return
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-        raw_xml = Path(tmp_path).read_bytes()
-
-        # Tier 1 — gzip for fast working-file reads
-        gz_data = gzip.compress(raw_xml, compresslevel=6)
-        (proj_dir / "current.xml.gz").write_bytes(gz_data)
-
-        # Registry sidecar
-        (proj_dir / "registry.json").write_text(
-            json.dumps({"metadata": metadata, "objects": registry}, indent=2),
-            encoding="utf-8",
+    try:
+        _rotate_scenario_current(sctx.project_id, sctx.scenario_id)
+        _scenario_context_xml(sctx.project_id, sctx.scenario_id).write_bytes(raw_xml)
+        logger.debug(
+            "[scenario-autosave] saved scenario %s (%d bytes)",
+            sctx.scenario_id, len(raw_xml),
+        )
+    except Exception:
+        logger.exception(
+            "[scenario-autosave] rotation/write failed for scenario %s",
+            sctx.scenario_id,
         )
 
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+
+# ── Load ──────────────────────────────────────────────────────────────────────
+
+
+def load_scenario_snapshot(sctx) -> None:
+    """
+    Restore a scenario's PyHelios context from disk.
+
+    Reads:
+        data/projects/<pid>/scenarios/<sid>/context_file/context.xml
+
+    No-op (silent) when the file doesn't exist — a fresh scenario has
+    nothing to restore.
+    """
+    new_xml = _scenario_context_xml(sctx.project_id, sctx.scenario_id)
+    if not new_xml.exists():
+        return
+
+    try:
+        sctx.context.loadXML(str(new_xml))
+        logger.info("[scenario-load] restored scenario %s", sctx.scenario_id)
+    except Exception:
+        logger.exception("[scenario-load] failed for scenario %s", sctx.scenario_id)
+
+
+# ── Versioning (SQLite-based, unchanged) ─────────────────────────────────────
 
 
 def save_version(project_id: str, label: str, ctx, registry: dict,
@@ -74,8 +181,6 @@ def save_version(project_id: str, label: str, ctx, registry: dict,
     from app.db.models import ProjectVersion, Project
     from sqlalchemy import func
 
-    proj_dir = _project_dir(project_id)
-
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
         tmp_path = tmp.name
 
@@ -85,10 +190,8 @@ def save_version(project_id: str, label: str, ctx, registry: dict,
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
-    # Tier 2 — lzma for maximum archive compression
     compressed = lzma.compress(raw_xml, preset=6)
 
-    # Next version number for this project
     last = (
         db.query(func.max(ProjectVersion.version_num))
         .filter(ProjectVersion.project_id == project_id)
@@ -107,46 +210,15 @@ def save_version(project_id: str, label: str, ctx, registry: dict,
     )
     db.add(row)
 
-    # Update project updated_at + current_version_id
     project = db.query(Project).filter(Project.id == project_id).first()
     if project:
-        from datetime import datetime, timezone
-        project.updated_at = datetime.now(timezone.utc).isoformat()
+        from datetime import datetime as _dt, timezone as _tz
+        project.updated_at = _dt.now(_tz.utc).isoformat()
         project.current_version_id = row.id
 
     db.commit()
     db.refresh(row)
     return row.id
-
-
-# ── Load ──────────────────────────────────────────────────────────────────────
-
-def load_snapshot(project_id: str, ctx) -> dict:
-    """
-    Restore context from current.xml.gz on disk.
-    Returns the registry dict (metadata + objects).
-    """
-    proj_dir = _project_dir(project_id)
-    gz_path = proj_dir / "current.xml.gz"
-    registry_path = proj_dir / "registry.json"
-
-    if not gz_path.exists():
-        raise FileNotFoundError(f"No saved snapshot for project {project_id}")
-
-    raw_xml = gzip.decompress(gz_path.read_bytes())
-
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
-        tmp.write(raw_xml)
-        tmp_path = tmp.name
-
-    try:
-        ctx.loadXML(tmp_path)
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-    if registry_path.exists():
-        return json.loads(registry_path.read_text(encoding="utf-8"))
-    return {"metadata": {}, "objects": {}}
 
 
 def restore_version(project_id: str, version_id: int, ctx, db) -> dict:
@@ -178,8 +250,6 @@ def restore_version(project_id: str, version_id: int, ctx, db) -> dict:
     return json.loads(row.registry_json)
 
 
-# ── List ──────────────────────────────────────────────────────────────────────
-
 def list_versions(project_id: str, db) -> list:
     """Return all version rows for a project (without the blob)."""
     from app.db.models import ProjectVersion
@@ -208,3 +278,5 @@ def list_versions(project_id: str, db) -> list:
         }
         for r in rows
     ]
+
+

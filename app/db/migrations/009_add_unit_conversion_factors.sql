@@ -1,4 +1,4 @@
--- Migration 010 — add unit-conversion fields to data_units.
+-- Migration 009 — add unit-conversion fields to data_units.
 --
 -- Each unit can now describe how to convert a value into the type's
 -- canonical/base unit:
@@ -24,4 +24,4 @@ CREATE UNIQUE INDEX idx_data_units_one_base
     ON data_units(data_type_id)
     WHERE is_base = 1;
 
-INSERT OR IGNORE INTO schema_migrations(version) VALUES (10);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (9);

@@ -23,6 +23,7 @@ import csv
 import io
 import math
 import os
+import shutil
 import tempfile
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -32,6 +33,10 @@ from sqlalchemy.orm import Session
 
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
 from app.helios import context as helios_ctx
+from app.helios.persistence import (
+    _ensure_scenario_structure,
+    trigger_scenario_autosave,
+)
 
 # PyHelios's specific exception for "thing not found" errors (missing label,
 # missing cell, etc.). Defensive import: if PyHelios isn't available, define
@@ -44,7 +49,7 @@ except ImportError:  # pragma: no cover
 
 if TYPE_CHECKING:
     from app.core.scenario_context import ScenarioContext
-    from app.schemas.weather import AddColumn, DeleteRequest, UpdateRequest
+    from app.schemas.weather import AddColumn, DeleteRequest, UpdateColumn, UpdateRequest
 
 
 # ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -84,10 +89,10 @@ def _label_has_timestamp(ctx, label: str, date_obj, time_obj) -> bool:
 
 
 def _clean_float(v: float) -> float | None:
-    """NaN → None so JSON serialization doesn't choke. Otherwise float."""
+    """NaN → None so JSON serialization doesn't choke. Otherwise float rounded to max 7 decimals."""
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return None
-    return float(v)
+    return round(float(v), 7)
 
 
 def _is_numeric_value(v: Any) -> bool:
@@ -106,6 +111,47 @@ def _is_numeric_value(v: Any) -> bool:
         except ValueError:
             return False
     return False
+
+
+def _validate_cell_range(v: float, col_name: str, location_hint: str = "") -> None:
+    """Validate cell value is within -1e6 to +1e6 when no data type is assigned."""
+    if math.isnan(v):
+        return
+    if not (-1_000_000 <= v <= 1_000_000):
+        prefix = f"{location_hint}: " if location_hint else ""
+        raise HTTPException(
+            400, f"{prefix}value '{v}' for column '{col_name}' must be between -1,000,000 and 1,000,000 when no data type is assigned"
+        )
+
+
+
+def _has_excess_decimals(v: Any) -> bool:
+    """True if numeric string or float has more than 7 decimal places."""
+    if v is None:
+        return False
+    vstr = str(v).strip().upper()
+    if vstr in ("", "NAN"):
+        return False
+    if "." in vstr:
+        # e.g. "123.45678901" -> "45678901"
+        decimal_part = vstr.split(".")[1]
+        # Ignore exponent part if present
+        if "E" in decimal_part:
+            decimal_part = decimal_part.split("E")[0]
+        return len(decimal_part) > 7
+    return False
+
+
+def _truncate_decimals(vstr: str) -> str:
+    """Truncate to 7 decimal places if needed."""
+    if vstr is None:
+        return vstr
+    vstr = str(vstr).strip()
+    if "." in vstr:
+        integer_part, decimal_part = vstr.split(".")
+        if len(decimal_part) > 7:
+            return f"{integer_part}.{decimal_part[:7]}"
+    return vstr
 
 
 # ─── Auto-transform: any-format CSV → standard (date, time, numeric...) ──────
@@ -286,8 +332,8 @@ def _find_time_column(
     return None
 
 
-def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
-    """Take raw CSV bytes in any reasonable format, return (header, rows) in
+def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
+    """Take raw CSV bytes in any reasonable format, return (header, rows, truncated_flag) in
     our standard: first column 'date' (YYYY-MM-DD), second 'time' (HH:MM:SS),
     then numeric data columns with slugified names. Drops text/qc-flag cols."""
     text = raw_bytes.decode("utf-8-sig", errors="replace")
@@ -341,6 +387,7 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
 
     new_header = ["date", "time"] + [s for _, s in data_cols]
     new_rows: list[list[str]] = []
+    truncated_any = False
     for r in data_rows:
         max_idx = max([date_idx, time_idx] + [i for i, _ in data_cols])
         if max_idx >= len(r):
@@ -361,8 +408,17 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
             d.strftime("%Y-%m-%d"),
             f"{h:02d}:{m:02d}:{sec:02d}",
         ]
-        for i, _ in data_cols:
-            new_row.append(r[i].strip() if i < len(r) else "")
+        for i, col_name in data_cols:
+            if i < len(r):
+                val = r[i].strip()
+                if val and val.upper() != "NAN":
+                    _validate_cell_range(float(val), col_name, "uploadfile")
+                if _has_excess_decimals(val):
+                    val = _truncate_decimals(val)
+                    truncated_any = True
+                new_row.append(val)
+            else:
+                new_row.append("")
         new_rows.append(new_row)
 
     # Deduplicate by (date, time). Keep the LAST row for each pair — PyHelios
@@ -374,7 +430,7 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]]]:
     if len(seen) < len(new_rows):
         new_rows = [new_rows[i] for i in sorted(seen.values())]
 
-    return new_header, new_rows
+    return new_header, new_rows, truncated_any
 
 
 # ─── Read endpoints ──────────────────────────────────────────────────────────
@@ -510,13 +566,14 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
     if not file_bytes:
         raise HTTPException(400, "uploaded file is empty")
 
-    header, rows = _transform_csv(file_bytes)
+    header, rows, truncated_any = _transform_csv(file_bytes)
 
     if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is not None:
         ctx = sctx.context
         ctx.clearTimeseriesData()
 
         temp_path = _write_temp_csv(header, rows)
+        load_ok = False
         try:
             ctx.loadTabularTimeseriesData(
                 temp_path,
@@ -525,19 +582,39 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
                 "YYYY-MM-DD",
                 1,
             )
+            load_ok = True
         except Exception as exc:
             raise HTTPException(503, f"PyHelios load failed: {exc}")
         finally:
+            # Persist a copy of the normalized CSV under the scenario's
+            # weather/ folder if PyHelios accepted it. Best-effort —
+            # never fails the request if the disk write trips on something.
+            if load_ok:
+                try:
+                    weather_dir = (
+                        _ensure_scenario_structure(sctx.project_id, sctx.scenario_id)
+                        / "weather"
+                    )
+                    weather_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(temp_path, weather_dir / "weather.csv")
+                except Exception:
+                    pass
+
             try:
                 os.unlink(temp_path)
             except OSError:
                 pass
 
-    return {
+    response = {
         "success": True,
         "row_count": len(rows),
         "column_count": len(header),
     }
+    if truncated_any:
+        response["message"] = "Some values contained more than 7 decimal places and were truncated."
+    
+    trigger_scenario_autosave(sctx)
+    return response
 
 
 # ─── add — the only place with row/column wrappers ───────────────────────────
@@ -556,20 +633,54 @@ def _add_column(ctx, label: str, cells: list[tuple[Any, Any, float]]) -> None:
         ctx.addTimeseriesData(label, float(value), d, t)
 
 
-def _cleanup_pyhelios_cells(ctx, cells: list[tuple[str, Any, Any]]) -> None:
-    """Best-effort cleanup: write NaN to cells we partially wrote during a
-    column add that's now being rolled back.
+def _scenario_timestamps(ctx, exclude_labels: set[str] | None = None) -> list[tuple[Any, Any]]:
+    """Return all (date, time) pairs from PyHelios for this scenario.
 
-    PyHelios v0.1.19 has no true delete; NaN is the closest workaround. If
-    this cleanup itself fails, we swallow it — the SQL rollback already
-    happened, so we accept a small PyHelios leak rather than crash.
-
-    This is the "for later" atomicity gap noted in the design doc.
+    Anchors on the first registered label and reads its cells in order.
+    Relies on the invariant that every label in a scenario shares the
+    same (date, time) set (maintained by addCol / addRow). Returns an
+    empty list if no usable label exists (scenario has no rows).
     """
-    for label, d, t in cells:
+    candidates = list(ctx.listTimeseriesVariables())
+    if exclude_labels:
+        candidates = [l for l in candidates if l not in exclude_labels]
+    if not candidates:
+        return []
+    anchor = candidates[0]
+    n = ctx.getTimeseriesLength(anchor)
+    return [
+        (ctx.queryTimeseriesDate(anchor, i), ctx.queryTimeseriesTime(anchor, i))
+        for i in range(n)
+    ]
+
+
+def _label_timestamp_set(ctx, label: str) -> set[tuple[str, str]]:
+    """Return {(str(date), str(time))} for cells already present under `label`.
+
+    Used to detect which scenario timestamps already have a cell for a
+    given column (so a default-value fill skips them).
+    """
+    if label not in ctx.listTimeseriesVariables():
+        return set()
+    n = ctx.getTimeseriesLength(label)
+    return {
+        (
+            str(ctx.queryTimeseriesDate(label, i)),
+            str(ctx.queryTimeseriesTime(label, i)),
+        )
+        for i in range(n)
+    }
+
+
+def _cleanup_pyhelios_cells(ctx, cells: list[tuple[str, Any, Any]]) -> None:
+    """Best-effort cleanup: wipe variables we partially wrote during a
+    column add that's now being rolled back.
+    """
+    labels_to_wipe = set(label for label, d, t, in cells)
+    for label in labels_to_wipe:
         try:
-            ctx.updateTimeseriesData(label, d, t, float("nan"))
-        except Exception:
+            ctx.deleteTimeseriesVariable(label)
+        except (HeliosRuntimeError, AttributeError):
             pass
 
 
@@ -665,6 +776,23 @@ def add_columns(
                     f"column[{i}].values[{j}]: value '{v.value}' "
                     f"is not numeric or empty",
                 )
+            if _has_excess_decimals(v.value):
+                raise HTTPException(
+                    400,
+                    f"column[{i}].values[{j}]: value '{v.value}' contains more than 7 decimal places"
+                )
+            if col.datatype is None and v.value != "" and v.value.upper() != "NAN":
+                _validate_cell_range(float(v.value), col.name, f"column[{i}].values[{j}]")
+
+        if _has_excess_decimals(col.default_value):
+            raise HTTPException(
+                400,
+                f"column[{i}]: default_value '{col.default_value}' contains more than 7 decimal places"
+            )
+        
+        if col.datatype is None and col.default_value is not None:
+            if not math.isnan(float(col.default_value)):
+                _validate_cell_range(float(col.default_value), col.name, f"column[{i}] default_value")
 
         # Track newly-added names so a follow-up item in the same request
         # collides too (Pydantic also catches this, defence-in-depth).
@@ -678,6 +806,11 @@ def add_columns(
     )
     written_cells: list[tuple[str, Any, Any]] = []
     created_columns: list[dict] = []
+
+    # Snapshot scenario timestamps ONCE before any writes — otherwise the
+    # newly-created (and partially-filled) label could become the anchor
+    # and we'd see only the cells we just wrote.
+    scenario_ts = _scenario_timestamps(ctx)
 
     try:
         for i, col in enumerate(columns):
@@ -693,12 +826,33 @@ def add_columns(
             db.flush()  # populate header.id
 
             label = str(header.id)
+
+            # Track explicit (date, time) keys so the fill loop knows which
+            # scenario timestamps the user already covered via values[].
+            # Empty value ("") still counts as explicit — written as NaN.
+            explicit_keys: set[tuple[str, str]] = set()
             for v in col.values:
-                if v.value == "":
-                    continue  # empty cells are no-ops
                 d, t = _helios_date_time(v.date, v.time)
-                ctx.addTimeseriesData(label, float(v.value), d, t)
+                cell_value = float("nan") if v.value == "" else float(v.value)
+                ctx.addTimeseriesData(label, cell_value, d, t)
                 written_cells.append((label, d, t))
+                explicit_keys.add((v.date, v.time))
+
+            # Fill every scenario timestamp not covered by values[]:
+            #   - default_value if provided
+            #   - else NaN (placeholder so the column is always aligned with
+            #     the scenario's row count; matches addRow's NaN convention).
+            fill_value = (
+                float(col.default_value)
+                if col.default_value is not None
+                else float("nan")
+            )
+            for d_obj, t_obj in scenario_ts:
+                key = (str(d_obj), str(t_obj))
+                if key in explicit_keys:
+                    continue
+                ctx.addTimeseriesData(label, fill_value, d_obj, t_obj)
+                written_cells.append((label, d_obj, t_obj))
 
             created_columns.append(
                 {
@@ -710,6 +864,7 @@ def add_columns(
             )
 
         db.commit()
+        trigger_scenario_autosave(sctx)
 
     except HTTPException:
         db.rollback()
@@ -721,6 +876,197 @@ def add_columns(
         raise HTTPException(500, f"Failed to add columns: {exc}")
 
     return {"success": True, "columns": created_columns}
+
+
+def update_columns(
+    sctx: "ScenarioContext", column_id: int, column: "UpdateColumn", db: Session
+) -> dict:
+    """PATCH /updateCol/{column_id} — update one existing column.
+
+    Target column is identified by `column_id` (URL path). Per field:
+      - `datatype` / `data_unit`: PATCH semantics — only updated when non-null.
+        Consistency check (`unit.data_type_id == helios_data_type_id`) runs
+        against the post-update pair when both are non-null.
+      - `values[]`: each cell upserts. If a cell at (date, time) exists,
+        overwrite via `updateTimeseriesData`; if not, create via
+        `addTimeseriesData`.
+      - `default_value`: when provided, OVERWRITES every scenario timestamp
+        not in `values[]`. When absent/null, only missing cells are NaN-filled.
+
+    Atomic: a failure rolls back SQL and best-effort NaN-clears cells
+    written during this call.
+    """
+    if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
+        raise HTTPException(503, "PyHelios not available")
+
+    ctx = sctx.context
+
+    # ── Validation (fail-fast before any mutation) ──
+    existing = db.get(WeatherDataHeader, column_id)
+    if existing is None or existing.scenario_id != sctx.scenario_id:
+        raise HTTPException(
+            404, f"column id {column_id} not found in this scenario"
+        )
+
+    if column.name in ("date", "time"):
+        raise HTTPException(400, f"name '{column.name}' is reserved")
+
+    # FK existence checks (only for fields the user is actually sending).
+    if column.datatype is not None:
+        if db.get(HeliosDataType, column.datatype) is None:
+            raise HTTPException(404, f"datatype {column.datatype} not found")
+
+    new_unit_row = None
+    if column.data_unit is not None:
+        new_unit_row = db.get(DataUnit, column.data_unit)
+        if new_unit_row is None:
+            raise HTTPException(404, f"data_unit {column.data_unit} not found")
+
+    # Consistency check against post-update pair. Only enforced when both
+    # end up non-null; one-sided partial mappings remain legal.
+    final_dt = (
+        column.datatype if column.datatype is not None
+        else existing.helios_data_type_id
+    )
+    final_unit = (
+        column.data_unit if column.data_unit is not None
+        else existing.unit_id
+    )
+    if final_dt is not None and final_unit is not None:
+        unit_for_check = (
+            new_unit_row if new_unit_row is not None
+            else db.get(DataUnit, final_unit)
+        )
+        if unit_for_check.data_type_id != final_dt:
+            raise HTTPException(
+                400,
+                f"unit '{unit_for_check.unit}' belongs to "
+                f"data_type {unit_for_check.data_type_id}, not {final_dt}",
+            )
+
+    for j, v in enumerate(column.values):
+        if not v.date or not v.time:
+            raise HTTPException(
+                400, f"values[{j}]: date and time are required"
+            )
+        try:
+            list(int(p) for p in v.date.split("-"))
+            list(int(p) for p in v.time.split(":"))
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                400,
+                f"values[{j}]: bad date/time format '{v.date}' '{v.time}'",
+            )
+        if v.value != "" and not _is_numeric_or_empty(v.value):
+            raise HTTPException(
+                400,
+                f"values[{j}]: value '{v.value}' is not numeric or empty",
+            )
+        if _has_excess_decimals(v.value):
+            raise HTTPException(
+                400,
+                f"values[{j}]: value '{v.value}' contains more than 7 decimal places",
+            )
+        if final_dt is None and v.value != "" and v.value.upper() != "NAN":
+            _validate_cell_range(float(v.value), existing.name, f"values[{j}]")
+
+    if _has_excess_decimals(column.default_value):
+        raise HTTPException(
+            400,
+            f"default_value '{column.default_value}' contains more than 7 decimal places",
+        )
+
+    if final_dt is None and column.default_value is not None:
+        if not math.isnan(float(column.default_value)):
+            _validate_cell_range(float(column.default_value), existing.name, "default_value")
+
+    # ── Apply changes ──
+    written_cells: list[tuple[str, Any, Any]] = []
+
+    # Snapshot scenario timestamps once at the top, before any writes.
+    # The target label is INCLUDED — it holds the pre-mutation state and
+    # is a valid anchor for the scenario's timeline. Excluding it would
+    # break the case where this is the scenario's only column.
+    scenario_ts = _scenario_timestamps(ctx)
+
+    try:
+        label = str(existing.id)
+
+        # SQL header field updates (PATCH semantics — None = no change).
+        existing.name = column.name
+        if column.datatype is not None:
+            existing.helios_data_type_id = column.datatype
+        if column.data_unit is not None:
+            existing.unit_id = column.data_unit
+
+        # Cells that already exist for this column.
+        existing_cell_keys = _label_timestamp_set(ctx, label)
+
+        # Track keys provided in `values[]` so default_value skips them.
+        explicit_keys: set[tuple[str, str]] = set()
+
+        # Process explicit values[]. Empty value ("") writes NaN —
+        # consistent with addRow's empty-cell convention.
+        for v in column.values:
+            d, t = _helios_date_time(v.date, v.time)
+            key = (str(d), str(t))
+            explicit_keys.add(key)
+            cell_value = float("nan") if v.value == "" else float(v.value)
+
+            if key in existing_cell_keys:
+                ctx.updateTimeseriesData(label, d, t, cell_value)
+            else:
+                ctx.addTimeseriesData(label, cell_value, d, t)
+                written_cells.append((label, d, t))
+                existing_cell_keys.add(key)
+
+        # Fill scenario timestamps not in values[]:
+        #   - default_value provided  → OVERWRITE every such cell
+        #     (use case: select-all / deselect-all on a check column).
+        #   - default_value missing   → fill ONLY missing cells with NaN
+        #     (so the column stays aligned with the scenario timeline,
+        #     but existing data is left alone — non-destructive PATCH).
+        if column.default_value is not None:
+            fill_value = float(column.default_value)
+            for d_obj, t_obj in scenario_ts:
+                key = (str(d_obj), str(t_obj))
+                if key in explicit_keys:
+                    continue  # explicit value wins
+                if key in existing_cell_keys:
+                    ctx.updateTimeseriesData(label, d_obj, t_obj, fill_value)
+                else:
+                    ctx.addTimeseriesData(label, fill_value, d_obj, t_obj)
+                    written_cells.append((label, d_obj, t_obj))
+                    existing_cell_keys.add(key)
+        else:
+            for d_obj, t_obj in scenario_ts:
+                key = (str(d_obj), str(t_obj))
+                if key in explicit_keys or key in existing_cell_keys:
+                    continue  # don't overwrite existing data
+                ctx.addTimeseriesData(label, float("nan"), d_obj, t_obj)
+                written_cells.append((label, d_obj, t_obj))
+                existing_cell_keys.add(key)
+
+        updated_column = {
+            "id": existing.id,
+            "name": existing.name,
+            "datatype_id": existing.helios_data_type_id,
+            "data_unit_id": existing.unit_id,
+        }
+
+        db.commit()
+        trigger_scenario_autosave(sctx)
+
+    except HTTPException:
+        db.rollback()
+        _cleanup_pyhelios_cells(ctx, written_cells)
+        raise
+    except Exception as exc:
+        db.rollback()
+        _cleanup_pyhelios_cells(ctx, written_cells)
+        raise HTTPException(500, f"Failed to update column: {exc}")
+
+    return {"success": True, "columns": [updated_column]}
 
 
 def add_rows(
@@ -751,14 +1097,19 @@ def add_rows(
     # reserved as row keys, not data columns. addCol/PATCH refuse to
     # create them, but the bulk PUT doesn't enforce that, so a sideloaded
     # row could exist; this filter keeps add_rows robust either way. ──
-    header_ids = [
-        row[0]
-        for row in db.query(WeatherDataHeader.id)
+    headers = (
+        db.query(
+            WeatherDataHeader.id,
+            WeatherDataHeader.name,
+            WeatherDataHeader.helios_data_type_id,
+        )
         .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
         .filter(WeatherDataHeader.name.notin_(("date", "time")))
         .all()
-    ]
-    existing_label_set = {str(hid) for hid in header_ids}
+    )
+    existing_label_set = {str(r.id) for r in headers}
+    cols_without_datatype = {str(r.id) for r in headers if r.helios_data_type_id is None}
+    header_names_by_id = {str(r.id): r.name for r in headers}
 
     # ── Existing timestamps still come from PyHelios (SQL doesn't track
     # row timestamps). We can only anchor on a label PyHelios actually
@@ -820,7 +1171,14 @@ def add_rows(
             if vstr.strip() == "":
                 cells[k] = float("nan")
             elif _is_numeric_or_empty(vstr):
-                cells[k] = float(vstr)
+                if _has_excess_decimals(vstr):
+                    raise HTTPException(
+                        400, f"value '{v}' for column '{k}' contains more than 7 decimal places"
+                    )
+                new_val = float(vstr)
+                if k in cols_without_datatype:
+                    _validate_cell_range(new_val, header_names_by_id.get(k, k), "addRow")
+                cells[k] = new_val
             else:
                 raise HTTPException(
                     400,
@@ -829,6 +1187,7 @@ def add_rows(
         _add_row(ctx, row_data["date"], row_data["time"], cells)
         added_rows += 1
 
+    trigger_scenario_autosave(sctx)
     return {
         "success": True,
         "row_count": len(existing_timestamps) + len(rows),
@@ -840,7 +1199,7 @@ def add_rows(
 # ─── update — batch update of existing cells ────────────────────────────────
 
 
-def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
+def update_cells(sctx: "ScenarioContext", req: "UpdateRequest", db: Session) -> dict:
     """Update one or more existing cells in a single call.
 
     Used by the frontend when changing a column's data_unit — every cell
@@ -860,6 +1219,19 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
     if len(req.updates) == 0:
         raise HTTPException(400, "updates list cannot be empty")
 
+    headers = (
+        db.query(
+            WeatherDataHeader.id,
+            WeatherDataHeader.name,
+            WeatherDataHeader.helios_data_type_id,
+        )
+        .filter(WeatherDataHeader.scenario_id == sctx.scenario_id)
+        .filter(WeatherDataHeader.name.notin_(("date", "time")))
+        .all()
+    )
+    cols_without_datatype = {str(r.id) for r in headers if r.helios_data_type_id is None}
+    header_names_by_id = {str(r.id): r.name for r in headers}
+
     for i, item in enumerate(req.updates):
         # Business rule — PyHelios doesn't reserve these names, we do.
         if item.col in ("date", "time"):
@@ -874,7 +1246,15 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
         #   - missing cell at (d, t)  → HeliosRuntimeError
         #   - non-numeric value       → ValueError (from float() cast)
         try:
+            if _has_excess_decimals(item.value):
+                raise HTTPException(
+                    400, f"updates[{i}]: value '{item.value}' contains more than 7 decimal places"
+                )
             new_value = float("nan") if item.value == "" else float(item.value)
+            
+            if item.col in cols_without_datatype:
+                _validate_cell_range(new_value, header_names_by_id.get(item.col, item.col), f"updates[{i}]")
+
             ctx.updateTimeseriesData(item.col, date_obj, time_obj, new_value)
         except ValueError as exc:
             raise HTTPException(
@@ -883,26 +1263,30 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest") -> dict:
         except HeliosRuntimeError as exc:
             raise HTTPException(404, f"updates[{i}]: {exc}")
 
+    trigger_scenario_autosave(sctx)
     return {"success": True, "updated_count": len(req.updates)}
 
 
 # ─── delete — direct updateTimeseriesData calls (no wrappers) ────────────────
 
 
-def delete(sctx: "ScenarioContext", req: "DeleteRequest") -> dict:
+def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
     """Remove a row, a column, or wipe everything.
 
-    CAVEAT: partial deletes write NaN via updateTimeseriesData. The data point
-    stays in PyHelios memory (label still listed, length unchanged, queries
-    return NaN). A true remove would need removeTimeseriesData /
-    removeTimeseriesVariable — not in v0.1.19.
+    - Whole wipe: clearTimeseriesData (PyHelios) + delete all headers (SQL).
+    - Row delete: updateTimeseriesData(..., NaN) for that timestamp across all vars.
+    - Column delete: deleteTimeseriesVariable (PyHelios) + delete header (SQL).
     """
     if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
         raise HTTPException(503, "PyHelios not available")
     ctx = sctx.context
 
     if req.row is None and req.column is None:
+        # Wipe EVERYTHING for this scenario
         ctx.clearTimeseriesData()
+        db.query(WeatherDataHeader).filter_by(scenario_id=sctx.scenario_id).delete()
+        db.commit()
+        trigger_scenario_autosave(sctx)
         return {"success": True, "row_count": 0, "column_count": 2}
 
     # STEP A — clear one row
@@ -918,28 +1302,38 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest") -> dict:
             if _label_has_timestamp(ctx, label, date_obj, time_obj):
                 ctx.updateTimeseriesData(label, date_obj, time_obj, float("nan"))
 
-    # STEP B — clear one column
+    # STEP B — delete one column
     if req.column is not None:
         name = req.column.columnname
-        # Business rule — PyHelios doesn't reserve these names, we do.
         if name in ("date", "time"):
             raise HTTPException(400, "cannot delete the date/time column")
 
-        # PyHelios validates: getTimeseriesLength raises HeliosRuntimeError on
-        # missing label. The remaining loop is safe — date/time come from
-        # PyHelios's own data, so updateTimeseriesData won't error per cell.
-        try:
-            n = ctx.getTimeseriesLength(name)
-            for i in range(n):
-                date_obj = ctx.queryTimeseriesDate(name, i)
-                time_obj = ctx.queryTimeseriesTime(name, i)
-                ctx.updateTimeseriesData(name, date_obj, time_obj, float("nan"))
-        except HeliosRuntimeError as exc:
-            raise HTTPException(404, str(exc))
+        # Find the header in DB
+        h_row = (
+            db.query(WeatherDataHeader)
+            .filter_by(scenario_id=sctx.scenario_id, name=name)
+            .first()
+        )
+        if not h_row:
+            raise HTTPException(404, f"column '{name}' not found")
+
+        # Delete from Simulation (RAM).
+        # We try both the ID and the Name to handle both manual and CSV-uploaded labels.
+        if sctx.context is not None:
+            for label in [str(h_row.id), h_row.name]:
+                try:
+                    sctx.context.deleteTimeseriesVariable(label)
+                except Exception:
+                    pass
+
+        # Delete from DB (UI)
+        db.delete(h_row)
+        db.commit()
 
     labels_after = list(ctx.listTimeseriesVariables())
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0
     column_count = 2 + len(labels_after)
+    trigger_scenario_autosave(sctx)
     return {
         "success": True,
         "row_count": row_count,
@@ -978,6 +1372,7 @@ def clear_data(sctx: "ScenarioContext", db: Session) -> dict:
     except Exception:
         pass  # SQL is the source of truth; orphan cells will be invisible to /addRow
 
+    trigger_scenario_autosave(sctx)
     return {
         "success": True,
         "headers_removed": headers_removed,

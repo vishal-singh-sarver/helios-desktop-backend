@@ -1,9 +1,11 @@
+
 """
 Request bodies for weather endpoints.
 
-    POST /addCol  body: AddColumnsRequest
-    POST /addRow  body: AddRowsRequest
-    POST /update  body: UpdateRequest
+    POST  /addCol                   body: AddColumnsRequest
+    PATCH /updateCol/{column_id}    body: UpdateColumn  (single)
+    POST  /addRow                   body: AddRowsRequest
+    POST  /update                   body: UpdateRequest
     POST /delete  body: DeleteRequest
 
 The `addCol` flow links each new column to the metadata catalog
@@ -28,17 +30,21 @@ class ColumnValue(BaseModel):
 
     date: str
     time: str
-    value: str = ""   # empty string allowed; written as a no-op
+    value: str = "NAN"   # "NAN" is treated as empty/NaN
 
 
-class AddColumn(BaseModel):
-    """One column spec inside the AddRequest.column list.
+class _ColumnFields(BaseModel):
+    """Shared per-column fields + validators for addCol / updateCol bodies.
 
-    Two optional FKs link the column to the master catalog:
+    Two optional FKs link a column to the master catalog:
       datatype  -> helios_data_types.id
       data_unit -> data_units.id
     When non-null and both present, the unit must belong to the type
     (service-level invariant; the schema doesn't enforce cross-table CHECKs).
+
+    `default_value` (optional) fills any scenario timestamp NOT covered by
+    `values[]`. Numeric (or numeric string). Null/absent = no fill on add;
+    on update, see UpdateColumn for the overwrite-vs-fill semantics.
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -46,6 +52,7 @@ class AddColumn(BaseModel):
     datatype: int | None = None
     data_unit: int | None = None
     values: list[ColumnValue] = Field(default_factory=list)
+    default_value: float | str | None = "NAN"
 
     @field_validator("name")
     @classmethod
@@ -56,6 +63,44 @@ class AddColumn(BaseModel):
         if len(v) > 100:
             raise ValueError("name must be 100 characters or fewer")
         return v
+
+    @field_validator("default_value", mode="before")
+    @classmethod
+    def _coerce_default(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("default_value must be numeric")
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "" or s.upper() == "NAN":
+                return float("nan")
+            try:
+                return float(s)
+            except ValueError:
+                raise ValueError(f"default_value '{v}' is not numeric")
+        raise ValueError("default_value must be numeric")
+
+
+class AddColumn(_ColumnFields):
+    """One column spec inside the AddColumnsRequest.column list."""
+    pass
+
+
+class UpdateColumn(_ColumnFields):
+    """Body for PATCH /updateCol/{column_id} — update one existing column.
+
+    The target column is identified by `column_id` in the URL path. Per field:
+      - `datatype` / `data_unit`: PATCH semantics — only updated when non-null.
+      - `values[]`: each cell upserts (creates if missing, overwrites if exists).
+      - `default_value`: when provided, writes the default at every scenario
+        timestamp NOT listed in `values[]`, OVERWRITING any existing cell at
+        that timestamp. When absent/null, only missing cells are filled (NaN)
+        — existing data is preserved.
+    """
+    pass
 
 
 class AddColumnsRequest(BaseModel):
@@ -98,7 +143,7 @@ class UpdateValue(BaseModel):
 
     col: str
     row: RowRef
-    value: str = ""
+    value: str = "NAN"
 
 
 class UpdateRequest(BaseModel):

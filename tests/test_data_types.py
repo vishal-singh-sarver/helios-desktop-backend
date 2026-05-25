@@ -148,7 +148,7 @@ def test_check_data_type_seeded_with_no_units(client):
     r = client.get("/api/data-types/")
     by_name = {t["data_type"]: t for t in r.json()["data_types"]}
 
-    assert "check" in by_name, "'check' data type should be seeded by migration 013"
+    assert "check" in by_name, "'check' data type should be seeded by migration 011"
     assert by_name["check"]["units"] == [], "'check' should have an empty units list"
 
 
@@ -249,7 +249,7 @@ def test_list_unit_payload_includes_conversion_fields(client):
 #
 # The 9 weather parameters defined in the design doc with their canonical
 # units and conversion factors. Each parent has exactly one base unit
-# (enforced by the partial unique index from migration 010).
+# (enforced by the partial unique index from migration 009).
 
 
 def _by_name(client) -> dict[str, dict]:
@@ -280,7 +280,7 @@ def test_default_data_types_seeded(client):
 
 
 def test_each_default_type_has_exactly_one_base_unit(client):
-    """Partial unique index from migration 010 enforces this, but verify
+    """Partial unique index from migration 009 enforces this, but verify
     the seed data didn't somehow ship with zero or multiple bases."""
     by_name = _by_name(client)
     for type_name in (
@@ -327,17 +327,18 @@ def test_co2_conversion_factors(client):
 
 
 def test_default_units_min_max_set_on_base(client):
-    """Each base unit carries the design-doc min/max range; secondary
-    units leave them null (the range is meaningful in the canonical unit)."""
+    """Every unit (base + secondary) carries a min/max range per the
+    Weather Parameter Unit Conversion Reference doc (migration 012)."""
     by_name = _by_name(client)
 
-    # air_temperature K base: 223–350
+    # air_temperature: K (base) 223–350, C (secondary) -50.15–76.85
     units = {u["unit"]: u for u in by_name["air_temperature"]["units"]}
     assert units["K"]["min"] == 223
     assert units["K"]["max"] == 350
-    assert units["C"]["min"] is None  # secondary unit — no range
+    assert units["C"]["min"] == -50.15
+    assert units["C"]["max"] == 76.85
 
-    # air_humidity fraction base: 0–1
+    # air_humidity: 0-1 (base) 0–1
     units = {u["unit"]: u for u in by_name["air_humidity"]["units"]}
-    assert units["fraction"]["min"] == 0
-    assert units["fraction"]["max"] == 1
+    assert units["0-1"]["min"] == 0
+    assert units["0-1"]["max"] == 1

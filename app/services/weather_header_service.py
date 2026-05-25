@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
+from app.helios.persistence import trigger_scenario_autosave
 from app.services.scenario_service import _resolve_scenario
 
 
@@ -77,7 +78,7 @@ def replace_headers(
     nothing). Pydantic-level validation (duplicate name / display_order)
     happens BEFORE this function runs.
     """
-    _resolve_scenario(session_id, project_id, scenario_id, db)
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
 
     # ── Per-item consistency check (DB-aware) ──
     # Run BEFORE any mutation so a bad item doesn't half-delete the existing set.
@@ -111,6 +112,8 @@ def replace_headers(
         db.rollback()
         raise HTTPException(500, "Failed to replace headers")
 
+    trigger_scenario_autosave(sctx)
+
     rows = (
         db.query(WeatherDataHeader)
         .filter_by(scenario_id=scenario_id)
@@ -128,7 +131,7 @@ def clear_headers(
     session_id: str, project_id: str, scenario_id: str, db: Session
 ) -> dict:
     """Remove all headers for the scenario. Returns the count removed."""
-    _resolve_scenario(session_id, project_id, scenario_id, db)
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
 
     try:
         removed = (
@@ -141,6 +144,14 @@ def clear_headers(
         db.rollback()
         raise HTTPException(500, "Failed to clear headers")
 
+    if sctx.context is not None:
+        try:
+            sctx.context.clearTimeseriesData()
+        except Exception:
+            pass  # SQL is the source of truth; orphan cells will be invisible to /addRow
+
+    trigger_scenario_autosave(sctx)
+
     return {"success": True, "count": removed}
 
 
@@ -151,18 +162,10 @@ def delete_header(
     header_id: int,
     db: Session,
 ) -> dict:
-    """Delete one header row and best-effort NaN-clear its PyHelios cells.
+    """Delete one header row and wipe its variable from simulation memory.
 
-    PyHelios v0.1.19 has no remove API, so the cells under the header's
-    `str(id)` label are overwritten with NaN — same approach as
-    `weather_service.delete()` for column-clear. The label itself stays
-    visible in `listTimeseriesVariables()`; that's a known limitation of
-    the PyHelios version.
-
-    Order: SQL delete first (transactional), then PyHelios NaN as
-    best-effort. If the PyHelios cleanup throws (label never registered
-    because the column was created with values=[]), we swallow it — the
-    SQL row is the source of truth.
+    Order: SQL delete first (transactional), then PyHelios delete as
+    best-effort.
     """
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
 
@@ -174,7 +177,8 @@ def delete_header(
     if row is None:
         raise HTTPException(404, f"header {header_id} not found in scenario")
 
-    label = str(row.id)
+    label_id = str(row.id)
+    label_name = row.name
 
     try:
         db.delete(row)
@@ -183,18 +187,15 @@ def delete_header(
         db.rollback()
         raise HTTPException(500, "Failed to delete header")
 
-    # Best-effort PyHelios cleanup. A column with values=[] never registered
-    # a label, in which case getTimeseriesLength raises — that's fine, swallow.
     if sctx.context is not None:
-        ctx = sctx.context
-        try:
-            n = ctx.getTimeseriesLength(label)
-            for i in range(n):
-                d = ctx.queryTimeseriesDate(label, i)
-                t = ctx.queryTimeseriesTime(label, i)
-                ctx.updateTimeseriesData(label, d, t, float("nan"))
-        except Exception:
-            pass
+        # Attempt to delete both possible labels (ID and Name)
+        for label in [label_id, label_name]:
+            try:
+                sctx.context.deleteTimeseriesVariable(label)
+            except Exception:
+                pass
+
+    trigger_scenario_autosave(sctx)
 
     return {"success": True, "header_id": header_id}
 
@@ -204,10 +205,7 @@ def update_header(
     project_id: str,
     scenario_id: str,
     header_id: int,
-    name: str | None,
-    helios_data_type_id: int | None,
-    unit_id: int | None,
-    display_order: int | None,
+    data: dict,
     db: Session,
 ) -> dict:
     """Partial update of one header. Editable fields: name, datatype FK,
@@ -220,7 +218,7 @@ def update_header(
     excluding the row being updated so a no-op patch doesn't self-collide.
     The unit/type consistency invariant is verified against the post-update
     state and only when BOTH are non-null (partial mappings remain legal
-    per migration 009).
+    per migration 008).
     """
     _resolve_scenario(session_id, project_id, scenario_id, db)
 
@@ -231,6 +229,12 @@ def update_header(
     )
     if row is None:
         raise HTTPException(404, f"header {header_id} not found in scenario")
+
+    # Extract values from data dict for validation
+    name = data.get("name")
+    helios_data_type_id = data.get("helios_data_type_id")
+    unit_id = data.get("unit_id")
+    display_order = data.get("display_order")
 
     # Reserved-name guard mirrors the column-add flow.
     if name is not None and name in ("date", "time"):
@@ -283,10 +287,12 @@ def update_header(
 
     # Consistency check against the POST-update pair. Only enforced when both
     # FKs end up non-null; one-sided partial mapping stays legal.
+    # Note: we use "in data" to check if the user is explicitly setting a field.
     final_dt = (
-        helios_data_type_id if helios_data_type_id is not None else row.helios_data_type_id
+        helios_data_type_id if "helios_data_type_id" in data else row.helios_data_type_id
     )
-    final_unit = unit_id if unit_id is not None else row.unit_id
+    final_unit = unit_id if "unit_id" in data else row.unit_id
+
     if final_dt is not None and final_unit is not None:
         unit_for_check = new_unit_row if new_unit_row is not None else db.get(DataUnit, final_unit)
         if unit_for_check.data_type_id != final_dt:
@@ -296,14 +302,9 @@ def update_header(
                 f"{unit_for_check.data_type_id}, not {final_dt}",
             )
 
-    if name is not None:
-        row.name = name
-    if helios_data_type_id is not None:
-        row.helios_data_type_id = helios_data_type_id
-    if unit_id is not None:
-        row.unit_id = unit_id
-    if display_order is not None:
-        row.display_order = display_order
+    # ── Apply Updates ──
+    for key, val in data.items():
+        setattr(row, key, val)
 
     try:
         db.commit()

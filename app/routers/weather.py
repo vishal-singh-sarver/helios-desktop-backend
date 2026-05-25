@@ -18,6 +18,7 @@ from app.schemas.weather import (
     AddColumnsRequest,
     AddRowsRequest,
     DeleteRequest,
+    UpdateColumn,
     UpdateRequest,
 )
 from app.schemas.weather_header import (
@@ -89,6 +90,22 @@ def add_columns(
     return weather_service.add_columns(sctx, body.column, db)
 
 
+@router.patch("/project/{project_id}/scenario/{scenario_id}/updateCol/{column_id}")
+def update_columns(
+    project_id: str,
+    scenario_id: str,
+    column_id: int,
+    body: UpdateColumn = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Update one existing column. Target identified by `column_id` in the
+    URL path. Body upserts cells in `values[]` and optionally fills the
+    remaining scenario timestamps with `default_value`."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.update_columns(sctx, column_id, body, db)
+
+
 @router.post("/project/{project_id}/scenario/{scenario_id}/addRow")
 def add_rows(
     project_id: str,
@@ -102,7 +119,7 @@ def add_rows(
     return weather_service.add_rows(sctx, body.rows, db)
 
 
-@router.post("/project/{project_id}/scenario/{scenario_id}/update")
+@router.patch("/project/{project_id}/scenario/{scenario_id}/update")
 def update_weather(
     project_id: str,
     scenario_id: str,
@@ -112,7 +129,7 @@ def update_weather(
 ):
     """Update one or more existing cells in one call (fail-fast)."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.update_cells(sctx, body)
+    return weather_service.update_cells(sctx, body, db)
 
 
 @router.post("/project/{project_id}/scenario/{scenario_id}/delete")
@@ -125,7 +142,7 @@ def delete_weather(
 ):
     """Delete a row, a column, or wipe everything."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.delete(sctx, body)
+    return weather_service.delete(sctx, body, db)
 
 
 @router.delete("/project/{project_id}/scenario/{scenario_id}/clear_data")
@@ -192,15 +209,13 @@ def update_weather_data_header(
     db: Session = Depends(get_db),
 ):
     """Partial update of a single header — name, datatype, unit, or order."""
+    update_data = body.model_dump(exclude_unset=True)
     return weather_header_service.update_header(
         session_id,
         project_id,
         scenario_id,
         header_id,
-        body.name,
-        body.helios_data_type_id,
-        body.unit_id,
-        body.display_order,
+        update_data,
         db,
     )
 

@@ -332,6 +332,86 @@ def _find_time_column(
     return None
 
 
+# ── Julian (day-of-year) combined-datetime support ───────────────────────────
+#
+# Catalog formats (migration 015): 'YYYY DOY HH:MM' and 'DOY YYYY HH:MM'.
+# Both layouts encode (year, day-of-year, time) in a single whitespace-split
+# cell. The 4-digit-year rule disambiguates which token is which, so both
+# layouts share one parser. Cells are normalized to canonical date + time
+# columns just like the standard datetime path — PyHelios never sees the
+# Julian shape.
+
+
+def _parse_julian_datetime(s: str) -> tuple[datetime, bool]:
+    """Parse a Julian (day-of-year) combined datetime — accepts either
+    'YYYY DOY HH:MM' or 'DOY YYYY HH:MM' layout (HH:MM:SS also accepted).
+
+    Returns (datetime, rollover). `rollover` is True for the 24:00 end-of-day
+    convention, matching `_parse_datetime`'s contract.
+
+    Year must be 4 digits; DOY is 1-3 digits in [1, 366]. Token order is
+    inferred from which token is 4 digits, so a single parser covers both
+    catalog formats. DOY 366 is only valid in leap years.
+    """
+    s = s.strip()
+    parts = s.split()
+    if len(parts) != 3:
+        raise ValueError(f"could not parse Julian datetime '{s}'")
+
+    year = doy = time_str = None
+    for p in parts:
+        if ":" in p:
+            time_str = p
+        elif p.isdigit() and len(p) == 4:
+            year = int(p)
+        elif p.isdigit() and 1 <= len(p) <= 3:
+            doy = int(p)
+
+    if year is None or doy is None or time_str is None:
+        raise ValueError(f"could not parse Julian datetime '{s}'")
+
+    if not (1900 <= year <= 2100):
+        raise ValueError(f"Julian year {year} out of supported range (1900-2100)")
+    if not (1 <= doy <= 366):
+        raise ValueError(f"Julian DOY {doy} must be in 1-366")
+
+    h, m, sec, rollover = _parse_time(time_str)
+
+    base = datetime(year, 1, 1, h, m, sec)
+    result = base + timedelta(days=doy - 1)
+    # DOY 366 in a non-leap year would roll into the next year — reject.
+    if result.year != year:
+        raise ValueError(
+            f"Julian DOY {doy} invalid for year {year} (not a leap year)"
+        )
+    return result, rollover
+
+
+def _looks_like_julian_datetime(values: list[str]) -> bool:
+    for v in values[:10]:
+        if v.strip():
+            try:
+                _parse_julian_datetime(v)
+                return True
+            except ValueError:
+                return False
+    return False
+
+
+def _find_julian_datetime_column(
+    header: list[str], data_rows: list[list[str]]
+) -> int | None:
+    for i, h in enumerate(header):
+        lh = h.lower()
+        if "julian" in lh or "doy" in lh:
+            return i
+    for i in range(len(header)):
+        col_values = [r[i] for r in data_rows if i < len(r)]
+        if _looks_like_julian_datetime(col_values):
+            return i
+    return None
+
+
 def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
     """Take raw CSV bytes in any reasonable format, return (header, rows, truncated_flag) in
     our standard: first column 'date' (YYYY-MM-DD), second 'time' (HH:MM:SS),
@@ -346,9 +426,17 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
     data_rows = rows[1:]
 
     datetime_idx = _find_datetime_column(raw_header, data_rows)
+    julian_idx = (
+        _find_julian_datetime_column(raw_header, data_rows)
+        if datetime_idx is None
+        else None
+    )
     if datetime_idx is not None:
         date_idx = time_idx = datetime_idx
         skip_for_data = {datetime_idx}
+    elif julian_idx is not None:
+        date_idx = time_idx = julian_idx
+        skip_for_data = {julian_idx}
     else:
         date_idx = _find_date_column(raw_header, data_rows)
         if date_idx is None:
@@ -395,6 +483,10 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
         try:
             if datetime_idx is not None:
                 dt, rollover = _parse_datetime(r[datetime_idx])
+                d = dt
+                h, m, sec = dt.hour, dt.minute, dt.second
+            elif julian_idx is not None:
+                dt, rollover = _parse_julian_datetime(r[julian_idx])
                 d = dt
                 h, m, sec = dt.hour, dt.minute, dt.second
             else:

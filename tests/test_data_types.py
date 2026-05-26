@@ -342,3 +342,43 @@ def test_default_units_min_max_set_on_base(client):
     units = {u["unit"]: u for u in by_name["air_humidity"]["units"]}
     assert units["0-1"]["min"] == 0
     assert units["0-1"]["max"] == 1
+
+
+def test_date_time_catalog_includes_all_ten_formats(client):
+    """Migration 013 seeded 8 combined-datetime formats; migration 015 added
+    2 Julian (day-of-year) formats. The API must return all 10, with the
+    expected aliases and `MM/DD/YYYY HH:MM` as the base. Frontend's format
+    dropdown depends on this contract."""
+    by_name = _by_name(client)
+    assert "date_time" in by_name, "'date_time' data type missing — migration 013 didn't run"
+
+    units = by_name["date_time"]["units"]
+    by_unit = {u["unit"]: u for u in units}
+
+    # All 10 formats must be present (8 from migration 013 + 2 Julian from 015).
+    expected = {
+        "MM/DD/YYYY HH:MM":          "US slash 24-hour",
+        "YYYY-MM-DDTHH:MM:SSZ":      "ISO-8601 UTC",
+        "YYYY-MM-DDTHH:MM:SS-HH:MM": "ISO-8601 with offset",
+        "YYYYMMDDHH":                "Compact hourly",
+        "YYYY-MM-DD HH:MM":          "ISO 24-hour",
+        "DD/MM/YYYY HH:MM":          "EU slash 24-hour",
+        "DD-MM-YYYY HH:MM":          "EU dash 24-hour",
+        "MM-DD-YYYY HH:MM":          "US dash 24-hour",
+        "YYYY DOY HH:MM":            "Julian (year first)",
+        "DOY YYYY HH:MM":            "Julian (DOY first)",
+    }
+    assert len(units) == len(expected), (
+        f"date_time should have {len(expected)} units, got {len(units)}: "
+        f"{sorted(by_unit.keys())}"
+    )
+    for unit, expected_alias in expected.items():
+        assert unit in by_unit, f"date_time missing unit {unit!r} — migration didn't run on this DB"
+        assert by_unit[unit]["alias"] == expected_alias, (
+            f"alias drift for {unit!r}: expected {expected_alias!r}, got {by_unit[unit]['alias']!r}"
+        )
+
+    # Exactly one base, and it's the US slash 24-hour format.
+    bases = [u for u in units if u["is_base"]]
+    assert len(bases) == 1, f"date_time should have exactly one base unit, got {len(bases)}"
+    assert bases[0]["unit"] == "MM/DD/YYYY HH:MM"

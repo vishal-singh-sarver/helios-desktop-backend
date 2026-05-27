@@ -215,7 +215,7 @@ pyinstaller \
     --collect-all fastapi \
     --collect-all pydantic \
     --collect-all sqlalchemy \
-    --add-data "$BACKEND_DIR/app/db/migrations:app/db/migrations" \
+   --add-data "$BACKEND_DIR/app/db/migrations:app/db/migrations" \
     $PYHELIOS_DATA_ARGS \
     $HIDDEN_IMPORTS_STR \
     backend_wrapper.py

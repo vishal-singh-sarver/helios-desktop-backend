@@ -179,6 +179,7 @@ $pyInstallerArgs = @(
   '--noconfirm'
   '--collect-submodules', 'app'
   '--collect-data', 'app'
+  '--add-data', "$backendApiDir\app\db\migrations;app\db\migrations"
   '--collect-all', 'fastapi'
   '--collect-all', 'pydantic'
   '--collect-all', 'sqlalchemy'

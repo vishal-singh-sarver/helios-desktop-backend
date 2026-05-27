@@ -154,6 +154,33 @@ def _truncate_decimals(vstr: str) -> str:
     return vstr
 
 
+# User-facing message when a request would create two cells for the same
+# (date, time) under one column. PyHelios's addTimeseriesData rejects this
+# with the opaque "Failed to insert timeseries data for unknown reason".
+# We pre-detect the case in validation and use this message instead, both
+# for clarity and to give a 400 (user data issue) instead of a 500.
+_DUPLICATE_DATETIME_MSG = (
+    "Import failed: Duplicate date-time entries detected in the weather "
+    "file. Duplicate data points are not supported. Please try again."
+)
+
+
+def _check_duplicate_timestamps_in_values(values) -> None:
+    """Raise HTTP 400 if `values` contains the same (date, time) twice.
+
+    PyHelios's addTimeseriesData fails on duplicates with an opaque error
+    that surfaces to the user as "Helios error 7: ...Failed to insert
+    timeseries data for unknown reason". Pre-detecting here lets us return
+    the cleaner _DUPLICATE_DATETIME_MSG and a 400 instead of a 500.
+    """
+    seen: set[tuple[str, str]] = set()
+    for v in values:
+        key = (v.date, v.time)
+        if key in seen:
+            raise HTTPException(400, _DUPLICATE_DATETIME_MSG)
+        seen.add(key)
+
+
 # ─── Auto-transform: any-format CSV → standard (date, time, numeric...) ──────
 
 
@@ -876,6 +903,11 @@ def add_columns(
             if col.datatype is None and v.value != "" and v.value.upper() != "NAN":
                 _validate_cell_range(float(v.value), col.name, f"column[{i}].values[{j}]")
 
+        # Reject duplicate (date, time) pairs within this column's values
+        # before PyHelios's addTimeseriesData can fail on them with an
+        # opaque "unknown reason" error.
+        _check_duplicate_timestamps_in_values(col.values)
+
         if _has_excess_decimals(col.default_value):
             raise HTTPException(
                 400,
@@ -965,6 +997,12 @@ def add_columns(
     except Exception as exc:
         db.rollback()
         _cleanup_pyhelios_cells(ctx, written_cells)
+        msg = str(exc)
+        # PyHelios's addTimeseriesData rejects duplicates with an opaque
+        # "Failed to insert timeseries data for unknown reason". Translate
+        # to the user-facing message and 400 (it's a data issue, not a 500).
+        if "addTimeseriesData" in msg and "Failed to insert" in msg:
+            raise HTTPException(400, _DUPLICATE_DATETIME_MSG)
         raise HTTPException(500, f"Failed to add columns: {exc}")
 
     return {"success": True, "columns": created_columns}
@@ -1062,6 +1100,11 @@ def update_columns(
         if final_dt is None and v.value != "" and v.value.upper() != "NAN":
             _validate_cell_range(float(v.value), existing.name, f"values[{j}]")
 
+    # Reject duplicate (date, time) pairs within the column's values
+    # before PyHelios's addTimeseriesData fails on them with an opaque
+    # "unknown reason" error.
+    _check_duplicate_timestamps_in_values(column.values)
+
     if _has_excess_decimals(column.default_value):
         raise HTTPException(
             400,
@@ -1156,6 +1199,9 @@ def update_columns(
     except Exception as exc:
         db.rollback()
         _cleanup_pyhelios_cells(ctx, written_cells)
+        msg = str(exc)
+        if "addTimeseriesData" in msg and "Failed to insert" in msg:
+            raise HTTPException(400, _DUPLICATE_DATETIME_MSG)
         raise HTTPException(500, f"Failed to update column: {exc}")
 
     return {"success": True, "columns": [updated_column]}

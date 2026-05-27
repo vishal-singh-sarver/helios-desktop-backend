@@ -1316,6 +1316,29 @@ def test_addcol_default_value_non_numeric_returns_422(client):
     assert r.status_code == 422
 
 
+def test_addcol_duplicate_date_time_returns_400_with_friendly_message(client):
+    """A column with two cells at the same (date, time) used to surface
+    PyHelios's opaque 'Failed to insert timeseries data for unknown reason'
+    wrapped in a 500. We now pre-detect and return a 400 with a clean
+    user-facing message."""
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [
+                {"date": "2026-05-21", "time": "10:00:00", "value": "20"},
+                {"date": "2026-05-21", "time": "10:00:00", "value": "22"},
+            ],
+        }]},
+    )
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"].lower()
+    assert "duplicate" in detail
+    assert "date-time" in detail
+
+
 # ─────────────────────────── PATCH /updateCol ────────────────────────────────
 
 

@@ -220,10 +220,19 @@ def test_recent_projects_are_scoped_and_sorted_with_size(client):
     assert other.status_code == 201
 
     p2_id = p2.json()["project_id"]
-    snapshot_path = settings.resolved_projects_dir / p2_id / "current.xml.gz"
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_bytes = b"sample_snapshot_payload"
-    snapshot_path.write_bytes(snapshot_bytes)
+    # Project size is the total on-disk footprint of the project's nested
+    # folder (scenario context XMLs, weather CSVs, archives) — not the old
+    # project-level current.xml.gz, which was removed. Write a couple of
+    # files in the nested layout to exercise the recursive sum.
+    ctx_dir = settings.scenario_context_file_dir(p2_id, "s1")
+    ctx_dir.mkdir(parents=True, exist_ok=True)
+    weather_dir = settings.scenario_dir(p2_id, "s1") / "weather"
+    weather_dir.mkdir(parents=True, exist_ok=True)
+    file_a = ctx_dir / "context.xml"
+    file_b = weather_dir / "weather.csv"
+    file_a.write_bytes(b"<helios>data</helios>")
+    file_b.write_bytes(b"date,time,temp\n2026-01-01,00:00:00,20\n")
+    expected_size = file_a.stat().st_size + file_b.stat().st_size
 
     recent = client.get("/api/project/recent", headers={"session-id": session_a})
     assert recent.status_code == 200
@@ -231,7 +240,9 @@ def test_recent_projects_are_scoped_and_sorted_with_size(client):
 
     assert len(projects) == 2
     assert projects[0]["id"] == p2_id  # updated_at DESC, second created should come first
-    assert projects[0]["size"] == len(snapshot_bytes)
+    assert projects[0]["size"] == expected_size  # recursive sum of both files
+    # The other project in session A has nothing persisted → size 0
+    assert projects[1]["size"] == 0
 
     names = {item["name"] for item in projects}
     assert p1_payload["name"] in names

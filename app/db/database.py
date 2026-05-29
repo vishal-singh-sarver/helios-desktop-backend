@@ -3,6 +3,7 @@ SQLite database connection, session management, and migrations.
 """
 from pathlib import Path
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from app.core.config import settings
 
@@ -40,11 +41,53 @@ def get_db():
         db.close()
 
 
+# Errors that mean "this statement's effect is already present in the DB".
+# They fire when a not-yet-recorded migration re-runs structural DDL against
+# a database that already has the change — e.g. after an app update, or a
+# reinstall that kept the existing backend-data/ DB. (See migration 014's
+# header for how the recorded versions drifted from the schema.) Treating
+# them as no-ops lets an older DB roll forward instead of crashing at startup.
+_ALREADY_APPLIED_ERRORS = (
+    "duplicate column name",   # ALTER TABLE ... ADD COLUMN  (009, 014)
+    "already exists",          # CREATE TABLE / INDEX / TRIGGER  (009's unique index)
+)
+
+
+def _split_statements(raw_sql: str) -> list[str]:
+    """Strip -- comment lines, then split into individual statements on ;."""
+    lines = [
+        line for line in raw_sql.splitlines()
+        if not line.strip().startswith("--")
+    ]
+    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
+
+
+def _is_already_applied(exc: OperationalError) -> bool:
+    msg = str(getattr(exc, "orig", exc)).lower()
+    return any(token in msg for token in _ALREADY_APPLIED_ERRORS)
+
+
+def _column_type(conn, table: str, column: str) -> str | None:
+    """Declared type of a column (upper-cased), or None if table/column absent."""
+    # PRAGMA can't bind the table name; `table` here is always a literal.
+    rows = conn.execute(text(f'PRAGMA table_info("{table}")')).fetchall()
+    for row in rows:  # cid, name, type, notnull, dflt_value, pk
+        if row[1] == column:
+            return (row[2] or "").upper()
+    return None
+
+
 def run_migrations() -> None:
     """
     Apply all .sql migration files in db/migrations/ in version order.
     Skips migrations already recorded in schema_migrations.
     Called once at startup from lifespan.py.
+
+    Resilient to a DB whose schema is ahead of its recorded versions — the
+    state left by an app update or a reinstall over an existing backend-data/
+    DB. Structural DDL that is already satisfied ("duplicate column name",
+    "already exists") is treated as a no-op and the version is still stamped,
+    so the next launch skips it instead of crashing (exit code 3).
 
     Fails fast if the migrations folder is missing or empty — historically a
     packaging regression (PyInstaller bundle without `--add-data
@@ -68,40 +111,54 @@ def run_migrations() -> None:
             "Bundle is incomplete — rebuild the backend."
         )
 
+    # 1. Ensure the tracking table exists, then read what's been applied.
     with engine.begin() as conn:
-        # Ensure tracking table exists before querying it
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version    INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """))
-
         applied = {
             row[0] for row in conn.execute(text("SELECT version FROM schema_migrations"))
         }
 
-        for sql_file in sql_files:
-            # Extract version number from filename prefix, e.g. 001_initial.sql → 1
-            try:
-                version = int(sql_file.stem.split("_")[0])
-            except ValueError:
-                continue
+        # Reconcile the one migration that is NOT a safe no-op to re-run.
+        # 010 rebuilds `projects` to change utc_offset REAL -> TEXT (create
+        # _new, copy+convert, drop, rename). If a drifted DB already stores
+        # utc_offset as TEXT but never recorded version 10, re-running the
+        # rebuild would mangle half-hour offsets (+05:30 -> +05:00). Detect
+        # the finished state and stamp it applied so the rebuild is skipped.
+        if 10 not in applied and _column_type(conn, "projects", "utc_offset") == "TEXT":
+            conn.execute(text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (10)"))
+            applied.add(10)
+            print("[db] migration 010 already satisfied (utc_offset is TEXT) — marking applied")
 
-            if version in applied:
-                continue
+    # 2. Apply each pending migration in its OWN transaction, so one
+    #    migration committing is independent of the next.
+    for sql_file in sql_files:
+        # Extract version number from filename prefix, e.g. 001_initial.sql → 1
+        try:
+            version = int(sql_file.stem.split("_")[0])
+        except ValueError:
+            continue
+        if version in applied:
+            continue
 
-            raw_sql = sql_file.read_text(encoding="utf-8")
-            # Strip -- line comments before splitting on ; to avoid
-            # false splits on semicolons inside comment text
-            lines = [
-                line for line in raw_sql.splitlines()
-                if not line.strip().startswith("--")
-            ]
-            sql = "\n".join(lines)
-            for statement in sql.split(";"):
-                stmt = statement.strip()
-                if stmt:
+        with engine.begin() as conn:
+            for stmt in _split_statements(sql_file.read_text(encoding="utf-8")):
+                try:
                     conn.execute(text(stmt))
-
-            print(f"[db] applied migration {sql_file.name}")
+                except OperationalError as exc:
+                    if _is_already_applied(exc):
+                        print(f"[db] {sql_file.name}: already-applied statement skipped "
+                              f"({getattr(exc, 'orig', exc)})")
+                        continue
+                    raise
+            # Record centrally so a fully- or partially-already-applied
+            # migration is stamped done and never retried next launch.
+            conn.execute(
+                text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (:v)"),
+                {"v": version},
+            )
+        print(f"[db] applied migration {sql_file.name}")

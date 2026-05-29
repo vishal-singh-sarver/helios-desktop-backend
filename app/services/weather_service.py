@@ -154,6 +154,33 @@ def _truncate_decimals(vstr: str) -> str:
     return vstr
 
 
+# User-facing message when a request would create two cells for the same
+# (date, time) under one column. PyHelios's addTimeseriesData rejects this
+# with the opaque "Failed to insert timeseries data for unknown reason".
+# We pre-detect the case in validation and use this message instead, both
+# for clarity and to give a 400 (user data issue) instead of a 500.
+_DUPLICATE_DATETIME_MSG = (
+    "Import failed: Duplicate date-time entries detected in the weather "
+    "file. Duplicate data points are not supported. Please try again."
+)
+
+
+def _check_duplicate_timestamps_in_values(values) -> None:
+    """Raise HTTP 400 if `values` contains the same (date, time) twice.
+
+    PyHelios's addTimeseriesData fails on duplicates with an opaque error
+    that surfaces to the user as "Helios error 7: ...Failed to insert
+    timeseries data for unknown reason". Pre-detecting here lets us return
+    the cleaner _DUPLICATE_DATETIME_MSG and a 400 instead of a 500.
+    """
+    seen: set[tuple[str, str]] = set()
+    for v in values:
+        key = (v.date, v.time)
+        if key in seen:
+            raise HTTPException(400, _DUPLICATE_DATETIME_MSG)
+        seen.add(key)
+
+
 # ─── Auto-transform: any-format CSV → standard (date, time, numeric...) ──────
 
 
@@ -332,6 +359,86 @@ def _find_time_column(
     return None
 
 
+# ── Julian (day-of-year) combined-datetime support ───────────────────────────
+#
+# Catalog formats (migration 015): 'YYYY DOY HH:MM' and 'DOY YYYY HH:MM'.
+# Both layouts encode (year, day-of-year, time) in a single whitespace-split
+# cell. The 4-digit-year rule disambiguates which token is which, so both
+# layouts share one parser. Cells are normalized to canonical date + time
+# columns just like the standard datetime path — PyHelios never sees the
+# Julian shape.
+
+
+def _parse_julian_datetime(s: str) -> tuple[datetime, bool]:
+    """Parse a Julian (day-of-year) combined datetime — accepts either
+    'YYYY DOY HH:MM' or 'DOY YYYY HH:MM' layout (HH:MM:SS also accepted).
+
+    Returns (datetime, rollover). `rollover` is True for the 24:00 end-of-day
+    convention, matching `_parse_datetime`'s contract.
+
+    Year must be 4 digits; DOY is 1-3 digits in [1, 366]. Token order is
+    inferred from which token is 4 digits, so a single parser covers both
+    catalog formats. DOY 366 is only valid in leap years.
+    """
+    s = s.strip()
+    parts = s.split()
+    if len(parts) != 3:
+        raise ValueError(f"could not parse Julian datetime '{s}'")
+
+    year = doy = time_str = None
+    for p in parts:
+        if ":" in p:
+            time_str = p
+        elif p.isdigit() and len(p) == 4:
+            year = int(p)
+        elif p.isdigit() and 1 <= len(p) <= 3:
+            doy = int(p)
+
+    if year is None or doy is None or time_str is None:
+        raise ValueError(f"could not parse Julian datetime '{s}'")
+
+    if not (1900 <= year <= 2100):
+        raise ValueError(f"Julian year {year} out of supported range (1900-2100)")
+    if not (1 <= doy <= 366):
+        raise ValueError(f"Julian DOY {doy} must be in 1-366")
+
+    h, m, sec, rollover = _parse_time(time_str)
+
+    base = datetime(year, 1, 1, h, m, sec)
+    result = base + timedelta(days=doy - 1)
+    # DOY 366 in a non-leap year would roll into the next year — reject.
+    if result.year != year:
+        raise ValueError(
+            f"Julian DOY {doy} invalid for year {year} (not a leap year)"
+        )
+    return result, rollover
+
+
+def _looks_like_julian_datetime(values: list[str]) -> bool:
+    for v in values[:10]:
+        if v.strip():
+            try:
+                _parse_julian_datetime(v)
+                return True
+            except ValueError:
+                return False
+    return False
+
+
+def _find_julian_datetime_column(
+    header: list[str], data_rows: list[list[str]]
+) -> int | None:
+    for i, h in enumerate(header):
+        lh = h.lower()
+        if "julian" in lh or "doy" in lh:
+            return i
+    for i in range(len(header)):
+        col_values = [r[i] for r in data_rows if i < len(r)]
+        if _looks_like_julian_datetime(col_values):
+            return i
+    return None
+
+
 def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
     """Take raw CSV bytes in any reasonable format, return (header, rows, truncated_flag) in
     our standard: first column 'date' (YYYY-MM-DD), second 'time' (HH:MM:SS),
@@ -346,9 +453,17 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
     data_rows = rows[1:]
 
     datetime_idx = _find_datetime_column(raw_header, data_rows)
+    julian_idx = (
+        _find_julian_datetime_column(raw_header, data_rows)
+        if datetime_idx is None
+        else None
+    )
     if datetime_idx is not None:
         date_idx = time_idx = datetime_idx
         skip_for_data = {datetime_idx}
+    elif julian_idx is not None:
+        date_idx = time_idx = julian_idx
+        skip_for_data = {julian_idx}
     else:
         date_idx = _find_date_column(raw_header, data_rows)
         if date_idx is None:
@@ -395,6 +510,10 @@ def _transform_csv(raw_bytes: bytes) -> tuple[list[str], list[list[str]], bool]:
         try:
             if datetime_idx is not None:
                 dt, rollover = _parse_datetime(r[datetime_idx])
+                d = dt
+                h, m, sec = dt.hour, dt.minute, dt.second
+            elif julian_idx is not None:
+                dt, rollover = _parse_julian_datetime(r[julian_idx])
                 d = dt
                 h, m, sec = dt.hour, dt.minute, dt.second
             else:
@@ -784,6 +903,11 @@ def add_columns(
             if col.datatype is None and v.value != "" and v.value.upper() != "NAN":
                 _validate_cell_range(float(v.value), col.name, f"column[{i}].values[{j}]")
 
+        # Reject duplicate (date, time) pairs within this column's values
+        # before PyHelios's addTimeseriesData can fail on them with an
+        # opaque "unknown reason" error.
+        _check_duplicate_timestamps_in_values(col.values)
+
         if _has_excess_decimals(col.default_value):
             raise HTTPException(
                 400,
@@ -873,6 +997,12 @@ def add_columns(
     except Exception as exc:
         db.rollback()
         _cleanup_pyhelios_cells(ctx, written_cells)
+        msg = str(exc)
+        # PyHelios's addTimeseriesData rejects duplicates with an opaque
+        # "Failed to insert timeseries data for unknown reason". Translate
+        # to the user-facing message and 400 (it's a data issue, not a 500).
+        if "addTimeseriesData" in msg and "Failed to insert" in msg:
+            raise HTTPException(400, _DUPLICATE_DATETIME_MSG)
         raise HTTPException(500, f"Failed to add columns: {exc}")
 
     return {"success": True, "columns": created_columns}
@@ -970,6 +1100,11 @@ def update_columns(
         if final_dt is None and v.value != "" and v.value.upper() != "NAN":
             _validate_cell_range(float(v.value), existing.name, f"values[{j}]")
 
+    # Reject duplicate (date, time) pairs within the column's values
+    # before PyHelios's addTimeseriesData fails on them with an opaque
+    # "unknown reason" error.
+    _check_duplicate_timestamps_in_values(column.values)
+
     if _has_excess_decimals(column.default_value):
         raise HTTPException(
             400,
@@ -1064,6 +1199,9 @@ def update_columns(
     except Exception as exc:
         db.rollback()
         _cleanup_pyhelios_cells(ctx, written_cells)
+        msg = str(exc)
+        if "addTimeseriesData" in msg and "Failed to insert" in msg:
+            raise HTTPException(400, _DUPLICATE_DATETIME_MSG)
         raise HTTPException(500, f"Failed to update column: {exc}")
 
     return {"success": True, "columns": [updated_column]}

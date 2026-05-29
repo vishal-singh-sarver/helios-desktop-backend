@@ -1316,6 +1316,29 @@ def test_addcol_default_value_non_numeric_returns_422(client):
     assert r.status_code == 422
 
 
+def test_addcol_duplicate_date_time_returns_400_with_friendly_message(client):
+    """A column with two cells at the same (date, time) used to surface
+    PyHelios's opaque 'Failed to insert timeseries data for unknown reason'
+    wrapped in a 500. We now pre-detect and return a 400 with a clean
+    user-facing message."""
+    sid, pid, scn = _make_project(client)
+    r = client.post(
+        _url(pid, scn, "addCol"),
+        headers=_session_headers(sid),
+        json={"column": [{
+            "name": "temperature",
+            "values": [
+                {"date": "2026-05-21", "time": "10:00:00", "value": "20"},
+                {"date": "2026-05-21", "time": "10:00:00", "value": "22"},
+            ],
+        }]},
+    )
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"].lower()
+    assert "duplicate" in detail
+    assert "date-time" in detail
+
+
 # ─────────────────────────── PATCH /updateCol ────────────────────────────────
 
 
@@ -1912,3 +1935,93 @@ def test_update_col_renames_column_via_id(client):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["columns"][0]["name"] == "Renamed_Column"
+
+
+# ─────────────────────────── Julian (DOY) datetime upload ────────────────────
+#
+# Migration 015 catalogued 'YYYY DOY HH:MM' and 'DOY YYYY HH:MM'. The parser
+# in _transform_csv recognizes either layout in a single whitespace-split cell
+# and normalizes to canonical date + time columns.
+
+
+def test_upload_julian_year_first_csv(client):
+    """'YYYY DOY HH:MM' layout normalizes to canonical date+time."""
+    sid, pid, scn = _make_project(client)
+    # 2026 is not a leap year — DOY 142 = May 22.
+    csv_content = b"Julian,Air Temp\n2026 142 14:30,25.5\n2026 143 15:00,26.0\n"
+    r = client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("julian.csv", csv_content, "text/csv")},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    rows = r.json()["rows"]
+    dates = sorted(row["date"] for row in rows)
+    assert dates == ["2026-05-22", "2026-05-23"]
+
+
+def test_upload_julian_doy_first_csv(client):
+    """'DOY YYYY HH:MM' layout parses to the same calendar date."""
+    sid, pid, scn = _make_project(client)
+    csv_content = b"DOY,Air Temp\n142 2026 14:30,25.5\n"
+    r = client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("julian.csv", csv_content, "text/csv")},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    rows = r.json()["rows"]
+    assert rows[0]["date"] == "2026-05-22"
+    assert rows[0]["time"] == "14:30:00"
+
+
+def test_upload_julian_leap_year_doy_366(client):
+    """DOY 366 is valid in a leap year (2024 → 2024-12-31)."""
+    sid, pid, scn = _make_project(client)
+    csv_content = b"Julian,Air Temp\n2024 366 12:00,20.0\n"
+    r = client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("julian.csv", csv_content, "text/csv")},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(
+        _url(pid, scn, "getAllTimeSeriesData"),
+        headers=_session_headers(sid),
+    )
+    assert r.json()["rows"][0]["date"] == "2024-12-31"
+
+
+def test_upload_julian_doy_366_non_leap_returns_400(client):
+    """DOY 366 in a non-leap year (2025) is rejected."""
+    sid, pid, scn = _make_project(client)
+    csv_content = b"Julian,Air Temp\n2025 366 12:00,20.0\n"
+    r = client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("julian.csv", csv_content, "text/csv")},
+    )
+    assert r.status_code == 400
+
+
+def test_upload_julian_invalid_doy_zero_returns_400(client):
+    """DOY must be >= 1; 0 is rejected."""
+    sid, pid, scn = _make_project(client)
+    csv_content = b"Julian,Air Temp\n2026 0 12:00,20.0\n"
+    r = client.post(
+        _url(pid, scn, "uploadfile"),
+        headers=_session_headers(sid),
+        files={"file": ("julian.csv", csv_content, "text/csv")},
+    )
+    assert r.status_code == 400

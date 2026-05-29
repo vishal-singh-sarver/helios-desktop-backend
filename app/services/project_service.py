@@ -136,6 +136,31 @@ def get_project_with_scenarios(
     }
 
 
+def _project_disk_size(project_id: str) -> int:
+    """Total bytes on disk for a project: the sum of every file under its
+    nested folder (scenario context XMLs, weather CSVs, autosave archives).
+
+    Replaces the old single-file `current.xml.gz` lookup, which was dropped
+    when project-level autosave was removed — so the old code always
+    reported 0.
+
+    Returns 0 when the folder doesn't exist yet (a project with nothing
+    persisted). Per-file errors are skipped so a transient lock or a
+    vanished file can't break the whole recent-projects listing.
+    """
+    proj_dir = settings.resolved_projects_dir / project_id
+    if not proj_dir.exists():
+        return 0
+    total = 0
+    for entry in proj_dir.rglob("*"):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 def list_recent_projects(session_id: str, db: Session) -> dict:
     projects = (
         db.query(Project)
@@ -146,13 +171,11 @@ def list_recent_projects(session_id: str, db: Session) -> dict:
 
     recent = []
     for project in projects:
-        snapshot_path = settings.resolved_projects_dir / project.id / "current.xml.gz"
-        project_size = snapshot_path.stat().st_size if snapshot_path.exists() else 0
         recent.append({
             "id": project.id,
             "name": project.name,
             "last_updated": project.updated_at,
-            "size": project_size,
+            "size": _project_disk_size(project.id),
         })
 
     return {"projects": recent}

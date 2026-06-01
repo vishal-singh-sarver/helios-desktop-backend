@@ -851,7 +851,7 @@ def add_columns(
         if col.datatype is not None:
             if db.get(HeliosDataType, col.datatype) is None:
                 raise HTTPException(
-                    404, f"column[{i}]: datatype {col.datatype} not found"
+                    404, f"datatype {col.datatype} not found"
                 )
 
         # 4d — data_unit FK (and fetch it for the consistency check)

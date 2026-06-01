@@ -837,14 +837,14 @@ def add_columns(
         # 4a — reserved name
         if col.name in ("date", "time"):
             raise HTTPException(
-                400, f"column[{i}]: name '{col.name}' is reserved"
+                400, f"name '{col.name}' is reserved"
             )
 
         # 4b — UNIQUE(scenario_id, name)
         if col.name in existing_header_names:
             raise HTTPException(
                 409,
-                f"column[{i}]: name '{col.name}' already exists in scenario",
+                f"name '{col.name}' already exists in scenario",
             )
 
         # 4c — datatype FK
@@ -861,7 +861,7 @@ def add_columns(
             if unit_row is None:
                 raise HTTPException(
                     404,
-                    f"column[{i}]: data_unit {col.data_unit} not found",
+                    f"data_unit {col.data_unit} not found",
                 )
 
         # 4e — unit/type consistency
@@ -869,7 +869,7 @@ def add_columns(
             if unit_row.data_type_id != col.datatype:
                 raise HTTPException(
                     400,
-                    f"column[{i}]: unit '{unit_row.unit}' belongs to "
+                    f"unit '{unit_row.unit}' belongs to "
                     f"data_type {unit_row.data_type_id}, not {col.datatype}",
                 )
 

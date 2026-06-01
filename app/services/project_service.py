@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from fastapi import HTTPException
 import shutil
+from datetime import datetime, timezone
 
 from app.db.models import Project, Scenario, WeatherDataHeader
 from app.core.timezone import utc_offset_from_coords
@@ -136,47 +137,63 @@ def get_project_with_scenarios(
     }
 
 
-def _project_disk_size(project_id: str) -> int:
-    """Total bytes on disk for a project: the sum of every file under its
-    nested folder (scenario context XMLs, weather CSVs, autosave archives).
+def _project_disk_stats(project_id: str) -> tuple[int, float | None]:
+    """Single walk over data/projects/<id>/: returns (total_bytes, latest_mtime).
 
-    Replaces the old single-file `current.xml.gz` lookup, which was dropped
-    when project-level autosave was removed — so the old code always
-    reported 0.
+    `total_bytes` is the sum of every file size under the project tree
+    (scenario context XMLs, weather CSVs, autosave archives). `latest_mtime`
+    is the newest file mtime in the tree as a POSIX timestamp, or None when
+    the folder is missing or has no files yet — a fresh project before its
+    first autosave.
 
-    Returns 0 when the folder doesn't exist yet (a project with nothing
-    persisted). Per-file errors are skipped so a transient lock or a
-    vanished file can't break the whole recent-projects listing.
+    Per-file errors are skipped so a transient lock or a vanished file
+    can't break the whole recent-projects listing.
     """
     proj_dir = settings.resolved_projects_dir / project_id
     if not proj_dir.exists():
-        return 0
+        return 0, None
     total = 0
+    latest = 0.0
     for entry in proj_dir.rglob("*"):
         try:
             if entry.is_file():
-                total += entry.stat().st_size
+                st = entry.stat()
+                total += st.st_size
+                if st.st_mtime > latest:
+                    latest = st.st_mtime
         except OSError:
             continue
-    return total
+    return total, (latest if latest > 0.0 else None)
 
 
 def list_recent_projects(session_id: str, db: Session) -> dict:
     projects = (
         db.query(Project)
         .filter(Project.session_id == session_id)
-        .order_by(Project.updated_at.desc())
         .all()
     )
 
     recent = []
     for project in projects:
+        size, fs_mtime = _project_disk_stats(project.id)
+        # Take the later of DB-tracked updated_at (rename / lat-long edit /
+        # save_version) and filesystem mtime (scenario/weather autosaves).
+        # ISO 8601 UTC strings compare lexicographically.
+        last_updated = project.updated_at
+        if fs_mtime is not None:
+            fs_iso = datetime.fromtimestamp(fs_mtime, tz=timezone.utc).isoformat()
+            if fs_iso > last_updated:
+                last_updated = fs_iso
         recent.append({
             "id": project.id,
             "name": project.name,
-            "last_updated": project.updated_at,
-            "size": _project_disk_size(project.id),
+            "last_updated": last_updated,
+            "size": size,
         })
+
+    # Sort by the derived last_updated (DESC) so ordering matches what the
+    # user sees, not the stale DB column. ISO 8601 UTC sorts lexicographically.
+    recent.sort(key=lambda p: p["last_updated"], reverse=True)
 
     return {"projects": recent}
 

@@ -261,13 +261,13 @@ def _by_name(client) -> dict[str, dict]:
 
 def test_default_data_types_seeded(client):
     """All 9 weather parameters from the design doc are present.
-    Names match the doc's "Key used" column — snake_case for the seven
-    that have a key, Title Case for the two radiation types where the
-    doc leaves "Key used" empty."""
+    All names are snake_case after migration 016 renamed the two radiation
+    entries (the doc left their "Key used" column empty, so the snake_case
+    keys were chosen to match the rest of the catalog)."""
     by_name = _by_name(client)
     expected = {
-        "Direct Normal Radiation",
-        "Diffuse Horizontal Radiation",
+        "direct_horizontal_radiation_flux",
+        "diffuse_horizontal_radiation_flux",
         "air_temperature",
         "air_pressure",
         "air_humidity",
@@ -284,7 +284,7 @@ def test_each_default_type_has_exactly_one_base_unit(client):
     the seed data didn't somehow ship with zero or multiple bases."""
     by_name = _by_name(client)
     for type_name in (
-        "Direct Normal Radiation", "Diffuse Horizontal Radiation",
+        "direct_horizontal_radiation_flux", "diffuse_horizontal_radiation_flux",
         "air_temperature", "air_pressure", "air_humidity", "wind_speed",
         "turbidity", "beta_soil", "air_CO2",
     ):

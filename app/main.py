@@ -19,6 +19,9 @@ from app.routers import (
     scripting,
     helios_data_type,
     data_unit,
+    catalog,
+    scene_objects,
+    material_library,
 )
 
 app = FastAPI(
@@ -60,3 +63,8 @@ app.include_router(import_export.router, prefix="/api",            tags=["import
 app.include_router(scripting.router,     prefix="/api/script",     tags=["scripting"])
 app.include_router(helios_data_type.router, prefix="/api/data-types", tags=["catalog"])
 app.include_router(data_unit.router,        prefix="/api/data-units", tags=["catalog"])
+# Milestone 2 — persisted geometry, material library, assignment (spec in
+# helios_gui repo: docs/api/milestone-2-materials-geometry.md)
+app.include_router(catalog.router,          prefix="/api/catalog",    tags=["m2-catalog"])
+app.include_router(scene_objects.router,    prefix="/api/geometry",   tags=["m2-geometry"])
+app.include_router(material_library.router, prefix="/api/materials",  tags=["m2-materials"])

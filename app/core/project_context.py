@@ -32,6 +32,11 @@ class ProjectContext:
         "gpu_geometry_cache",
         "gpu_children_cache",
         "script_object_counter",
+        # Persisted scene objects (milestone 2) — DB row id → runtime
+        # registry object_id, and which scenarios have been hydrated
+        # from the DB into this context since startup/reset.
+        "persisted_objects",
+        "hydrated_scenarios",
     )
 
     def __init__(self, project_id: str):
@@ -47,6 +52,8 @@ class ProjectContext:
         self.gpu_geometry_cache = {}
         self.gpu_children_cache = {}
         self.script_object_counter = 0
+        self.persisted_objects = {}
+        self.hydrated_scenarios = set()
 
     def reset(self):
         """Wipe all state for a fresh load. Old C++ context gets GC'd."""
@@ -61,3 +68,5 @@ class ProjectContext:
         self.gpu_geometry_cache = {}
         self.gpu_children_cache = {}
         self.script_object_counter = 0
+        self.persisted_objects = {}
+        self.hydrated_scenarios = set()

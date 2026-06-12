@@ -5,8 +5,7 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column, Integer, Text, Float, LargeBinary,
-    ForeignKey, UniqueConstraint, Index,
-    func,
+    ForeignKey, ForeignKeyConstraint, UniqueConstraint, Index,
 )
 from app.db.database import Base
 
@@ -156,5 +155,286 @@ class WeatherDataHeader(Base):
     name                = Column(Text, nullable=False)
     status              = Column(Integer, nullable=False, default=1)
     display_order       = Column(Integer, nullable=False, default=0)
+    created_at          = Column(Text, nullable=False, default=_now)
+    updated_at          = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+# ── Milestone 2: Materials & Geometry persistence (migration 017) ────────────
+# Spec: docs/api/milestone-2-materials-geometry.md in the parent helios_gui
+# repo. The migration SQL is authoritative; these classes mirror it.
+# Name columns are COLLATE NOCASE in the DDL — case-insensitive uniqueness
+# comes from the schema, not from these mappings.
+
+
+class Datatype(Base):
+    """Catalog: a value type (float, integer, boolean, string, date, time, file, enum)."""
+    __tablename__ = "datatype"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    name       = Column(Text, nullable=False, unique=True)
+    created_at = Column(Text, nullable=False, default=_now)
+    updated_at = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class PropertyType(Base):
+    """Catalog: one named property shared across object/material types."""
+    __tablename__ = "property_type"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    property    = Column(Text, nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    datatype_id = Column(Integer, ForeignKey("datatype.id", ondelete="RESTRICT"), nullable=False)
+    min         = Column(Float, nullable=True)
+    max         = Column(Float, nullable=True)
+    enum_values = Column(Text, nullable=True)   # JSON array of allowed tokens
+    created_at  = Column(Text, nullable=False, default=_now)
+    updated_at  = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ObjectType(Base):
+    """Catalog: a geometry kind (Ground, Crop)."""
+    __tablename__ = "object_types"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    object     = Column(Text, nullable=False, unique=True)
+    created_at = Column(Text, nullable=False, default=_now)
+    updated_at = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ObjectPropertyType(Base):
+    """Catalog M:N: which properties an object type has (+ range narrowing)."""
+    __tablename__ = "object_property_type"
+    __table_args__ = (
+        UniqueConstraint("object_type_id", "property_type_id"),
+    )
+
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    object_type_id   = Column(Integer, ForeignKey("object_types.id", ondelete="CASCADE"), nullable=False)
+    property_type_id = Column(Integer, ForeignKey("property_type.id", ondelete="CASCADE"), nullable=False)
+    min_override     = Column(Float, nullable=True)
+    max_override     = Column(Float, nullable=True)
+    display_order    = Column(Integer, nullable=False, default=0)
+
+
+class ObjectGroup(Base):
+    """Geometry tree group. Deleting a group SET NULLs its members."""
+    __tablename__ = "object_group"
+    __table_args__ = (
+        Index("idx_object_group_project_name_ci", "project_id", "name", unique=True),
+    )
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    scenario_id = Column(Text, ForeignKey("scenarios.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id  = Column(Text, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    name        = Column(Text, nullable=False)
+    created_at  = Column(Text, nullable=False, default=_now)
+    updated_at  = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ScenarioObject(Base):
+    """A persisted geometry instance (e.g. one Ground), scenario-scoped.
+
+    project_id is denormalized from scenarios so the per-PROJECT
+    case-insensitive name uniqueness is a real DB constraint.
+    helios_uuids holds the live PyHelios primitive UUIDs (JSON array) —
+    rewritten on every build/rebuild; session-scoped, never trusted
+    across a restart without hydration.
+    """
+    __tablename__ = "scenario_object"
+    __table_args__ = (
+        Index("idx_scenario_object_project_name_ci", "project_id", "name", unique=True),
+    )
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    scenario_id    = Column(Text, ForeignKey("scenarios.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id     = Column(Text, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    name           = Column(Text, nullable=False)
+    object_type_id = Column(Integer, ForeignKey("object_types.id", ondelete="RESTRICT"), nullable=False)
+    group_id       = Column(Integer, ForeignKey("object_group.id", ondelete="SET NULL"), nullable=True, index=True)
+    helios_uuids   = Column(Text, nullable=False, default="[]")   # JSON
+    visible        = Column(Integer, nullable=False, default=1)   # eye icon (3D viewport)
+    render_enabled = Column(Integer, nullable=False, default=1)   # render icon (all models)
+    created_at     = Column(Text, nullable=False, default=_now)
+    updated_at     = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ModelType(Base):
+    """Catalog: a runnable simulation model (Radiation, Energy Balance, ...).
+
+    Hierarchical — parent_id NULL marks a top-level model, otherwise the
+    row is a submodel (e.g. Stomatal Conductance → Ball-Woodrow-Berry).
+    Distinct from MaterialType (parameter groups) even though the
+    top-level models correspond 1:1 to the six groups today.
+    """
+    __tablename__ = "model_type"
+    __table_args__ = (
+        UniqueConstraint("model", "parent_id"),
+        Index(
+            "idx_model_type_toplevel_name_ci",
+            "model",
+            unique=True,
+            sqlite_where=Column("parent_id").is_(None),
+        ),
+    )
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    model       = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    parent_id   = Column(Integer, ForeignKey("model_type.id", ondelete="CASCADE"), nullable=True, index=True)
+    created_at  = Column(Text, nullable=False, default=_now)
+    updated_at  = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ScenarioObjectModel(Base):
+    """Per-GEOMETRY model participation: which models USE this geometry.
+    Absent row = enabled; only explicit settings are stored."""
+    __tablename__ = "scenario_object_model"
+
+    scenario_object_id = Column(Integer, ForeignKey("scenario_object.id", ondelete="CASCADE"), primary_key=True)
+    model_type_id      = Column(Integer, ForeignKey("model_type.id", ondelete="RESTRICT"), primary_key=True)
+    enabled            = Column(Integer, nullable=False, default=1)
+    created_at         = Column(Text, nullable=False, default=_now)
+    updated_at         = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ScenarioModel(Base):
+    """Per-SCENARIO run configuration: which models RUN on the Run button.
+    Absent row = enabled; only explicit settings are stored."""
+    __tablename__ = "scenario_model"
+
+    scenario_id   = Column(Text, ForeignKey("scenarios.id", ondelete="CASCADE"), primary_key=True)
+    model_type_id = Column(Integer, ForeignKey("model_type.id", ondelete="RESTRICT"), primary_key=True)
+    enabled       = Column(Integer, nullable=False, default=1)
+    created_at    = Column(Text, nullable=False, default=_now)
+    updated_at    = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class MaterialType(Base):
+    """Catalog: a model parameter group (Radiation, Energy Balance, ...)."""
+    __tablename__ = "material_type"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    materialtype = Column(Text, nullable=False, unique=True)
+    description  = Column(Text, nullable=True)
+    created_at   = Column(Text, nullable=False, default=_now)
+    updated_at   = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class MaterialPropertyType(Base):
+    """Catalog M:N: which properties a material type has (+ range narrowing)."""
+    __tablename__ = "material_property_type"
+    __table_args__ = (
+        UniqueConstraint("material_type_id", "property_type_id"),
+    )
+
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    material_type_id = Column(Integer, ForeignKey("material_type.id", ondelete="CASCADE"), nullable=False)
+    property_type_id = Column(Integer, ForeignKey("property_type.id", ondelete="CASCADE"), nullable=False)
+    min_override     = Column(Float, nullable=True)
+    max_override     = Column(Float, nullable=True)
+    display_order    = Column(Integer, nullable=False, default=0)
+
+
+class ProjectMaterial(Base):
+    """A material instance in the project library — exactly one material type.
+
+    UNIQUE(id, material_type_id) exists solely as the target of
+    object_material's composite FK, making the denormalized type on the
+    assignment provably consistent. scenario_id is reserved for future use.
+    """
+    __tablename__ = "project_material"
+    __table_args__ = (
+        UniqueConstraint("id", "material_type_id"),
+        Index("idx_project_material_project_name_ci", "project_id", "name", unique=True),
+    )
+
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    project_id       = Column(Text, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    scenario_id      = Column(Text, ForeignKey("scenarios.id", ondelete="SET NULL"), nullable=True)
+    material_type_id = Column(Integer, ForeignKey("material_type.id", ondelete="RESTRICT"), nullable=False)
+    name             = Column(Text, nullable=False)
+    created_at       = Column(Text, nullable=False, default=_now)
+    updated_at       = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class MaterialData(Base):
+    """The library material's own property values (one row per property)."""
+    __tablename__ = "material_data"
+    __table_args__ = (
+        UniqueConstraint("project_material_id", "property_type_id"),
+    )
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    project_material_id = Column(Integer, ForeignKey("project_material.id", ondelete="CASCADE"), nullable=False, index=True)
+    property_type_id    = Column(Integer, ForeignKey("property_type.id", ondelete="RESTRICT"), nullable=False)
+    value               = Column(Text, nullable=True)
+    created_at          = Column(Text, nullable=False, default=_now)
+    updated_at          = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ObjectMaterial(Base):
+    """Assignment of a library material to a geometry (+ sync flag).
+
+    sync=1 → the geometry follows the library values live.
+    sync=0 → frozen: per-geometry values live in object_property_data.
+    UNIQUE(scenario_object_id, material_type_id) = one material per type
+    per geometry; the composite FK keeps the denormalized type honest.
+    """
+    __tablename__ = "object_material"
+    __table_args__ = (
+        UniqueConstraint("scenario_object_id", "material_type_id"),
+        ForeignKeyConstraint(
+            ["project_material_id", "material_type_id"],
+            ["project_material.id", "project_material.material_type_id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+    scenario_object_id  = Column(Integer, ForeignKey("scenario_object.id", ondelete="CASCADE"), primary_key=True)
+    project_material_id = Column(Integer, primary_key=True)
+    material_type_id    = Column(Integer, ForeignKey("material_type.id", ondelete="RESTRICT"), nullable=False)
+    sync                = Column(Integer, nullable=False, default=1)
+    created_at          = Column(Text, nullable=False, default=_now)
+    updated_at          = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ObjectPropertyData(Base):
+    """Merged per-geometry value table.
+
+    project_material_id IS NULL     → intrinsic geometry parameter
+                                      (length, breadth, position, ...).
+    project_material_id IS NOT NULL → frozen material value for that
+                                      assignment (sync=0).
+    Uniqueness is enforced by two partial unique indexes because SQLite
+    treats NULLs as distinct in a plain UNIQUE. The composite FK to
+    object_material is skipped by SQLite when project_material_id is NULL,
+    so intrinsic rows are exempt while frozen rows cascade on unassign.
+    """
+    __tablename__ = "object_property_data"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["scenario_object_id", "project_material_id"],
+            ["object_material.scenario_object_id", "object_material.project_material_id"],
+            ondelete="CASCADE",
+        ),
+        Index(
+            "idx_opd_intrinsic",
+            "scenario_object_id", "property_type_id",
+            unique=True,
+            sqlite_where=Column("project_material_id").is_(None),
+        ),
+        Index(
+            "idx_opd_frozen",
+            "scenario_object_id", "project_material_id", "property_type_id",
+            unique=True,
+            sqlite_where=Column("project_material_id").isnot(None),
+        ),
+    )
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    scenario_object_id  = Column(Integer, ForeignKey("scenario_object.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_material_id = Column(Integer, nullable=True)
+    property_type_id    = Column(Integer, ForeignKey("property_type.id", ondelete="RESTRICT"), nullable=False)
+    value               = Column(Text, nullable=True)
     created_at          = Column(Text, nullable=False, default=_now)
     updated_at          = Column(Text, nullable=False, default=_now, onupdate=_now)

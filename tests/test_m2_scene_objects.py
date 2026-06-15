@@ -242,33 +242,47 @@ def test_per_geometry_model_visibility(client):
     }, headers=h).json()["object"]
     assert obj["visibility"]["models"][rad] is False
     assert obj["visibility"]["models"][photo] is True
+    # render = OR(models): one model off, others on ⇒ render stays on.
+    assert obj["visibility"]["render"] is True
 
-    # Partial merge: disabling another model keeps the first setting
-    r = client.patch(_base(pid, sid) + f"/objects/{obj['id']}",
-                     json={"visibility": {"render": False, "models": {photo: False}}},
-                     headers=h)
+    oid = obj["id"]
+
+    def _vis():
+        return client.get(_base(pid, sid) + f"/objects/{oid}",
+                          headers=h).json()["object"]["visibility"]
+
+    # render=False is the master switch → ALL models off, render off.
+    r = client.patch(_base(pid, sid) + f"/objects/{oid}",
+                     json={"visibility": {"render": False}}, headers=h)
     vis = r.json()["object"]["visibility"]
     assert vis["render"] is False
-    assert vis["models"][rad] is False and vis["models"][photo] is False
+    assert all(v is False for v in vis["models"].values())
 
-    # Re-enable → exception row removed, reads enabled again
-    r = client.patch(_base(pid, sid) + f"/objects/{obj['id']}",
+    # Enabling any one model flips render back on (render = OR of models).
+    r = client.patch(_base(pid, sid) + f"/objects/{oid}",
                      json={"visibility": {"models": {rad: True}}}, headers=h)
-    assert r.json()["object"]["visibility"]["models"][rad] is True
+    vis = r.json()["object"]["visibility"]
+    assert vis["models"][rad] is True and vis["models"][photo] is False
+    assert vis["render"] is True
 
-    # Unknown model id → 404 with the catalog code
-    r = client.patch(_base(pid, sid) + f"/objects/{obj['id']}",
+    # render=True is the master switch → ALL models on.
+    r = client.patch(_base(pid, sid) + f"/objects/{oid}",
+                     json={"visibility": {"render": True}}, headers=h)
+    vis = r.json()["object"]["visibility"]
+    assert vis["render"] is True
+    assert all(v is True for v in vis["models"].values())
+
+    # Unknown model id → 404 with the catalog code (no state change).
+    r = client.patch(_base(pid, sid) + f"/objects/{oid}",
                      json={"visibility": {"models": {"99999": False}}}, headers=h)
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "MODEL_TYPE_NOT_FOUND"
 
-    # Visibility survives a simulated restart (fresh in-memory context):
-    # flags come from the DB, not the registry.
+    # State survives a simulated restart (flags come from the DB, not registry).
     from app.core.session_store import registry as session_registry
     session_registry.get_or_create_context(session_id, pid).reset()
-    r = client.get(_base(pid, sid) + f"/objects/{obj['id']}", headers=h)
-    vis = r.json()["object"]["visibility"]
-    assert vis["render"] is False and vis["models"][photo] is False
+    vis = _vis()
+    assert vis["render"] is True and all(v is True for v in vis["models"].values())
 
 
 def test_scenario_run_configuration(client):
@@ -404,25 +418,39 @@ def test_group_bulk_visibility_and_delete(client):
                       json={"member_ids": [o1["id"], o2["id"]]}, headers=h).json()["group"]
     gid = grp["id"]
 
+    rad = str(_model_ids(client)["Radiation"])
+
     def _vis(oid):
         return client.get(_base(pid, sid) + f"/objects/{oid}", headers=h).json()["object"]["visibility"]
 
-    # Bulk viewport off for the whole group.
+    # Bulk viewport off for the whole group (render untouched).
     r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility",
-                     json={"viewport": False}, headers=h)
+                     json={"visibility": {"viewport": False}}, headers=h)
     assert r.status_code == 200, r.text
     assert set(r.json()["member_ids"]) == {o1["id"], o2["id"]}
     assert _vis(o1["id"])["viewport"] is False and _vis(o2["id"])["viewport"] is False
-    assert _vis(o1["id"])["render"] is True   # render untouched
+    assert _vis(o1["id"])["render"] is True
 
-    # Bulk render off for the whole group.
+    # Bulk render off → master switch: every member render off + all models off.
     r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility",
-                     json={"render": False}, headers=h)
+                     json={"visibility": {"render": False}}, headers=h)
     assert r.status_code == 200
-    assert _vis(o1["id"])["render"] is False and _vis(o2["id"])["render"] is False
+    for oid in (o1["id"], o2["id"]):
+        v = _vis(oid)
+        assert v["render"] is False
+        assert all(x is False for x in v["models"].values())
 
-    # Empty body rejected.
-    r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility", json={}, headers=h)
+    # Enabling one model for the group flips render back on for every member.
+    r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility",
+                     json={"visibility": {"models": {rad: True}}}, headers=h)
+    assert r.status_code == 200
+    for oid in (o1["id"], o2["id"]):
+        v = _vis(oid)
+        assert v["models"][rad] is True and v["render"] is True
+
+    # Empty visibility object rejected.
+    r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility",
+                     json={"visibility": {}}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "NO_VISIBILITY_FIELDS"
 

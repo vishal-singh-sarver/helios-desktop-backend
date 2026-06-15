@@ -502,32 +502,67 @@ def _parse_models_map(db: Session, models: dict) -> dict[int, bool]:
     return parsed
 
 
-def _apply_visibility(db: Session, so: ScenarioObject, payload: dict) -> None:
-    """Persist a partial visibility update (caller commits).
+def _top_level_model_ids(db: Session) -> list[int]:
+    return [r[0] for r in db.query(ModelType.id).filter(ModelType.parent_id.is_(None)).all()]
 
-    viewport → scenario_object.visible, render → scenario_object.render_enabled,
-    models → scenario_object_model rows (row deleted when set back to True —
-    absent = enabled)."""
-    if not isinstance(payload, dict):
-        raise api_error(400, "DATATYPE_MISMATCH", "visibility must be an object")
-    if "viewport" in payload:
-        if not isinstance(payload["viewport"], bool):
-            raise api_error(400, "DATATYPE_MISMATCH", "visibility.viewport must be a boolean")
-        so.visible = 1 if payload["viewport"] else 0
-    if "render" in payload:
-        if not isinstance(payload["render"], bool):
-            raise api_error(400, "DATATYPE_MISMATCH", "visibility.render must be a boolean")
-        so.render_enabled = 1 if payload["render"] else 0
-    for model_id, enabled in _parse_models_map(db, payload.get("models") or {}).items():
-        row = db.get(ScenarioObjectModel, (so.id, model_id))
+
+def _set_object_models(db: Session, so_id: int, states: dict[int, bool]) -> None:
+    """Per-model participation upsert (absent row = enabled): enabled → delete
+    the disable row; disabled → upsert a ScenarioObjectModel(enabled=0) row."""
+    for model_id, enabled in states.items():
+        row = db.get(ScenarioObjectModel, (so_id, model_id))
         if enabled:
             if row is not None:
                 db.delete(row)
         elif row is None:
-            db.add(ScenarioObjectModel(scenario_object_id=so.id,
+            db.add(ScenarioObjectModel(scenario_object_id=so_id,
                                        model_type_id=model_id, enabled=0))
         else:
             row.enabled = 0
+
+
+def _apply_visibility(db: Session, so: ScenarioObject, payload: dict) -> None:
+    """Persist a partial visibility update (caller commits).
+
+    viewport → scenario_object.visible (independent).
+    render ↔ models are COUPLED — render is the master switch over the top-level
+    models: render=true enables all, render=false disables all; an explicit
+    models map then applies granular overrides; finally render_enabled is
+    recomputed as OR(model states) so it always reflects "any model enabled"."""
+    if not isinstance(payload, dict):
+        raise api_error(400, "DATATYPE_MISMATCH", "visibility must be an object")
+
+    if "viewport" in payload:
+        if not isinstance(payload["viewport"], bool):
+            raise api_error(400, "DATATYPE_MISMATCH", "visibility.viewport must be a boolean")
+        so.visible = 1 if payload["viewport"] else 0
+
+    has_render = "render" in payload
+    if has_render and not isinstance(payload["render"], bool):
+        raise api_error(400, "DATATYPE_MISMATCH", "visibility.render must be a boolean")
+    models = _parse_models_map(db, payload.get("models") or {})
+
+    if not has_render and not models:
+        return    # nothing model-related to apply; render untouched
+
+    top_level = _top_level_model_ids(db)
+    if has_render:
+        # Master switch: enable-all / disable-all across top-level models.
+        _set_object_models(db, so.id, {mid: payload["render"] for mid in top_level})
+    if models:
+        # Granular overrides (applied after the master switch).
+        _set_object_models(db, so.id, models)
+
+    # Recompute render = OR(top-level model states). Flush first so the freshly
+    # written rows are visible to the query.
+    db.flush()
+    disabled = {
+        r[0] for r in db.query(ScenarioObjectModel.model_type_id)
+        .filter(ScenarioObjectModel.scenario_object_id == so.id,
+                ScenarioObjectModel.enabled == 0)
+        .all()
+    }
+    so.render_enabled = 1 if any(mid not in disabled for mid in top_level) else 0
 
 
 def _visibility_of(db: Session, so: ScenarioObject) -> dict:
@@ -1040,28 +1075,25 @@ def _group_members(db: Session, group_id: int) -> list[ScenarioObject]:
 
 def update_group_visibility(db: Session, session_id: str, project_id: str,
                             scenario_id: str, group_id: int, body) -> dict:
-    """Bulk-set viewport and/or render visibility on every member of a group.
-    DB-only, like per-object visibility (the live viewport reads these flags at
-    serialization; nothing in the PyHelios context changes)."""
+    """Bulk-apply a visibility object ({viewport?, render?, models?}) to every
+    member of a group, reusing the per-object writer (so the render↔models
+    master-switch coupling applies identically). DB-only — the live viewport
+    reads these flags at serialization; nothing in the PyHelios context changes."""
     _resolve_scope(db, session_id, project_id, scenario_id)
     _group_or_404(db, scenario_id, group_id)
 
-    payload: dict = {}
-    if body.viewport is not None:
-        payload["viewport"] = body.viewport
-    if body.render is not None:
-        payload["render"] = body.render
-    if not payload:
+    visibility = body.visibility
+    if not visibility:
         raise api_error(400, "NO_VISIBILITY_FIELDS",
-                        "Provide viewport and/or render")
+                        "visibility must contain viewport, render and/or models")
 
     members = _group_members(db, group_id)
     for so in members:
-        _apply_visibility(db, so, payload)   # reuses the per-object writer
+        _apply_visibility(db, so, visibility)   # reuses the per-object writer
         so.updated_at = _now()
     db.commit()
     return {"success": True, "group_id": group_id,
-            "viewport": body.viewport, "render": body.render,
+            "visibility": visibility,
             "member_ids": [so.id for so in members]}
 
 

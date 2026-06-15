@@ -37,10 +37,10 @@ class GroupRenameRequest(BaseModel):
 
 
 class GroupVisibilityRequest(BaseModel):
-    # Bulk-set viewport and/or render for every member of a group. At least one
-    # must be provided (the service rejects an all-omitted body).
-    viewport: Optional[bool] = None
-    render: Optional[bool] = None
+    # Bulk-apply a visibility object ({viewport?, render?, models?}) to every
+    # member of a group — same shape as SceneObjectUpdateRequest.visibility. The
+    # service rejects an empty object.
+    visibility: dict[str, Any] = Field(default_factory=dict)
 
 
 class AssignMaterialRequest(BaseModel):

@@ -77,6 +77,15 @@ def _column_type(conn, table: str, column: str) -> str | None:
     return None
 
 
+def _column_is_nullable(conn, table: str, column: str) -> bool | None:
+    """True/False if the column allows NULL, or None if table/column absent."""
+    rows = conn.execute(text(f'PRAGMA table_info("{table}")')).fetchall()
+    for row in rows:  # cid, name, type, notnull, dflt_value, pk
+        if row[1] == column:
+            return row[3] == 0
+    return None
+
+
 def run_migrations() -> None:
     """
     Apply all .sql migration files in db/migrations/ in version order.
@@ -133,6 +142,16 @@ def run_migrations() -> None:
             conn.execute(text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (10)"))
             applied.add(10)
             print("[db] migration 010 already satisfied (utc_offset is TEXT) — marking applied")
+
+        # 019 rebuilds `project_material` to make project_id nullable (global
+        # materials). The rebuild DROPs the table, whose ON DELETE CASCADE would
+        # fire on a drifted DB that already has the finished shape — re-running it
+        # is destructive. If project_material.project_id is already nullable the
+        # migration is done; stamp it so the rebuild is skipped.
+        if 19 not in applied and _column_is_nullable(conn, "project_material", "project_id") is True:
+            conn.execute(text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (19)"))
+            applied.add(19)
+            print("[db] migration 019 already satisfied (project_material.project_id nullable) — marking applied")
 
     # 2. Apply each pending migration in its OWN transaction, so one
     #    migration committing is independent of the next.

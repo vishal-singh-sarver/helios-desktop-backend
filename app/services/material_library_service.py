@@ -1,11 +1,16 @@
 """
-Persisted project material library (milestone 2, spec §7).
+Global material library (milestone 2, spec §7; materials globalised in
+migration 019).
 
 Each material = exactly one material type (parameter group) + EAV values in
-material_data. Visualisation values (color_r/g/b, texture_file,
-two_sided_heat_transfer) are mirrored onto the material's shared PyHelios
-label pm_{id}, so every SYNCED assignment follows library edits live.
-Frozen assignments use dedicated labels and are never touched from here.
+material_data. Materials are GLOBAL: names are unique across all projects, and a
+material may be assigned to any object regardless of its project/scenario.
+project_id/scenario_id are stored only to record where a material was created
+(both NULL for app-shipped defaults).
+
+Library edits do NOT repaint assigned geometry — assignment is snapshot-on-assign
+(decision #1), so applied values change only on (re)assignment. Deleting a
+material still repaints the geometries that LOSE the assignment.
 """
 from __future__ import annotations
 
@@ -23,10 +28,10 @@ from app.db.models import (
     ObjectMaterial,
     ProjectMaterial,
     PropertyType,
+    Scenario,
     ScenarioObject,
     _now,
 )
-from app.services import material_apply
 from app.services.eav_validation import (
     VISUALISATION_PROPERTIES,
     api_error,
@@ -49,19 +54,17 @@ def _pctx(session_id: str, project_id: str):
     return session_registry.get_or_create_context(session_id, project_id)
 
 
-def _material_or_404(db: Session, project_id: str, material_id: int) -> ProjectMaterial:
-    pm = (
-        db.query(ProjectMaterial)
-        .filter(ProjectMaterial.id == material_id, ProjectMaterial.project_id == project_id)
-        .first()
-    )
+def _material_or_404(db: Session, material_id: int) -> ProjectMaterial:
+    # Materials are GLOBAL — reachable regardless of project (migration 019).
+    pm = db.get(ProjectMaterial, material_id)
     if pm is None:
         raise api_error(404, "MATERIAL_NOT_FOUND", f"Material {material_id} not found")
     return pm
 
 
-def _existing_names_lower(db: Session, project_id: str) -> set[str]:
-    rows = db.query(ProjectMaterial.name).filter(ProjectMaterial.project_id == project_id).all()
+def _existing_names_lower(db: Session) -> set[str]:
+    """All material names (GLOBAL namespace — names are unique everywhere)."""
+    rows = db.query(ProjectMaterial.name).all()
     return {r[0].lower() for r in rows}
 
 
@@ -118,21 +121,12 @@ def _upsert_values(db: Session, material_id: int, canonical: dict[str, str | Non
             row.value = value
 
 
-def _refresh_shared_label(db: Session, session_id: str, project_id: str, pm: ProjectMaterial) -> None:
-    """Push library vis values onto pm_{id} — all synced geometries follow."""
-    pctx = _pctx(session_id, project_id)
-    material_apply.apply_vis_to_label(
-        pctx, material_apply.pm_label(pm.id), material_apply.library_vis_values(db, pm.id)
-    )
-    material_apply.invalidate_geometry_caches(pctx)
-
-
-def _resync_built_objects(db: Session, session_id: str, project_id: str,
-                          object_ids: list[int]) -> None:
-    """Route affected geometries through the assignment-level viewport sync
-    (handles the plain<->textured rebuild rule). Only objects built in THIS
-    session are touched — stored UUIDs are session-scoped, and a post-commit
-    viewport repair must never fail the request."""
+def _repaint_after_delete(db: Session, session_id: str, project_id: str,
+                          object_ids: list[int], material_type_id: int) -> None:
+    """Repaint geometries that LOST a now-deleted material's assignment: clear
+    that type's per-primitive data and re-apply remaining materials (rebuilding
+    if a baked texture went away). Only objects built in THIS session are
+    touched — a post-commit viewport repair must never fail the request."""
     if not object_ids:
         return
     from app.services import scene_object_service
@@ -144,18 +138,10 @@ def _resync_built_objects(db: Session, session_id: str, project_id: str,
         if so is None:
             continue
         try:
-            scene_object_service._sync_viewport(db, pctx, so)
+            scene_object_service._apply_assignment_change(
+                db, pctx, so, cleared_type_id=material_type_id)
         except Exception:
             pass
-
-
-def _synced_object_ids(db: Session, material_id: int) -> list[int]:
-    return [
-        row[0] for row in db.query(ObjectMaterial.scenario_object_id)
-        .filter(ObjectMaterial.project_material_id == material_id,
-                ObjectMaterial.sync == 1)
-        .all()
-    ]
 
 
 # ── Endpoint handlers ────────────────────────────────────────────────────────
@@ -168,7 +154,19 @@ def create_material(db: Session, session_id: str, project_id: str, body) -> dict
         raise api_error(404, "MATERIAL_TYPE_NOT_FOUND",
                         f"material_type_id {body.material_type_id} not found")
 
-    taken = _existing_names_lower(db, project_id)
+    # Record the scenario when a material is created inside one (optional).
+    scenario_id = getattr(body, "scenario_id", None)
+    if scenario_id is not None:
+        scn = (
+            db.query(Scenario)
+            .filter(Scenario.id == scenario_id, Scenario.project_id == project_id)
+            .first()
+        )
+        if scn is None:
+            raise api_error(404, "SCENARIO_NOT_FOUND",
+                            f"Scenario {scenario_id} not found in this project")
+
+    taken = _existing_names_lower(db)   # GLOBAL namespace
     if body.name is None:
         name = next_default_name(taken, _NAME_PREFIX)
     else:
@@ -181,7 +179,8 @@ def create_material(db: Session, session_id: str, project_id: str, body) -> dict
         body.properties, defs, type_label=mt.materialtype, type_kind="material type"
     )
 
-    pm = ProjectMaterial(project_id=project_id, material_type_id=mt.id, name=name)
+    pm = ProjectMaterial(project_id=project_id, scenario_id=scenario_id,
+                         material_type_id=mt.id, name=name)
     db.add(pm)
     try:
         db.flush()
@@ -192,14 +191,15 @@ def create_material(db: Session, session_id: str, project_id: str, body) -> dict
     db.commit()
     db.refresh(pm)
 
-    _refresh_shared_label(db, session_id, project_id, pm)
+    # Snapshot model: library creation does not touch any geometry.
     return {"success": True, "material": serialize_material(db, pm)}
 
 
 def list_materials(db: Session, session_id: str, project_id: str,
                    search: str | None, material_type_id: int | None) -> dict:
     project_or_404(db, session_id, project_id)
-    q = db.query(ProjectMaterial).filter(ProjectMaterial.project_id == project_id)
+    # Materials are GLOBAL — list the whole library (defaults + all projects').
+    q = db.query(ProjectMaterial)
     if material_type_id is not None:
         q = q.filter(ProjectMaterial.material_type_id == material_type_id)
     rows = q.order_by(ProjectMaterial.created_at.desc(), ProjectMaterial.id.desc()).all()
@@ -223,14 +223,14 @@ def list_materials(db: Session, session_id: str, project_id: str,
 
 def get_material(db: Session, session_id: str, project_id: str, material_id: int) -> dict:
     project_or_404(db, session_id, project_id)
-    pm = _material_or_404(db, project_id, material_id)
+    pm = _material_or_404(db, material_id)
     return {"material": serialize_material(db, pm)}
 
 
 def update_material(db: Session, session_id: str, project_id: str,
                     material_id: int, body) -> dict:
     project_or_404(db, session_id, project_id)
-    pm = _material_or_404(db, project_id, material_id)
+    pm = _material_or_404(db, material_id)
     mt = db.get(MaterialType, pm.material_type_id)
     defs = load_type_properties(db, material_type_id=pm.material_type_id)
     canonical = validate_properties(
@@ -241,23 +241,17 @@ def update_material(db: Session, session_id: str, project_id: str,
     db.commit()
     db.refresh(pm)
 
-    if any(name in VISUALISATION_PROPERTIES for name in canonical):
-        # Synced assignments share pm_{id}; frozen labels are untouched.
-        _refresh_shared_label(db, session_id, project_id, pm)
-        if "texture_file" in canonical:
-            # Texture-state changes require the plain<->textured rebuild
-            # check on every synced geometry (spec §12.2 design rule).
-            _resync_built_objects(db, session_id, project_id,
-                                  _synced_object_ids(db, pm.id))
+    # Snapshot model (decision #1): editing the library does NOT repaint already
+    # assigned geometry. Applied values change only on (re)assignment.
     return {"success": True, "material": serialize_material(db, pm)}
 
 
 def rename_material(db: Session, session_id: str, project_id: str,
                     material_id: int, name: str) -> dict:
     project_or_404(db, session_id, project_id)
-    pm = _material_or_404(db, project_id, material_id)
+    pm = _material_or_404(db, material_id)
     new_name = validate_name(name)
-    if new_name.lower() != pm.name.lower() and new_name.lower() in _existing_names_lower(db, project_id):
+    if new_name.lower() != pm.name.lower() and new_name.lower() in _existing_names_lower(db):
         raise api_error(409, "MATERIAL_NAME_EXISTS", "Material name already exists")
     pm.name = new_name
     db.commit()
@@ -268,26 +262,20 @@ def rename_material(db: Session, session_id: str, project_id: str,
 
 def delete_material(db: Session, session_id: str, project_id: str, material_id: int) -> dict:
     project_or_404(db, session_id, project_id)
-    pm = _material_or_404(db, project_id, material_id)
+    pm = _material_or_404(db, material_id)
+    material_type_id = pm.material_type_id
 
     affected_object_ids = [
         row[0] for row in db.query(ObjectMaterial.scenario_object_id)
         .filter(ObjectMaterial.project_material_id == pm.id)
         .all()
     ]
-    frozen_labels = [material_apply.frozen_label(pm.id, oid) for oid in affected_object_ids]
-    shared = material_apply.pm_label(pm.id)
 
-    db.delete(pm)   # cascades material_data + assignments + frozen rows
+    db.delete(pm)   # cascades material_data + assignments + snapshot rows
     db.commit()
 
-    # Repaint (and rebuild plain<->textured where needed) the geometries
-    # built this session, then drop the now-orphaned labels.
-    _resync_built_objects(db, session_id, project_id, affected_object_ids)
-    pctx = _pctx(session_id, project_id)
-    for label in [shared, *frozen_labels]:
-        material_apply.cleanup_label(pctx, label)
-    material_apply.invalidate_geometry_caches(pctx)
+    # Repaint the geometries built this session that lost the assignment.
+    _repaint_after_delete(db, session_id, project_id, affected_object_ids, material_type_id)
 
     return {"success": True, "material_id": material_id,
             "unassigned_from": len(affected_object_ids)}
@@ -295,13 +283,13 @@ def delete_material(db: Session, session_id: str, project_id: str, material_id: 
 
 def next_name(db: Session, session_id: str, project_id: str) -> dict:
     project_or_404(db, session_id, project_id)
-    return {"name": next_default_name(_existing_names_lower(db, project_id), _NAME_PREFIX)}
+    return {"name": next_default_name(_existing_names_lower(db), _NAME_PREFIX)}
 
 
 async def upload_file_property(db: Session, session_id: str, project_id: str,
                                material_id: int, property_name: str, file) -> dict:
     project_or_404(db, session_id, project_id)
-    pm = _material_or_404(db, project_id, material_id)
+    pm = _material_or_404(db, material_id)
     defs = load_type_properties(db, material_type_id=pm.material_type_id)
     prop = defs.get(property_name)
     if prop is None or prop.datatype != "file":
@@ -324,10 +312,7 @@ async def upload_file_property(db: Session, session_id: str, project_id: str,
     db.commit()
     db.refresh(pm)
 
-    if property_name in VISUALISATION_PROPERTIES:
-        _refresh_shared_label(db, session_id, project_id, pm)
-        if property_name == "texture_file":
-            _resync_built_objects(db, session_id, project_id,
-                                  _synced_object_ids(db, pm.id))
+    # Snapshot model: uploading a texture/file to the library does not repaint
+    # assigned geometry until the material is (re)assigned.
     return {"success": True, "property": property_name, "value": value,
             "material": serialize_material(db, pm)}

@@ -36,6 +36,13 @@ class GroupRenameRequest(BaseModel):
     name: str
 
 
+class GroupVisibilityRequest(BaseModel):
+    # Bulk-set viewport and/or render for every member of a group. At least one
+    # must be provided (the service rejects an all-omitted body).
+    viewport: Optional[bool] = None
+    render: Optional[bool] = None
+
+
 class AssignMaterialRequest(BaseModel):
     material_id: int
     sync: bool = True

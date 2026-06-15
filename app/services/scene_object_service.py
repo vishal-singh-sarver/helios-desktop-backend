@@ -5,19 +5,20 @@ DB-first write-through into the per-project PyHelios context:
 
     POST .../objects   one DB transaction (scenario_object + intrinsic
                        object_property_data rows) → in-memory ground build
-                       via the existing createTile methods → UUIDs written
-                       back to scenario_object.helios_uuids.
+                       as a TileObject → object id + UUIDs written back to
+                       scenario_object.ctx_object_id / helios_uuids.
 
-The ground build (spec §12.1):
-    plain    ctx.addTile(center, size, subdiv, color) + rotatePrimitive(z)
-    textured ctx.addTileObject(center, size, rotation, subdiv,
-                               texturefile, texture_repeat)
-selected by whether the appearance-winning assigned material carries a
-texture. Stored UUIDs are session-scoped — `ensure_hydrated` rebuilds a
-scenario's objects after a restart and rewrites the column.
+The ground build (spec §12.1, decision #1): ALWAYS a compound TileObject
+    ctx.addTileObject(center, size, rotation, subdiv,
+                      texturefile?, texture_repeat | color)
+so a stable ctx_object_id exists for in-place edits (translate/rotate/scale/
+subdivision). The winning material's texture (if any) is baked in with the
+intrinsic texture_x/texture_y repeat; a texture change rebuilds the object.
+Stored ctx_object_id/UUIDs are session-scoped — `ensure_hydrated` rebuilds a
+scenario's objects after a restart and rewrites the columns.
 
-Material assignment applies color/texture to the viewport through the
-label scheme in app/services/material_apply.py.
+Material assignment applies color + model properties per-primitive (snapshot
+model) through app/services/material_apply.py.
 
 All PyHelios work degrades to a DB-only operation when the native library
 is unavailable (helios_uuids stays []; getObjectGeometry returns 503).
@@ -108,8 +109,10 @@ def _group_or_404(db: Session, scenario_id: str, group_id: int) -> ObjectGroup:
     return grp
 
 
-def _object_names_lower(db: Session, project_id: str) -> set[str]:
-    rows = db.query(ScenarioObject.name).filter(ScenarioObject.project_id == project_id).all()
+def _object_names_lower(db: Session, scenario_id: str) -> set[str]:
+    """Object names taken within ONE scenario (uniqueness is per-scenario —
+    migration 019; a name may repeat across scenarios of a project)."""
+    rows = db.query(ScenarioObject.name).filter(ScenarioObject.scenario_id == scenario_id).all()
     return {r[0].lower() for r in rows}
 
 
@@ -193,7 +196,10 @@ def _frozen_rows(db: Session, so_id: int, material_id: int) -> list[ObjectProper
 
 
 def _snapshot_frozen(db: Session, so_id: int, material_id: int) -> None:
-    """Copy the material's current library values into frozen rows."""
+    """Copy the material's CURRENT library values into the assignment's snapshot
+    rows (object_property_data). Run for EVERY assignment regardless of sync —
+    these rows are the single source of truth the viewport re-applies from, so
+    later library edits never propagate (decision #1: snapshot-on-assign)."""
     for row in _frozen_rows(db, so_id, material_id):
         db.delete(row)
     db.flush()
@@ -208,7 +214,10 @@ def _snapshot_frozen(db: Session, so_id: int, material_id: int) -> None:
 # ── Viewport build (spec §12.1) ──────────────────────────────────────────────
 
 
-def _winner_effective_texture(db: Session, so: ScenarioObject) -> str | None:
+def _winner_texture_path(db: Session, so: ScenarioObject) -> str | None:
+    """Resolved texture file of the precedence-winning assignment, or None.
+    Texture is baked into the TileObject at build time (PyHelios has no in-place
+    texture/repeat setter), so this drives the rebuild-vs-reapply decision."""
     assignments = (
         db.query(ObjectMaterial)
         .filter(ObjectMaterial.scenario_object_id == so.id)
@@ -217,45 +226,53 @@ def _winner_effective_texture(db: Session, so: ScenarioObject) -> str | None:
     winner = material_apply._winning_assignment(db, assignments)
     if winner is None:
         return None
-    vis = (
-        material_apply.library_vis_values(db, winner.project_material_id)
-        if winner.sync
-        else material_apply.frozen_vis_values(db, so.id, winner.project_material_id)
-    )
-    return vis.get("texture_file")
+    values = material_apply._assignment_snapshot_native(db, so.id, winner.project_material_id)
+    return material_apply.resolve_texture_path(values.get("texture_file"))
 
 
 def _teardown(pctx, so: ScenarioObject) -> None:
-    """Remove the object's primitives + registry entry from the live context."""
-    uuids = json.loads(so.helios_uuids or "[]")
+    """Remove the compound object (and its primitives) + runtime entries from
+    the live context. ctx_object_id on the DB row is cleared (best-effort
+    session cache; never trusted without a persisted_objects membership check)."""
+    ctx_object_id = pctx.ctx_objects.pop(so.id, None)
     obj_id = pctx.persisted_objects.pop(so.id, None)
     if obj_id is not None and obj_id in pctx.registry:
         reg.delete_object(pctx, obj_id)
-    if uuids and helios_ctx.PYHELIOS_AVAILABLE and pctx.context is not None:
+    if helios_ctx.PYHELIOS_AVAILABLE and pctx.context is not None:
         try:
-            pctx.context.deletePrimitive(uuids)
+            if ctx_object_id is not None and pctx.context.doesObjectExist(ctx_object_id):
+                pctx.context.deleteObject(ctx_object_id)
+            else:
+                uuids = json.loads(so.helios_uuids or "[]")
+                if uuids:
+                    pctx.context.deletePrimitive(uuids)
         except Exception:
-            pass    # primitives may already be gone (fresh context)
+            pass    # object/primitives may already be gone (fresh context)
+    so.ctx_object_id = None
     material_apply.invalidate_geometry_caches(pctx)
 
 
 def _build(db: Session, pctx, so: ScenarioObject) -> list[int]:
-    """Build the ground in the live context from its intrinsic properties.
-    Returns the new primitive UUIDs (and persists them on the row).
+    """Build the ground as a TileObject from its intrinsic properties, capture
+    the compound-object id, persist the primitive UUIDs, then apply materials.
+
+    Geometry is ALWAYS a TileObject (decision #1) — even untextured — so a stable
+    ctx_object_id exists for in-place edits. The winning material's texture (if
+    any) is baked in with the intrinsic texture_x/texture_y repeat; color and
+    model properties are applied per-primitive afterward.
 
     On a PyHelios failure the row is left consistent (helios_uuids=[],
-    not registered) and BUILD_FAILED is raised — callers decide whether to
-    compensate (create) or surface it (rebuild); hydration skips and
-    retries later.
-    """
+    ctx_object_id=None, not registered) and BUILD_FAILED is raised — callers
+    decide whether to compensate (create) or surface it (rebuild); hydration
+    skips and retries later."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         so.helios_uuids = "[]"
+        so.ctx_object_id = None
         db.commit()
         return []
 
     props = _intrinsic_native(db, so.id)
-    texture_value = _winner_effective_texture(db, so)
-    texture_path = material_apply.resolve_texture_path(texture_value)
+    texture_path = _winner_texture_path(db, so)
 
     try:
         ctx = helios_ctx.get_context(pctx)
@@ -266,26 +283,26 @@ def _build(db: Session, pctx, so: ScenarioObject) -> list[int]:
                       props.get("position_z") or 0)
         size = vec2(props.get("length") or 1, props.get("breadth") or 1)
         subdiv = int2(int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1))
-        # Both tile builders rotate by -azimuth about z BEFORE translating
-        # to center (in-place spin) — same convention on both paths.
+        # Rotate by azimuth about z (in-place spin) before translating to center.
         rotation = SphericalCoord(1, 0, math.radians(float(props.get("rotation_z") or 0)))
+        repeat = int2(int(props.get("texture_x") or 1), int(props.get("texture_y") or 1))
 
         if texture_path:
-            pyh_obj_id = ctx.addTileObject(
+            ctx_object_id = ctx.addTileObject(
                 center=center, size=size, rotation=rotation, subdiv=subdiv,
-                texturefile=texture_path,
-                texture_repeat=int2(int(props.get("texture_x") or 1),
-                                    int(props.get("texture_y") or 1)),
+                texturefile=texture_path, texture_repeat=repeat,
             )
-            uuids = [p.uuid for p in ctx.getPrimitivesInfoForObject(pyh_obj_id)]
         else:
-            uuids = ctx.addTile(center=center, size=size, rotation=rotation,
-                                subdiv=subdiv,
-                                color=RGBcolor(*reg.DEFAULT_MATERIAL_COLOR[:3]))
+            ctx_object_id = ctx.addTileObject(
+                center=center, size=size, rotation=rotation, subdiv=subdiv,
+                color=RGBcolor(*reg.DEFAULT_MATERIAL_COLOR[:3]),
+            )
+        uuids = list(ctx.getObjectPrimitiveUUIDs(ctx_object_id))
     except HTTPException:
         raise
     except Exception:
         so.helios_uuids = "[]"
+        so.ctx_object_id = None
         db.commit()
         raise api_error(500, "BUILD_FAILED",
                         "Unable to create geometry. Please try again")
@@ -293,16 +310,18 @@ def _build(db: Session, pctx, so: ScenarioObject) -> list[int]:
     obj_id = reg.register_object(
         pctx, so.name, "ground", uuids,
         scenario_object_id=so.id,
-        # Track what was ACTUALLY built — when the texture file failed to
-        # resolve, the plain path ran and _sync_viewport must know that.
-        built_texture=texture_value if texture_path else None,
+        ctx_object_id=ctx_object_id,
+        # The texture baked into THIS build — the rebuild-vs-reapply check.
+        built_texture=texture_path,
     )
     pctx.persisted_objects[so.id] = obj_id
+    pctx.ctx_objects[so.id] = ctx_object_id
 
     so.helios_uuids = json.dumps(uuids)
+    so.ctx_object_id = ctx_object_id
     db.commit()
 
-    material_apply.apply_object_appearance(db, pctx, so)
+    material_apply.reapply_all_materials(db, pctx, so)
     return uuids
 
 
@@ -311,20 +330,100 @@ def _rebuild(db: Session, pctx, so: ScenarioObject) -> None:
     _build(db, pctx, so)
 
 
-def _sync_viewport(db: Session, pctx, so: ScenarioObject) -> None:
-    """After an assignment change: rebuild when the texture state changed
-    (plain ↔ textured build paths differ), else relabel only (spec §12.2)."""
+def _apply_assignment_change(db: Session, pctx, so: ScenarioObject,
+                             cleared_type_id: int | None = None) -> None:
+    """Repaint after an assignment add/remove/edit. Rebuild when the winning
+    texture changed (texture is baked into the TileObject), else clear the
+    removed/edited material type's stale labels and re-apply color/model data
+    in place. Safe no-op when headless or the object isn't built this session."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         return
-    desired = _winner_effective_texture(db, so)
+    if so.id not in pctx.persisted_objects:
+        return    # hydration will paint it correctly later
+    desired = _winner_texture_path(db, so)
     obj_id = pctx.persisted_objects.get(so.id)
-    built = None
-    if obj_id is not None and obj_id in pctx.registry:
-        built = pctx.registry[obj_id].get("built_texture")
+    built = pctx.registry.get(obj_id, {}).get("built_texture") if obj_id is not None else None
     if (desired or None) != (built or None):
+        _rebuild(db, pctx, so)    # fresh primitives; _build re-applies everything
+        return
+    if cleared_type_id is not None:
+        material_apply.clear_material_from_primitives(db, pctx, so, cleared_type_id)
+    material_apply.reapply_all_materials(db, pctx, so)
+
+
+# Intrinsic Ground properties that map to an in-place PyHelios object op.
+_TRANSLATE_KEYS = {"position_x", "position_y", "position_z"}
+_SCALE_KEYS = {"length", "breadth"}
+_RESOLUTION_KEYS = {"resolution_x", "resolution_y"}
+_INPLACE_KEYS = _TRANSLATE_KEYS | _SCALE_KEYS | _RESOLUTION_KEYS | {"rotation_z"}
+# texture_x/texture_y (repeat) are baked into the TileObject — no in-place setter.
+_RECREATE_KEYS = {"texture_x", "texture_y"}
+
+
+def _apply_intrinsic_change(db: Session, pctx, so: ScenarioObject,
+                            old_vals: dict, new_vals: dict, changed: set[str]) -> None:
+    """Apply an intrinsic-property change WITHOUT a full rebuild where possible
+    (decision #6): position→translateObject, length/breadth→scaleObject,
+    rotation_z→rotateObject, resolution→setTileObjectSubdivisionCount. texture
+    repeat (and any non-decomposable change) recreates the one object. Falls back
+    to a rebuild whenever the live object id is missing/dead."""
+    if not helios_ctx.PYHELIOS_AVAILABLE or so.id not in pctx.persisted_objects:
+        return
+    ctx = helios_ctx.get_context(pctx)
+    ctx_object_id = pctx.ctx_objects.get(so.id)
+    if ctx_object_id is None or not ctx.doesObjectExist(ctx_object_id):
         _rebuild(db, pctx, so)
-    else:
-        material_apply.apply_object_appearance(db, pctx, so)
+        return
+
+    # texture-repeat or a non-decomposable key → recreate this object only.
+    if (changed & _RECREATE_KEYS) or (changed - _INPLACE_KEYS - _RECREATE_KEYS):
+        _rebuild(db, pctx, so)
+        return
+
+    from pyhelios.types import int2, vec3
+
+    if changed & _TRANSLATE_KEYS:
+        dx = (new_vals.get("position_x") or 0) - (old_vals.get("position_x") or 0)
+        dy = (new_vals.get("position_y") or 0) - (old_vals.get("position_y") or 0)
+        dz = (new_vals.get("position_z") or 0) - (old_vals.get("position_z") or 0)
+        if dx or dy or dz:
+            ctx.translateObject(ctx_object_id, vec3(dx, dy, dz))
+
+    if "rotation_z" in changed:
+        delta = (new_vals.get("rotation_z") or 0) - (old_vals.get("rotation_z") or 0)
+        if delta:
+            # Rotate about the object's own center (origin=None default).
+            ctx.rotateObject(ctx_object_id, math.radians(delta), "z")
+
+    if changed & _SCALE_KEYS:
+        # scaleObject scales along WORLD axes; on a z-rotated tile that would
+        # shear it, so recreate when the (post-change) tile is rotated. Apply
+        # rotation first (above) so a rotate-to-zero is already in effect here.
+        if (new_vals.get("rotation_z") or 0) % 360 != 0:
+            _rebuild(db, pctx, so)
+            return
+        old_l = old_vals.get("length") or 1
+        old_b = old_vals.get("breadth") or 1
+        sx = (new_vals.get("length") or 1) / old_l if old_l else 1
+        sy = (new_vals.get("breadth") or 1) / old_b if old_b else 1
+        if sx != 1 or sy != 1:
+            ctx.scaleObject(ctx_object_id, vec3(sx, sy, 1), about_center=True)
+
+    if changed & _RESOLUTION_KEYS:
+        rx = int(new_vals.get("resolution_x") or 1)
+        ry = int(new_vals.get("resolution_y") or 1)
+        ctx.setTileObjectSubdivisionCount(ctx_object_id, int2(rx, ry))
+        # Subdivision REGENERATES the tile's primitives — re-read UUIDs and
+        # re-apply materials. If the object id didn't survive, recreate.
+        if not ctx.doesObjectExist(ctx_object_id):
+            _rebuild(db, pctx, so)
+            return
+        uuids = list(ctx.getObjectPrimitiveUUIDs(ctx_object_id))
+        so.helios_uuids = json.dumps(uuids)
+        db.commit()
+        material_apply.reapply_all_materials(db, pctx, so)
+
+    material_apply.invalidate_geometry_caches(pctx)
 
 
 def ensure_hydrated(db: Session, pctx, scenario_id: str) -> None:
@@ -505,6 +604,9 @@ def serialize_object(db: Session, pctx, so: ScenarioObject,
     defs = load_type_properties(db, object_type_id=so.object_type_id)
     values = _intrinsic_native(db, so.id)
     obj_id = pctx.persisted_objects.get(so.id)
+    # ctx_object_id is session-scoped — only meaningful when the object is built
+    # in THIS session; emit null otherwise so a stale DB value never leaks.
+    ctx_object_id = pctx.ctx_objects.get(so.id) if so.id in pctx.persisted_objects else None
     out = {
         "id": so.id,
         "name": so.name,
@@ -517,7 +619,7 @@ def serialize_object(db: Session, pctx, so: ScenarioObject,
         "properties": {name: values.get(name) for name in defs},
         "visibility": _visibility_of(db, so),
         "helios_uuids": json.loads(so.helios_uuids or "[]"),
-        "viewport": {"object_id": obj_id},
+        "viewport": {"object_id": obj_id, "ctx_object_id": ctx_object_id},
     }
     if include_materials:
         assignments = (
@@ -552,7 +654,7 @@ def create_object(db: Session, session_id: str, project_id: str,
         required=REQUIRED_OBJECT_PROPERTIES.get(ot.object),
     )
 
-    taken = _object_names_lower(db, project_id)
+    taken = _object_names_lower(db, scenario_id)
     if body.name is None:
         name = next_default_name(taken, ot.object)
     else:
@@ -564,12 +666,9 @@ def create_object(db: Session, session_id: str, project_id: str,
     seen_types: dict[int, int] = {}
     materials: list[tuple[ProjectMaterial, bool]] = []
     for entry in body.materials:
-        pm = (
-            db.query(ProjectMaterial)
-            .filter(ProjectMaterial.id == entry.material_id,
-                    ProjectMaterial.project_id == project_id)
-            .first()
-        )
+        # Materials are GLOBAL (migration 019): any material may be assigned to
+        # any object regardless of its project/scenario — no scope validation.
+        pm = db.get(ProjectMaterial, entry.material_id)
         if pm is None:
             raise api_error(404, "MATERIAL_NOT_FOUND",
                             f"Material {entry.material_id} not found")
@@ -597,9 +696,8 @@ def create_object(db: Session, session_id: str, project_id: str,
     for pm, sync in materials:
         db.add(ObjectMaterial(scenario_object_id=so.id, project_material_id=pm.id,
                               material_type_id=pm.material_type_id, sync=1 if sync else 0))
-        if not sync:
-            db.flush()
-            _snapshot_frozen(db, so.id, pm.id)
+        db.flush()
+        _snapshot_frozen(db, so.id, pm.id)   # snapshot every assignment
     db.commit()
     db.refresh(so)
 
@@ -670,7 +768,7 @@ def update_object(db: Session, session_id: str, project_id: str,
     ensure_hydrated(db, pctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
 
-    properties_changed = False
+    intrinsic_change = None
     if body.properties:
         ot = db.get(ObjectType, so.object_type_id)
         defs = load_type_properties(db, object_type_id=so.object_type_id)
@@ -680,8 +778,19 @@ def update_object(db: Session, session_id: str, project_id: str,
             body.properties, defs, type_label=ot.object,
             required=required & set(body.properties.keys()),
         )
+        # Snapshot the OLD native values before the write so in-place ops can
+        # compute deltas/ratios; derive the new values from the canonical patch.
+        old_vals = _intrinsic_native(db, so.id)
+        new_vals = dict(old_vals)
+        for name, ctext in canonical.items():
+            if ctext is None:
+                new_vals.pop(name, None)
+            else:
+                new_vals[name] = decode_value(ctext, defs[name].datatype)
         _upsert_intrinsic(db, so.id, canonical, defs)
-        properties_changed = True
+        changed = {name for name in canonical if old_vals.get(name) != new_vals.get(name)}
+        if changed:
+            intrinsic_change = (old_vals, new_vals, changed)
 
     if "group_id" in body.model_fields_set:
         if body.group_id is None:
@@ -697,8 +806,8 @@ def update_object(db: Session, session_id: str, project_id: str,
     db.commit()
     db.refresh(so)
 
-    if properties_changed:
-        _rebuild(db, pctx, so)
+    if intrinsic_change is not None:
+        _apply_intrinsic_change(db, pctx, so, *intrinsic_change)
     return {"success": True, "object": serialize_object(db, pctx, so)}
 
 
@@ -708,7 +817,7 @@ def rename_object(db: Session, session_id: str, project_id: str,
     pctx = _pctx(session_id, project_id)
     so = _object_or_404(db, scenario_id, object_id)
     new_name = validate_name(name)
-    if new_name.lower() != so.name.lower() and new_name.lower() in _object_names_lower(db, project_id):
+    if new_name.lower() != so.name.lower() and new_name.lower() in _object_names_lower(db, scenario_id):
         raise api_error(409, "GEOMETRY_NAME_EXISTS", "Geometry name already exists")
     so.name = new_name
     db.commit()
@@ -727,17 +836,11 @@ def delete_object(db: Session, session_id: str, project_id: str,
     ensure_hydrated(db, pctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
 
-    frozen_labels = [
-        material_apply.frozen_label(om.project_material_id, so.id)
-        for om in db.query(ObjectMaterial)
-        .filter(ObjectMaterial.scenario_object_id == so.id)
-        .all()
-    ]
+    # deleteObject removes the compound object and its primitives, so the
+    # per-primitive material data dies with them — no label cleanup needed.
     _teardown(pctx, so)
-    db.delete(so)   # cascades intrinsic + frozen rows + assignments
+    db.delete(so)   # cascades intrinsic + snapshot rows + assignments
     db.commit()
-    for label in frozen_labels:
-        material_apply.cleanup_label(pctx, label)
     return {"success": True, "object_id": object_id}
 
 
@@ -747,7 +850,7 @@ def next_name(db: Session, session_id: str, project_id: str,
     ot = db.query(ObjectType).filter(ObjectType.object == object_type).first()
     if ot is None:
         raise api_error(404, "OBJECT_TYPE_NOT_FOUND", f"object type '{object_type}' not found")
-    return {"name": next_default_name(_object_names_lower(db, project_id), ot.object)}
+    return {"name": next_default_name(_object_names_lower(db, scenario_id), ot.object)}
 
 
 def get_object_geometry_binary(db: Session, session_id: str, project_id: str,
@@ -926,6 +1029,62 @@ def delete_group(db: Session, session_id: str, project_id: str,
     return {"success": True, "group_id": group_id, "ungrouped": ungrouped}
 
 
+def _group_members(db: Session, group_id: int) -> list[ScenarioObject]:
+    return (
+        db.query(ScenarioObject)
+        .filter(ScenarioObject.group_id == group_id)
+        .order_by(ScenarioObject.id)
+        .all()
+    )
+
+
+def update_group_visibility(db: Session, session_id: str, project_id: str,
+                            scenario_id: str, group_id: int, body) -> dict:
+    """Bulk-set viewport and/or render visibility on every member of a group.
+    DB-only, like per-object visibility (the live viewport reads these flags at
+    serialization; nothing in the PyHelios context changes)."""
+    _resolve_scope(db, session_id, project_id, scenario_id)
+    _group_or_404(db, scenario_id, group_id)
+
+    payload: dict = {}
+    if body.viewport is not None:
+        payload["viewport"] = body.viewport
+    if body.render is not None:
+        payload["render"] = body.render
+    if not payload:
+        raise api_error(400, "NO_VISIBILITY_FIELDS",
+                        "Provide viewport and/or render")
+
+    members = _group_members(db, group_id)
+    for so in members:
+        _apply_visibility(db, so, payload)   # reuses the per-object writer
+        so.updated_at = _now()
+    db.commit()
+    return {"success": True, "group_id": group_id,
+            "viewport": body.viewport, "render": body.render,
+            "member_ids": [so.id for so in members]}
+
+
+def delete_group_objects(db: Session, session_id: str, project_id: str,
+                         scenario_id: str, group_id: int) -> dict:
+    """Delete every member geometry of a group AND the group itself (full
+    purge). Each member is torn down from the live context, then the DB rows
+    cascade (intrinsic + snapshot + assignment + per-model rows)."""
+    _resolve_scope(db, session_id, project_id, scenario_id)
+    pctx = _pctx(session_id, project_id)
+    ensure_hydrated(db, pctx, scenario_id)   # so live objects exist for teardown
+    grp = _group_or_404(db, scenario_id, group_id)
+
+    members = _group_members(db, group_id)
+    deleted = [so.id for so in members]
+    for so in members:
+        _teardown(pctx, so)
+        db.delete(so)
+    db.delete(grp)
+    db.commit()
+    return {"success": True, "group_id": group_id, "deleted_object_ids": deleted}
+
+
 # ── Assignment endpoints (spec §8) ───────────────────────────────────────────
 
 
@@ -936,12 +1095,8 @@ def assign_material(db: Session, session_id: str, project_id: str,
     ensure_hydrated(db, pctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
 
-    pm = (
-        db.query(ProjectMaterial)
-        .filter(ProjectMaterial.id == body.material_id,
-                ProjectMaterial.project_id == project_id)
-        .first()
-    )
+    # Materials are GLOBAL (migration 019) — no same-project/scenario check.
+    pm = db.get(ProjectMaterial, body.material_id)
     if pm is None:
         raise api_error(404, "MATERIAL_NOT_FOUND", f"Material {body.material_id} not found")
 
@@ -959,11 +1114,10 @@ def assign_material(db: Session, session_id: str, project_id: str,
             f"A {mt.materialtype if mt else 'material of this type'} material "
             "is already assigned to this geometry",
         )
-    if not body.sync:
-        _snapshot_frozen(db, so.id, pm.id)
+    _snapshot_frozen(db, so.id, pm.id)   # snapshot every assignment
     db.commit()
 
-    _sync_viewport(db, pctx, so)
+    _apply_assignment_change(db, pctx, so)
     om = db.get(ObjectMaterial, (so.id, pm.id))
     return {"success": True, "assignment": _assignment_payload(db, so, om)}
 
@@ -1003,13 +1157,12 @@ def update_assignment(db: Session, session_id: str, project_id: str,
 
     if body.sync is not None and body.sync != bool(om.sync):
         if body.sync:
-            # Unfreeze: drop frozen rows, follow the library again.
-            for row in _frozen_rows(db, so.id, material_id):
-                db.delete(row)
+            # Unfreeze = relink + refresh: re-snapshot the CURRENT library values
+            # (the snapshot stays the source of truth — there is no live sync).
+            _snapshot_frozen(db, so.id, material_id)
             om.sync = 1
         else:
-            # Freeze: snapshot current library values.
-            _snapshot_frozen(db, so.id, material_id)
+            # Freeze = detach: keep the existing snapshot as the editable copy.
             om.sync = 0
 
     if body.properties:
@@ -1036,18 +1189,10 @@ def update_assignment(db: Session, session_id: str, project_id: str,
                 row.value = value
 
     db.commit()
-    if not target_sync:
-        # Refresh the dedicated frozen label from the frozen values.
-        material_apply.apply_vis_to_label(
-            pctx, material_apply.frozen_label(material_id, so.id),
-            material_apply.frozen_vis_values(db, so.id, material_id),
-        )
-        _sync_viewport(db, pctx, so)
-    else:
-        # Re-point primitives FIRST, then drop the orphaned frozen label —
-        # cleanup only deletes labels with no primitives still using them.
-        _sync_viewport(db, pctx, so)
-        material_apply.cleanup_label(pctx, material_apply.frozen_label(material_id, so.id))
+    # Clear this material type's stale labels then re-apply (or rebuild if the
+    # winning texture changed). cleared_type_id drops labels a property edit
+    # may have removed.
+    _apply_assignment_change(db, pctx, so, cleared_type_id=om.material_type_id)
 
     om = db.get(ObjectMaterial, (so.id, material_id))
     return {"success": True, "assignment": _assignment_payload(db, so, om)}
@@ -1061,10 +1206,10 @@ def unassign_material(db: Session, session_id: str, project_id: str,
     so = _object_or_404(db, scenario_id, object_id)
     om = _assignment_or_404(db, so.id, material_id)
 
-    db.delete(om)   # cascades the assignment's frozen rows
+    old_type_id = om.material_type_id   # capture BEFORE the delete cascades it
+    db.delete(om)   # cascades the assignment's snapshot rows
     db.commit()
-    # Re-point primitives first; only then can the frozen label be orphaned
-    # and actually deleted by cleanup.
-    _sync_viewport(db, pctx, so)
-    material_apply.cleanup_label(pctx, material_apply.frozen_label(material_id, so.id))
+    # Clear the removed material type's labels + reset color, then re-apply the
+    # remaining assignments (or the default when none remain).
+    _apply_assignment_change(db, pctx, so, cleared_type_id=old_type_id)
     return {"success": True, "object_id": object_id, "material_id": material_id}

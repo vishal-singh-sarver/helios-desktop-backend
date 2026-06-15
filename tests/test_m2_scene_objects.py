@@ -1,6 +1,8 @@
 """Milestone-2 persisted scene objects, groups and assignment (spec §5/§6/§8)."""
 from uuid import uuid4
 
+import pytest
+
 from app.helios import context as helios_ctx
 
 GROUND_PROPS = {
@@ -388,6 +390,51 @@ def test_groups_lifecycle(client):
     assert r.status_code == 200 and r.json()["object"]["group_id"] is None
 
 
+def test_group_bulk_visibility_and_delete(client):
+    """Group bulk ops: PATCH visibility sets viewport/render for all members;
+    DELETE /objects purges every member geometry AND the group itself."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    ot = _ot_id(client)
+    o1 = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
+    o2 = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
+    grp = client.post(_base(pid, sid) + "/groups",
+                      json={"member_ids": [o1["id"], o2["id"]]}, headers=h).json()["group"]
+    gid = grp["id"]
+
+    def _vis(oid):
+        return client.get(_base(pid, sid) + f"/objects/{oid}", headers=h).json()["object"]["visibility"]
+
+    # Bulk viewport off for the whole group.
+    r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility",
+                     json={"viewport": False}, headers=h)
+    assert r.status_code == 200, r.text
+    assert set(r.json()["member_ids"]) == {o1["id"], o2["id"]}
+    assert _vis(o1["id"])["viewport"] is False and _vis(o2["id"])["viewport"] is False
+    assert _vis(o1["id"])["render"] is True   # render untouched
+
+    # Bulk render off for the whole group.
+    r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility",
+                     json={"render": False}, headers=h)
+    assert r.status_code == 200
+    assert _vis(o1["id"])["render"] is False and _vis(o2["id"])["render"] is False
+
+    # Empty body rejected.
+    r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility", json={}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "NO_VISIBILITY_FIELDS"
+
+    # Purge: every member geometry AND the group are deleted.
+    r = client.delete(_base(pid, sid) + f"/groups/{gid}/objects", headers=h)
+    assert r.status_code == 200
+    assert set(r.json()["deleted_object_ids"]) == {o1["id"], o2["id"]}
+    assert client.get(_base(pid, sid) + f"/objects/{o1['id']}", headers=h).status_code == 404
+    assert client.get(_base(pid, sid) + f"/objects/{o2['id']}", headers=h).status_code == 404
+    assert client.get(_base(pid, sid) + "/groups", headers=h).json()["groups"] == []
+
+
 # ── Material assignment + sync/frozen ────────────────────────────────────────
 
 
@@ -514,3 +561,44 @@ def test_assignment_in_create_call(client):
     mats = r.json()["object"]["materials"]
     assert len(mats) == 1 and mats[0]["material_id"] == rad["id"]
     assert mats[0]["properties"]["color_r"] == 90
+
+
+def test_inplace_geometry_edits(client):
+    """Item #6: geometry is a TileObject (ctx_object_id captured); resize with no
+    rotation mutates it in place (UUIDs + object id stable, no rebuild);
+    resolution regenerates primitives; texture-repeat recreates the object."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable — in-place ops are DB-only no-ops")
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    props = {**GROUND_PROPS, "rotation_z": 0,
+             "resolution_x": 2, "resolution_y": 2, "texture_x": 1, "texture_y": 1}
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": props,
+    }, headers=h).json()["object"]
+    obj_url = _base(pid, sid) + f"/objects/{obj['id']}"
+
+    uuids0 = obj["helios_uuids"]
+    ctx0 = obj["viewport"]["ctx_object_id"]
+    assert ctx0 is not None          # always a TileObject now
+    assert len(uuids0) == 4          # 2x2 subdivisions
+
+    # Resize with rotation_z == 0 → in-place scaleObject: same primitives + id.
+    o = client.patch(obj_url, json={"properties": {"length": 30, "breadth": 30}},
+                     headers=h).json()["object"]
+    assert o["properties"]["length"] == 30
+    assert o["helios_uuids"] == uuids0
+    assert o["viewport"]["ctx_object_id"] == ctx0
+
+    # Resolution change → setTileObjectSubdivisionCount regenerates primitives.
+    o = client.patch(obj_url, json={"properties": {"resolution_x": 5, "resolution_y": 4}},
+                     headers=h).json()["object"]
+    assert len(o["helios_uuids"]) == 20
+    assert o["helios_uuids"] != uuids0
+
+    # Texture-repeat change → recreate this one object (fresh id + primitives).
+    prev_uuids, prev_ctx = o["helios_uuids"], o["viewport"]["ctx_object_id"]
+    o = client.patch(obj_url, json={"properties": {"texture_x": 3, "texture_y": 3}},
+                     headers=h).json()["object"]
+    assert o["helios_uuids"] != prev_uuids
+    assert o["viewport"]["ctx_object_id"] != prev_ctx

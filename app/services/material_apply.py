@@ -1,19 +1,31 @@
 """
-Applies persisted material visualisation values (color_r/g/b, texture_file,
-two_sided_heat_transfer) to the PyHelios viewport via material labels.
+Per-primitive material application (snapshot model).
 
-Label scheme (spec §12.2):
-    pm_{material_id}                      shared label — all SYNCED
-                                          assignments of one library
-                                          material point here, so a single
-                                          library edit recolors every
-                                          synced geometry at once.
-    pm_{material_id}_so_{object_id}       dedicated label for a FROZEN
-                                          assignment — its values may
-                                          diverge from the library.
+A material assignment applies the material's CURRENT property values directly
+onto the geometry's primitives (decision: snapshot-on-assign — there is no live
+library sync). Two channels are handled here:
 
-Model parameters never touch the viewport. All PyHelios access degrades to
-a no-op when the native library is unavailable (headless / CI).
+    color_r/g/b   -> ctx.setPrimitiveColor(uuids, RGBcolor)          (single-valued)
+    everything    -> ctx.setPrimitiveData<typed>(uuids, name, value) (model data,
+    else                                                              one label each)
+
+The TEXTURE channel (texture_file) is NOT handled here: PyHelios can only tile a
+texture (texture_repeat) when the texture is baked into the TileObject at build
+time, so scene_object_service._build owns texture, and a texture change forces a
+rebuild of that one object. reapply_all_materials therefore never touches the
+primitive texture.
+
+Snapshot source: object_property_data rows for the (object, material) pair —
+written on assign by scene_object_service._snapshot_frozen for EVERY assignment.
+reapply_all_materials re-applies from these rows, so hydration and in-place
+regeneration repaint without re-reading the (possibly edited) library.
+
+The single-valued color channel is owned by the precedence-winning assignment
+(Radiation wins, else most-recently created). Model-data labels are additive —
+each assigned material contributes its own labels.
+
+All PyHelios access degrades to a no-op when the native library is unavailable
+(headless / CI) or when the object was not built in THIS session.
 """
 from __future__ import annotations
 
@@ -25,7 +37,6 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.models import (
     Datatype,
-    MaterialData,
     MaterialType,
     ObjectMaterial,
     ObjectPropertyData,
@@ -33,21 +44,30 @@ from app.db.models import (
 )
 from app.helios import context as helios_ctx
 from app.helios import registry as reg
+from app.services.eav_validation import (
+    VISUALISATION_PROPERTIES,
+    decode_value,
+    load_type_properties,
+)
 
-VIS_PROPS = ("color_r", "color_g", "color_b", "texture_file", "two_sided_heat_transfer")
-
-# Viewport precedence among a geometry's assigned materials (spec §12.2 /
-# open question #6): the Radiation-type material wins; otherwise the most
-# recently assigned one.
+# Viewport precedence among a geometry's assigned materials (spec §12.2 / open
+# question #6): the Radiation-type material owns the single-valued color/texture
+# channel; otherwise the most recently assigned one does.
 _PRECEDENCE_TYPE = "Radiation"
 
-
-def pm_label(material_id: int) -> str:
-    return f"pm_{material_id}"
-
-
-def frozen_label(material_id: int, scenario_object_id: int) -> str:
-    return f"pm_{material_id}_so_{scenario_object_id}"
+# datatype -> the Context.setPrimitiveData<typed> method that stores it.
+# boolean has no native bool setter, so it rides UInt as 0/1 (matching Helios'
+# own twosided-flag convention). date/time/file/enum/string all store as text.
+_DATATYPE_SETTER = {
+    "float": "setPrimitiveDataFloat",
+    "integer": "setPrimitiveDataInt",
+    "boolean": "setPrimitiveDataUInt",
+    "string": "setPrimitiveDataString",
+    "enum": "setPrimitiveDataString",
+    "date": "setPrimitiveDataString",
+    "time": "setPrimitiveDataString",
+    "file": "setPrimitiveDataString",
+}
 
 
 def resolve_texture_path(value: str | None) -> str | None:
@@ -73,64 +93,23 @@ def resolve_texture_path(value: str | None) -> str | None:
     return value
 
 
-def _vis_rows_to_native(rows: list[tuple[str, str | None, str]]) -> dict:
-    """[(property, canonical_value, datatype)] → native dict of vis props."""
-    from app.services.eav_validation import decode_value
-    out = {}
-    for prop, value, dt in rows:
-        if prop in VIS_PROPS:
-            out[prop] = decode_value(value, dt)
-    return out
+# ── Snapshot reads ───────────────────────────────────────────────────────────
 
 
-def library_vis_values(db: Session, material_id: int) -> dict:
-    """Visualisation values straight from material_data (the library)."""
-    rows = (
-        db.query(PropertyType.property, MaterialData.value, Datatype.name)
-        .join(MaterialData, MaterialData.property_type_id == PropertyType.id)
-        .join(Datatype, Datatype.id == PropertyType.datatype_id)
-        .filter(MaterialData.project_material_id == material_id)
-        .all()
-    )
-    return _vis_rows_to_native(rows)
-
-
-def frozen_vis_values(db: Session, scenario_object_id: int, material_id: int) -> dict:
-    """Visualisation values from the assignment's frozen rows."""
+def _assignment_snapshot_native(db: Session, so_id: int, material_id: int) -> dict:
+    """Snapshot (object_property_data) values for one assignment, as
+    {property_name: native value}."""
     rows = (
         db.query(PropertyType.property, ObjectPropertyData.value, Datatype.name)
         .join(ObjectPropertyData, ObjectPropertyData.property_type_id == PropertyType.id)
         .join(Datatype, Datatype.id == PropertyType.datatype_id)
         .filter(
-            ObjectPropertyData.scenario_object_id == scenario_object_id,
+            ObjectPropertyData.scenario_object_id == so_id,
             ObjectPropertyData.project_material_id == material_id,
         )
         .all()
     )
-    return _vis_rows_to_native(rows)
-
-
-def apply_vis_to_label(pctx, label: str, vis: dict) -> None:
-    """Create/refresh one PyHelios material label from native vis values.
-    No-op when PyHelios is unavailable."""
-    if not helios_ctx.PYHELIOS_AVAILABLE:
-        return
-    ctx = helios_ctx.get_context(pctx)
-    from pyhelios.types import RGBAcolor
-    if not ctx.doesMaterialExist(label):
-        ctx.addMaterial(label)
-    r = vis.get("color_r")
-    g = vis.get("color_g")
-    b = vis.get("color_b")
-    if r is not None and g is not None and b is not None:
-        ctx.setMaterialColor(label, RGBAcolor(r / 255.0, g / 255.0, b / 255.0, 1.0))
-    tex = resolve_texture_path(vis.get("texture_file"))
-    # Labels are reused across refreshes — an empty string CLEARS a
-    # previously set texture, otherwise removal would never take effect.
-    ctx.setMaterialTexture(label, tex or "")
-    two_sided = vis.get("two_sided_heat_transfer")
-    if two_sided is not None:
-        ctx.setMaterialTwosidedFlag(label, 1 if two_sided else 0)
+    return {prop: decode_value(value, dt) for prop, value, dt in rows}
 
 
 def _winning_assignment(db: Session, assignments: list[ObjectMaterial]) -> ObjectMaterial | None:
@@ -147,54 +126,111 @@ def _winning_assignment(db: Session, assignments: list[ObjectMaterial]) -> Objec
     return max(assignments, key=lambda a: a.created_at or "")
 
 
-def apply_object_appearance(db: Session, pctx, scenario_object) -> None:
-    """Re-point a geometry's primitives at the precedence-winning material
-    label (shared pm_{id} when synced, dedicated frozen label when not),
-    falling back to the default material when nothing is assigned.
+# ── Per-primitive writers ────────────────────────────────────────────────────
 
-    Safe no-op when PyHelios is unavailable, the object has no live
-    primitives, or the object was not built in THIS session (stored UUIDs
-    are session-scoped — touching them in a fresh context would raise or
-    recolor unrelated primitives; hydration repaints it correctly later).
-    """
+
+def _reset_color(ctx, uuids: list[int]) -> None:
+    """Reset the color channel to the default (no material). The precedence
+    winner overrides afterward. Texture is owned by the build path, not here."""
+    from pyhelios.types import RGBcolor
+    ctx.setPrimitiveColor(uuids, RGBcolor(*reg.DEFAULT_MATERIAL_COLOR[:3]))
+
+
+def _apply_color(ctx, uuids: list[int], values: dict) -> None:
+    """Apply one material's color (0..255 ints → RGBcolor)."""
+    r, g, b = values.get("color_r"), values.get("color_g"), values.get("color_b")
+    if r is not None or g is not None or b is not None:
+        from pyhelios.types import RGBcolor
+        ctx.setPrimitiveColor(
+            uuids, RGBcolor((r or 0) / 255.0, (g or 0) / 255.0, (b or 0) / 255.0)
+        )
+
+
+def _apply_model_data(ctx, uuids: list[int], defs: dict, values: dict) -> None:
+    """Apply every non-visualisation property as typed primitive data."""
+    for name, prop in defs.items():
+        if name in VISUALISATION_PROPERTIES:
+            continue
+        value = values.get(name)
+        if value is None:
+            continue
+        setter_name = _DATATYPE_SETTER.get(prop.datatype)
+        if setter_name is None:
+            continue
+        setter = getattr(ctx, setter_name)
+        if prop.datatype == "boolean":
+            setter(uuids, name, 1 if value else 0)
+        elif prop.datatype == "float":
+            setter(uuids, name, float(value))
+        elif prop.datatype == "integer":
+            setter(uuids, name, int(value))
+        else:
+            setter(uuids, name, str(value))
+
+
+# ── Public entry points ──────────────────────────────────────────────────────
+
+
+def clear_material_from_primitives(db: Session, pctx, so, material_type_id: int) -> None:
+    """Remove a material type's model-data labels from the object's primitives
+    (the color/texture channel is reset by reapply_all_materials). Call BEFORE
+    deleting an assignment, with the OLD material type, so stale primitive data
+    never lingers. No-op when headless or the object isn't built this session."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         return
-    if scenario_object.id not in pctx.persisted_objects:
+    if so.id not in pctx.persisted_objects:
         return
-    uuids = json.loads(scenario_object.helios_uuids or "[]")
+    uuids = json.loads(so.helios_uuids or "[]")
+    if not uuids:
+        return
+    ctx = helios_ctx.get_context(pctx)
+    defs = load_type_properties(db, material_type_id=material_type_id)
+    for name in defs:
+        if name in VISUALISATION_PROPERTIES:
+            continue
+        try:
+            ctx.clearPrimitiveData(uuids, name)
+        except Exception:
+            pass    # label may not be present on these primitives
+    invalidate_geometry_caches(pctx)
+
+
+def reapply_all_materials(db: Session, pctx, so) -> None:
+    """Re-apply every current assignment's snapshot onto the object's primitives.
+
+    Resets the single-valued color/texture channel, applies every assignment's
+    model-data labels, then lets the precedence winner own color/texture. Falls
+    back to the default color when nothing is assigned. Safe no-op when headless,
+    the object isn't built this session, or it has no live primitives."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        return
+    if so.id not in pctx.persisted_objects:
+        return
+    uuids = json.loads(so.helios_uuids or "[]")
     if not uuids:
         return
     ctx = helios_ctx.get_context(pctx)
 
     assignments = (
         db.query(ObjectMaterial)
-        .filter(ObjectMaterial.scenario_object_id == scenario_object.id)
+        .filter(ObjectMaterial.scenario_object_id == so.id)
         .all()
     )
+
+    _reset_color(ctx, uuids)
+
+    for om in assignments:
+        defs = load_type_properties(db, material_type_id=om.material_type_id)
+        values = _assignment_snapshot_native(db, so.id, om.project_material_id)
+        _apply_model_data(ctx, uuids, defs, values)
+
     winner = _winning_assignment(db, assignments)
-    if winner is None:
-        reg.ensure_default_material(pctx, ctx, uuids)
-    elif winner.sync:
-        label = pm_label(winner.project_material_id)
-        apply_vis_to_label(pctx, label, library_vis_values(db, winner.project_material_id))
-        ctx.assignMaterialToPrimitive(uuids, label)
-    else:
-        label = frozen_label(winner.project_material_id, scenario_object.id)
-        apply_vis_to_label(
-            pctx, label,
-            frozen_vis_values(db, scenario_object.id, winner.project_material_id),
+    if winner is not None:
+        _apply_color(
+            ctx, uuids, _assignment_snapshot_native(db, so.id, winner.project_material_id)
         )
-        ctx.assignMaterialToPrimitive(uuids, label)
 
     invalidate_geometry_caches(pctx)
-
-
-def cleanup_label(pctx, label: str) -> None:
-    """Delete a label if no primitives still use it (e.g. after unfreeze)."""
-    if not helios_ctx.PYHELIOS_AVAILABLE:
-        return
-    ctx = helios_ctx.get_context(pctx)
-    reg.cleanup_orphaned_materials(pctx, ctx, {label})
 
 
 def invalidate_geometry_caches(pctx) -> None:

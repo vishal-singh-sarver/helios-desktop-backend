@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class MaterialCreateRequest(BaseModel):
     material_type_id: int
     name: Optional[str] = None          # omitted → auto 'Material.001'
+    scenario_id: Optional[str] = None   # set when created inside a scenario
     properties: dict[str, Any] = Field(default_factory=dict)
 
 

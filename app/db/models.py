@@ -234,15 +234,17 @@ class ObjectGroup(Base):
 class ScenarioObject(Base):
     """A persisted geometry instance (e.g. one Ground), scenario-scoped.
 
-    project_id is denormalized from scenarios so the per-PROJECT
-    case-insensitive name uniqueness is a real DB constraint.
-    helios_uuids holds the live PyHelios primitive UUIDs (JSON array) —
-    rewritten on every build/rebuild; session-scoped, never trusted
-    across a restart without hydration.
+    project_id is denormalized from scenarios. Name uniqueness is per-SCENARIO
+    (migration 019): a name may repeat across scenarios of a project but not
+    within one.
+    helios_uuids holds the live PyHelios primitive UUIDs (JSON array) and
+    ctx_object_id the live PyHelios compound-object id — both rewritten on every
+    build/rebuild; session-scoped, never trusted across a restart without
+    hydration (guard on so.id in pctx.persisted_objects before use).
     """
     __tablename__ = "scenario_object"
     __table_args__ = (
-        Index("idx_scenario_object_project_name_ci", "project_id", "name", unique=True),
+        Index("idx_scenario_object_scenario_name_ci", "scenario_id", "name", unique=True),
     )
 
     id             = Column(Integer, primary_key=True, autoincrement=True)
@@ -251,7 +253,8 @@ class ScenarioObject(Base):
     name           = Column(Text, nullable=False)
     object_type_id = Column(Integer, ForeignKey("object_types.id", ondelete="RESTRICT"), nullable=False)
     group_id       = Column(Integer, ForeignKey("object_group.id", ondelete="SET NULL"), nullable=True, index=True)
-    helios_uuids   = Column(Text, nullable=False, default="[]")   # JSON
+    helios_uuids   = Column(Text, nullable=False, default="[]")   # JSON primitive UUIDs
+    ctx_object_id  = Column(Integer, nullable=True)               # live PyHelios object id (session-scoped)
     visible        = Column(Integer, nullable=False, default=1)   # eye icon (3D viewport)
     render_enabled = Column(Integer, nullable=False, default=1)   # render icon (all models)
     created_at     = Column(Text, nullable=False, default=_now)
@@ -336,20 +339,24 @@ class MaterialPropertyType(Base):
 
 
 class ProjectMaterial(Base):
-    """A material instance in the project library — exactly one material type.
+    """A material instance in the GLOBAL library — exactly one material type.
 
-    UNIQUE(id, material_type_id) exists solely as the target of
-    object_material's composite FK, making the denormalized type on the
-    assignment provably consistent. scenario_id is reserved for future use.
+    Migration 019 makes materials global: project_id/scenario_id are nullable
+    (NULL project_id = an app-shipped default or a material not bound to a
+    project; both are set when a material is created inside a scenario) and the
+    name is GLOBALLY unique (one flat namespace). Assignment does NOT validate
+    that a material shares the object's project/scenario.
+    UNIQUE(id, material_type_id) is the target of object_material's composite FK,
+    making the denormalized type on the assignment provably consistent.
     """
     __tablename__ = "project_material"
     __table_args__ = (
         UniqueConstraint("id", "material_type_id"),
-        Index("idx_project_material_project_name_ci", "project_id", "name", unique=True),
+        Index("idx_project_material_name_ci", "name", unique=True),
     )
 
     id               = Column(Integer, primary_key=True, autoincrement=True)
-    project_id       = Column(Text, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id       = Column(Text, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
     scenario_id      = Column(Text, ForeignKey("scenarios.id", ondelete="SET NULL"), nullable=True)
     material_type_id = Column(Integer, ForeignKey("material_type.id", ondelete="RESTRICT"), nullable=False)
     name             = Column(Text, nullable=False)

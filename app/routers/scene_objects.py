@@ -20,6 +20,7 @@ from app.schemas.scene_objects import (
     AssignmentUpdateRequest,
     GroupCreateRequest,
     GroupRenameRequest,
+    GroupVisibilityRequest,
     SceneObjectCreateRequest,
     SceneObjectRenameRequest,
     SceneObjectUpdateRequest,
@@ -214,6 +215,29 @@ def delete_group(
     db: Session = Depends(get_db),
 ):
     return svc.delete_group(db, session_id, project_id, scenario_id, group_id)
+
+
+@router.patch(_BASE + "/groups/{group_id}/visibility")
+def update_group_visibility(
+    project_id: str,
+    scenario_id: str,
+    group_id: int,
+    body: GroupVisibilityRequest,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    return svc.update_group_visibility(db, session_id, project_id, scenario_id, group_id, body)
+
+
+@router.delete(_BASE + "/groups/{group_id}/objects")
+def delete_group_objects(
+    project_id: str,
+    scenario_id: str,
+    group_id: int,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    return svc.delete_group_objects(db, session_id, project_id, scenario_id, group_id)
 
 
 # ── Material assignment (spec §8) ────────────────────────────────────────────

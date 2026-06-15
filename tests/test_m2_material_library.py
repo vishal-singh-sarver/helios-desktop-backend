@@ -124,16 +124,20 @@ def test_list_get_update_rename_delete(client):
         "properties": {"wind_speed": 3.5, "air_temperature": 298},
     }, headers=h).json()["material"]
 
-    # List: newest first, preview carries vis props only
+    # List: newest first (created materials precede the seeded global defaults),
+    # preview carries vis props only.
     r = client.get(_base(pid), headers=h)
     rows = r.json()["materials"]
-    assert [m["name"] for m in rows] == ["Soil EB", "Grass Rad"]
+    assert [m["name"] for m in rows[:2]] == ["Soil EB", "Grass Rad"]
     assert rows[1]["preview"]["color_r"] == 90
     assert "reflectivity" not in rows[1]["preview"]
 
-    # Filter by type + search
+    # Filter by type + search. The Radiation list also carries the seeded
+    # 'Default Radiation'; the created one is newest, so it comes first.
     r = client.get(_base(pid) + f"?material_type_id={rad}", headers=h)
-    assert [m["name"] for m in r.json()["materials"]] == ["Grass Rad"]
+    rad_names = [m["name"] for m in r.json()["materials"]]
+    assert rad_names[0] == "Grass Rad"
+    assert "Grass Rad" in rad_names
     r = client.get(_base(pid) + "?search=soil", headers=h)
     assert [m["name"] for m in r.json()["materials"]] == ["Soil EB"]
 
@@ -162,15 +166,23 @@ def test_list_get_update_rename_delete(client):
     assert client.get(_base(pid) + f"/{m1['id']}", headers=h).status_code == 404
 
 
-def test_project_scoping(client):
+def test_materials_are_global(client):
+    """Materials globalised (migration 019): a material is reachable from any
+    project, and names are unique across the whole DB. Project auth still
+    applies to the library endpoints."""
     s1, p1 = _setup(client)
     s2, p2 = _setup(client)
     rad = _mt_id(client, "Radiation")
-    m = client.post(_base(p1), json={"material_type_id": rad},
+    m = client.post(_base(p1), json={"material_type_id": rad, "name": "Shared Mat"},
                     headers={"session-id": s1}).json()["material"]
-    # Another session/project cannot see it
+    # Another project CAN see/assign the global material.
     r = client.get(_base(p2) + f"/{m['id']}", headers={"session-id": s2})
-    assert r.status_code == 404
-    # Wrong session for p1 → project not found
+    assert r.status_code == 200, r.text
+    # The name is globally unique — a second project cannot reuse it.
+    r = client.post(_base(p2), json={"material_type_id": rad, "name": "shared mat"},
+                    headers={"session-id": s2})
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "MATERIAL_NAME_EXISTS"
+    # Wrong session for p1 → project not found (endpoint auth unchanged).
     r = client.get(_base(p1), headers={"session-id": s2})
     assert r.status_code == 404

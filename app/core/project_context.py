@@ -36,6 +36,10 @@ class ProjectContext:
         # registry object_id, and which scenarios have been hydrated
         # from the DB into this context since startup/reset.
         "persisted_objects",
+        # DB row id → live PyHelios compound-object id (ctx_object_id).
+        # A SEPARATE namespace from the registry object_id above; only this
+        # value may be passed to PyHelios object methods (scaleObject, etc.).
+        "ctx_objects",
         "hydrated_scenarios",
     )
 
@@ -53,6 +57,7 @@ class ProjectContext:
         self.gpu_children_cache = {}
         self.script_object_counter = 0
         self.persisted_objects = {}
+        self.ctx_objects = {}
         self.hydrated_scenarios = set()
 
     def reset(self):
@@ -69,4 +74,5 @@ class ProjectContext:
         self.gpu_children_cache = {}
         self.script_object_counter = 0
         self.persisted_objects = {}
+        self.ctx_objects = {}
         self.hydrated_scenarios = set()

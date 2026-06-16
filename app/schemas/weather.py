@@ -6,8 +6,8 @@ Request bodies for weather endpoints.
     PATCH /updateCol/{column_id}    body: UpdateColumn  (single)
     POST  /addRow                   body: AddRowsRequest
     POST  /update                   body: UpdateRequest
-    POST  /deleteRow                body: RowRef        (one row)
-    POST  /deleteCol                body: DeleteColumn  (one column)
+    POST /delete  body: DeleteRequest
+    POST /deleteRow  body: RowRef  (row-only convenience)
 
 The `addCol` flow links each new column to the metadata catalog
 (helios_data_types, data_units) and persists a row in weather_data_headers
@@ -166,9 +166,7 @@ class DeleteColumn(BaseModel):
 
 
 class DeleteRequest(BaseModel):
-    """Internal arg for weather_service.delete() — built by the router from the
-    per-endpoint body (deleteRow → row, deleteCol → column), not parsed from a
-    request body directly.
+    """Body for POST /delete.
 
     Neither row nor column → wipe all.
     row only → clear that row across every column.

@@ -285,6 +285,43 @@ def test_per_geometry_model_visibility(client):
     assert vis["render"] is True and all(v is True for v in vis["models"].values())
 
 
+def test_visibility_render_and_models_in_one_payload(client):
+    """Regression: render + models in the SAME payload must not double-insert
+    scenario_object_model rows (the master switch and the explicit map overlap
+    on the top-level ids → previously a UNIQUE-constraint crash)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    ids = _model_ids(client)
+    all_ids = [str(v) for v in ids.values()]
+    one = all_ids[0]
+
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+    }, headers=h).json()["object"]
+    url = _base(pid, sid) + f"/objects/{obj['id']}"
+
+    # render + the full models map together (the failing staging payload shape).
+    r = client.patch(url, json={"visibility": {
+        "viewport": True, "render": False,
+        "models": {mid: False for mid in all_ids},
+    }}, headers=h)
+    assert r.status_code == 200, r.text
+    vis = r.json()["object"]["visibility"]
+    assert vis["render"] is False
+    assert all(v is False for v in vis["models"].values())
+
+    # render=True master + one model overridden off → that one off, rest on,
+    # render = OR = True.
+    r = client.patch(url, json={"visibility": {
+        "render": True, "models": {one: False},
+    }}, headers=h)
+    assert r.status_code == 200, r.text
+    vis = r.json()["object"]["visibility"]
+    assert vis["models"][one] is False
+    assert vis["render"] is True
+    assert sum(1 for v in vis["models"].values() if v is True) == len(all_ids) - 1
+
+
 def test_scenario_run_configuration(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
@@ -447,6 +484,14 @@ def test_group_bulk_visibility_and_delete(client):
     for oid in (o1["id"], o2["id"]):
         v = _vis(oid)
         assert v["models"][rad] is True and v["render"] is True
+
+    # render + models in ONE payload (regression: must not double-insert).
+    r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility",
+                     json={"visibility": {"render": True, "models": {rad: False}}}, headers=h)
+    assert r.status_code == 200, r.text
+    for oid in (o1["id"], o2["id"]):
+        v = _vis(oid)
+        assert v["models"][rad] is False and v["render"] is True
 
     # Empty visibility object rejected.
     r = client.patch(_base(pid, sid) + f"/groups/{gid}/visibility",

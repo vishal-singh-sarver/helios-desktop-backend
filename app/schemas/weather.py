@@ -164,13 +164,25 @@ class DeleteColumn(BaseModel):
     columnname: str
 
 
+class DeleteRowsRequest(BaseModel):
+    """Body for DELETE /row — remove one or more rows by (date, time).
+
+    Each row is identified by its (date, time). Rows that don't exist are
+    reported in the response's `not_found` list rather than failing the batch.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[RowRef]
+
+
 class DeleteRequest(BaseModel):
-    """Body for POST /delete.
+    """Body for POST /delete (column delete or wipe-all).
 
     Neither row nor column → wipe all.
-    row only → clear that row across every column.
-    column only → clear that column across every row.
-    Both → clear the row first, then the column.
+    column → clear that column across every row.
+
+    The `row` field is retained for the legacy request shape; row deletion now
+    lives at DELETE /row (see DeleteRowsRequest).
     """
     model_config = ConfigDict(extra="forbid")
 

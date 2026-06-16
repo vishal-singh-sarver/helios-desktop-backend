@@ -18,6 +18,7 @@ from app.schemas.weather import (
     AddColumnsRequest,
     AddRowsRequest,
     DeleteRequest,
+    DeleteRowsRequest,
     UpdateColumn,
     UpdateRequest,
 )
@@ -140,9 +141,22 @@ def delete_weather(
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    """Delete a row, a column, or wipe everything."""
+    """Delete a column, or wipe everything."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
     return weather_service.delete(sctx, body, db)
+
+
+@router.delete("/project/{project_id}/scenario/{scenario_id}/row")
+def delete_weather_rows(
+    project_id: str,
+    scenario_id: str,
+    body: DeleteRowsRequest = Body(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Delete one or more rows by (date, time) across every column."""
+    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    return weather_service.delete_rows(sctx, body.rows, db)
 
 
 @router.delete("/project/{project_id}/scenario/{scenario_id}/clear_data")

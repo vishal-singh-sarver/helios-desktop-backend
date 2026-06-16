@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover
 
 if TYPE_CHECKING:
     from app.core.scenario_context import ScenarioContext
-    from app.schemas.weather import AddColumn, DeleteRequest, RowRef, UpdateColumn, UpdateRequest
+    from app.schemas.weather import AddColumn, DeleteRequest, UpdateColumn, UpdateRequest
 
 
 # ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -1398,12 +1398,12 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest", db: Session) -> 
 
 
 def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
-    """Remove a column, or wipe everything.
+    """Remove a row, a column, or wipe everything.
 
     - Whole wipe: clearTimeseriesData (PyHelios) + delete all headers (SQL).
+    - Row delete: deleteTimeseriesDataPoint(date, time) — physically removes that
+      timestamp from every variable; existence checked via the getTimeseriesLength count.
     - Column delete: deleteTimeseriesVariable (PyHelios) + delete header (SQL).
-
-    Row deletion lives in delete_rows() (DELETE .../row).
     """
     if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
         raise HTTPException(503, "PyHelios not available")
@@ -1416,6 +1416,23 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         db.commit()
         trigger_scenario_autosave(sctx)
         return {"success": True, "row_count": 0, "column_count": 2}
+
+    # STEP A — delete one row (true removal of the timestamp across every column)
+    if req.row is not None:
+        date_obj, time_obj = _helios_date_time(req.row.date, req.row.time)
+        labels = list(ctx.listTimeseriesVariables())
+        before = sum(ctx.getTimeseriesLength(lbl) for lbl in labels)
+        try:
+            ctx.deleteTimeseriesDataPoint(date_obj, time_obj)
+        except (NotImplementedError, AttributeError) as exc:
+            raise HTTPException(
+                503,
+                "Row delete requires a PyHelios build with deleteTimeseriesDataPoint "
+                f"(helios-core >= v1.3.73): {exc}",
+            )
+        # Total point count unchanged -> that timestamp wasn't present.
+        if sum(ctx.getTimeseriesLength(lbl) for lbl in labels) == before:
+            raise HTTPException(404, f"no row at {req.row.date} {req.row.time}")
 
     # STEP B — delete one column
     if req.column is not None:
@@ -1453,68 +1470,6 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         "success": True,
         "row_count": row_count,
         "column_count": column_count,
-    }
-
-
-def delete_rows(sctx: "ScenarioContext", rows: list["RowRef"], db: Session) -> dict:
-    """Delete one or more rows by (date, time) across every column.
-
-    Each requested (date, time) is removed from every timeseries variable in a
-    single deleteTimeseriesDataPoint call (label omitted), which physically
-    erases the timestamp — value AND date/time — so the row truly disappears.
-
-    Existence is detected by the change in total point count
-    (getTimeseriesLength) before vs after each delete: if the total is
-    unchanged the timestamp wasn't present. If any requested row is missing the
-    call returns 404 (detail lists the missing rows); rows that did exist are
-    still removed.
-    """
-    if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
-        raise HTTPException(503, "PyHelios not available")
-    if not rows:
-        raise HTTPException(400, "rows list cannot be empty")
-
-    ctx = sctx.context
-    labels = list(ctx.listTimeseriesVariables())
-    deleted = 0
-    not_found: list[dict] = []
-
-    for r in rows:
-        date_obj, time_obj = _helios_date_time(r.date, r.time)
-        before = sum(ctx.getTimeseriesLength(lbl) for lbl in labels)
-        try:
-            ctx.deleteTimeseriesDataPoint(date_obj, time_obj)
-        except (NotImplementedError, AttributeError) as exc:
-            raise HTTPException(
-                503,
-                "Row delete requires a PyHelios build with deleteTimeseriesDataPoint "
-                f"(helios-core >= v1.3.73): {exc}",
-            )
-        after = sum(ctx.getTimeseriesLength(lbl) for lbl in labels)
-        if after == before:
-            not_found.append({"date": r.date, "time": r.time})
-        else:
-            deleted += 1
-
-    # Persist whatever was actually removed before surfacing a not-found error.
-    trigger_scenario_autosave(sctx)
-
-    if not_found:
-        raise HTTPException(
-            404,
-            detail={
-                "error": "row not found",
-                "not_found": not_found,
-                "deleted": deleted,
-            },
-        )
-
-    row_count = ctx.getTimeseriesLength(labels[0]) if labels else 0
-    return {
-        "success": True,
-        "deleted": deleted,
-        "row_count": row_count,
-        "column_count": 2 + len(labels),
     }
 
 

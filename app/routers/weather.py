@@ -17,8 +17,9 @@ from app.db.database import get_db
 from app.schemas.weather import (
     AddColumnsRequest,
     AddRowsRequest,
+    DeleteColumn,
     DeleteRequest,
-    DeleteRowsRequest,
+    RowRef,
     UpdateColumn,
     UpdateRequest,
 )
@@ -133,30 +134,30 @@ def update_weather(
     return weather_service.update_cells(sctx, body, db)
 
 
-@router.post("/project/{project_id}/scenario/{scenario_id}/delete")
-def delete_weather(
+@router.post("/project/{project_id}/scenario/{scenario_id}/deleteRow")
+def delete_weather_row(
     project_id: str,
     scenario_id: str,
-    body: DeleteRequest = Body(...),
+    body: RowRef = Body(...),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    """Delete a column, or wipe everything."""
+    """Delete one row — removes the (date, time) point from every column."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.delete(sctx, body, db)
+    return weather_service.delete(sctx, DeleteRequest(row=body), db)
 
 
-@router.delete("/project/{project_id}/scenario/{scenario_id}/row")
-def delete_weather_rows(
+@router.post("/project/{project_id}/scenario/{scenario_id}/deleteCol")
+def delete_weather_column(
     project_id: str,
     scenario_id: str,
-    body: DeleteRowsRequest = Body(...),
+    body: DeleteColumn = Body(...),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    """Delete one or more rows by (date, time) across every column."""
+    """Delete one column by name."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.delete_rows(sctx, body.rows, db)
+    return weather_service.delete(sctx, DeleteRequest(column=body), db)
 
 
 @router.delete("/project/{project_id}/scenario/{scenario_id}/clear_data")

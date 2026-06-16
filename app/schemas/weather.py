@@ -6,7 +6,8 @@ Request bodies for weather endpoints.
     PATCH /updateCol/{column_id}    body: UpdateColumn  (single)
     POST  /addRow                   body: AddRowsRequest
     POST  /update                   body: UpdateRequest
-    POST /delete  body: DeleteRequest
+    POST  /deleteRow                body: RowRef        (one row)
+    POST  /deleteCol                body: DeleteColumn  (one column)
 
 The `addCol` flow links each new column to the metadata catalog
 (helios_data_types, data_units) and persists a row in weather_data_headers
@@ -164,25 +165,15 @@ class DeleteColumn(BaseModel):
     columnname: str
 
 
-class DeleteRowsRequest(BaseModel):
-    """Body for DELETE /row — remove one or more rows by (date, time).
-
-    Each row is identified by its (date, time). Rows that don't exist are
-    reported in the response's `not_found` list rather than failing the batch.
-    """
-    model_config = ConfigDict(extra="forbid")
-
-    rows: list[RowRef]
-
-
 class DeleteRequest(BaseModel):
-    """Body for POST /delete (column delete or wipe-all).
+    """Internal arg for weather_service.delete() — built by the router from the
+    per-endpoint body (deleteRow → row, deleteCol → column), not parsed from a
+    request body directly.
 
     Neither row nor column → wipe all.
-    column → clear that column across every row.
-
-    The `row` field is retained for the legacy request shape; row deletion now
-    lives at DELETE /row (see DeleteRowsRequest).
+    row only → clear that row across every column.
+    column only → clear that column across every row.
+    Both → clear the row first, then the column.
     """
     model_config = ConfigDict(extra="forbid")
 

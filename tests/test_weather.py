@@ -313,20 +313,6 @@ def test_get_all_timeseries_data_accepts_paging_params(client):
     assert r.status_code == 200
 
 
-# ─────────────────────────── Delete wipe-all ─────────────────────────────────
-
-
-def test_delete_wipe_all_returns_success(client):
-    session_id, project_id, scenario_id = _make_project(client)
-    r = client.post(
-        _url(project_id, scenario_id, "delete"),
-        headers=_session_headers(session_id),
-        json={},
-    )
-    # 200 if PyHelios is available, 503 otherwise
-    assert r.status_code in (200, 503)
-
-
 # ─────────────────────────── Delete one row ─────────────────────────────────
 #
 # Row delete physically removes the (date, time) point from EVERY column via
@@ -379,31 +365,21 @@ def _seed_two_columns_three_rows(client, sid, pid, scn) -> tuple[int, int]:
     return cols[0]["id"], cols[1]["id"]
 
 
-def _delete_rows(client, sid, pid, scn, rows):
-    """DELETE one or more rows by (date, time). `rows` is a list of
-    {"date","time"} dicts. Uses request() explicitly so the DELETE carries a
-    JSON body (httpx's client.delete() does not accept json=)."""
-    return client.request(
-        "DELETE",
-        _url(pid, scn, "row"),
-        headers=_session_headers(sid),
-        json={"rows": rows},
-    )
-
-
 @requires_row_delete
 def test_delete_row_removes_it_and_drops_row_count(client):
-    """The deleted timestamp disappears from every column and row_count drops;
-    surviving rows keep their values (not blanked to NaN)."""
+    """POST /deleteRow removes that timestamp from every column
+    and row_count drops; surviving rows keep their values (not blanked to NaN)."""
     sid, pid, scn = _make_project(client)
     a_id, b_id = _seed_two_columns_three_rows(client, sid, pid, scn)
 
-    r = _delete_rows(client, sid, pid, scn, [{"date": "2024-01-01", "time": "11:00:00"}])
+    r = client.post(
+        _url(pid, scn, "deleteRow"),
+        headers=_session_headers(sid),
+        json={"date": "2024-01-01", "time": "11:00:00"},
+    )
     assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["success"] is True
-    assert body["deleted"] == 1
-    assert body["row_count"] == 2  # was 3
+    assert r.json()["success"] is True
+    assert r.json()["row_count"] == 2  # was 3
 
     # The row is gone from BOTH columns; the other two rows survive intact.
     r = client.get(_url(pid, scn, "getAllTimeSeriesData"), headers=_session_headers(sid))
@@ -419,71 +395,22 @@ def test_delete_row_removes_it_and_drops_row_count(client):
 
 
 @requires_row_delete
-def test_delete_multiple_rows_in_one_call(client):
-    """The list payload deletes several rows in a single DELETE request."""
-    sid, pid, scn = _make_project(client)
-    _seed_two_columns_three_rows(client, sid, pid, scn)
-
-    r = _delete_rows(client, sid, pid, scn, [
-        {"date": "2024-01-01", "time": "10:00:00"},
-        {"date": "2024-01-01", "time": "12:00:00"},
-    ])
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["deleted"] == 2
-    assert body["row_count"] == 1
-
-    r = client.get(_url(pid, scn, "getAllTimeSeriesData"), headers=_session_headers(sid))
-    assert [row["time"] for row in r.json()["rows"]] == ["11:00:00"]
-
-
-@requires_row_delete
 def test_delete_missing_row_returns_404(client):
-    """A requested row that doesn't exist returns 404, with the missing row
-    listed in the error detail; nothing is removed."""
+    """A row that doesn't exist returns 404; nothing is removed."""
     sid, pid, scn = _make_project(client)
     _seed_two_columns_three_rows(client, sid, pid, scn)
 
-    r = _delete_rows(client, sid, pid, scn, [{"date": "2099-12-31", "time": "23:59:59"}])
+    r = client.post(
+        _url(pid, scn, "deleteRow"),
+        headers=_session_headers(sid),
+        json={"date": "2099-12-31", "time": "23:59:59"},
+    )
     assert r.status_code == 404, r.text
-    detail = r.json()["detail"]
-    assert detail["not_found"] == [{"date": "2099-12-31", "time": "23:59:59"}]
-    assert detail["deleted"] == 0
+    assert "no row" in r.json()["detail"].lower()
 
     # nothing was removed
     r = client.get(_url(pid, scn, "getAllTimeSeriesData"), headers=_session_headers(sid))
     assert r.json()["row_count"] == 3
-
-
-@requires_row_delete
-def test_delete_rows_partial_some_missing_returns_404(client):
-    """A batch with a missing row returns 404 (listing the missing rows); rows
-    that did exist are still removed (delete is not atomic across the batch)."""
-    sid, pid, scn = _make_project(client)
-    _seed_two_columns_three_rows(client, sid, pid, scn)
-
-    r = _delete_rows(client, sid, pid, scn, [
-        {"date": "2024-01-01", "time": "10:00:00"},   # exists
-        {"date": "2099-12-31", "time": "23:59:59"},   # missing
-    ])
-    assert r.status_code == 404, r.text
-    detail = r.json()["detail"]
-    assert detail["not_found"] == [{"date": "2099-12-31", "time": "23:59:59"}]
-    assert detail["deleted"] == 1
-
-    # the existing row WAS removed despite the 404
-    r = client.get(_url(pid, scn, "getAllTimeSeriesData"), headers=_session_headers(sid))
-    assert [row["time"] for row in r.json()["rows"]] == ["11:00:00", "12:00:00"]
-
-
-@requires_row_delete
-def test_delete_rows_empty_list_returns_400(client):
-    sid, pid, scn = _make_project(client)
-    _seed_two_columns_three_rows(client, sid, pid, scn)
-
-    r = _delete_rows(client, sid, pid, scn, [])
-    assert r.status_code == 400
-    assert "cannot be empty" in r.json()["detail"].lower()
 
 
 @requires_row_delete
@@ -503,9 +430,12 @@ def test_delete_last_row_leaves_columns_present(client):
     )
     assert r.status_code == 200, r.text
 
-    r = _delete_rows(client, sid, pid, scn, [{"date": "2024-01-01", "time": "10:00:00"}])
+    r = client.post(
+        _url(pid, scn, "deleteRow"),
+        headers=_session_headers(sid),
+        json={"date": "2024-01-01", "time": "10:00:00"},
+    )
     assert r.status_code == 200, r.text
-    assert r.json()["deleted"] == 1
     assert r.json()["row_count"] == 0
 
     # Column header still exists.
@@ -520,9 +450,12 @@ def test_delete_row_then_readd_same_timestamp_succeeds(client):
     sid, pid, scn = _make_project(client)
     a_id, b_id = _seed_two_columns_three_rows(client, sid, pid, scn)
 
-    r = _delete_rows(client, sid, pid, scn, [{"date": "2024-01-01", "time": "11:00:00"}])
+    r = client.post(
+        _url(pid, scn, "deleteRow"),
+        headers=_session_headers(sid),
+        json={"date": "2024-01-01", "time": "11:00:00"},
+    )
     assert r.status_code == 200, r.text
-    assert r.json()["deleted"] == 1
 
     # The same timestamp can now be re-added (no zombie row blocking it).
     r = client.post(
@@ -535,6 +468,63 @@ def test_delete_row_then_readd_same_timestamp_succeeds(client):
     assert r.status_code == 200, r.text
     assert r.json()["added_rows"] == 1
     assert r.json()["row_count"] == 3
+
+
+# ─────────────────────────── Delete one column ──────────────────────────────
+
+
+def test_delete_column_removes_it_and_drops_column_count(client):
+    """POST /deleteCol drops the column from PyHelios and its SQL header row;
+    the other column survives."""
+    sid, pid, scn = _make_project(client)
+    a_id, b_id = _seed_two_columns_three_rows(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "deleteCol"),
+        headers=_session_headers(sid),
+        json={"columnname": "a"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["success"] is True
+    assert r.json()["column_count"] == 3  # date + time + surviving 'b'
+
+    # The header for 'a' is gone; 'b' remains.
+    r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
+    names = [h["name"] for h in r.json()["headers"]]
+    assert "a" not in names
+    assert "b" in names
+
+
+def test_delete_missing_column_returns_404(client):
+    """A column that doesn't exist returns 404; nothing is removed."""
+    sid, pid, scn = _make_project(client)
+    _seed_two_columns_three_rows(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "deleteCol"),
+        headers=_session_headers(sid),
+        json={"columnname": "nope"},
+    )
+    assert r.status_code == 404, r.text
+    assert "not found" in r.json()["detail"].lower()
+
+    # both columns still present
+    r = client.get(_headers_url(pid, scn), headers=_session_headers(sid))
+    names = [h["name"] for h in r.json()["headers"]]
+    assert {"a", "b"} <= set(names)
+
+
+def test_delete_date_time_column_rejected(client):
+    """The date/time pseudo-columns cannot be deleted (400)."""
+    sid, pid, scn = _make_project(client)
+    _seed_two_columns_three_rows(client, sid, pid, scn)
+
+    r = client.post(
+        _url(pid, scn, "deleteCol"),
+        headers=_session_headers(sid),
+        json={"columnname": "date"},
+    )
+    assert r.status_code == 400, r.text
 
 
 # ─────────────────────────── /update — batch cell updates ──────────────────

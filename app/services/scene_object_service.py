@@ -546,12 +546,15 @@ def _apply_visibility(db: Session, so: ScenarioObject, payload: dict) -> None:
         return    # nothing model-related to apply; render untouched
 
     top_level = _top_level_model_ids(db)
-    if has_render:
-        # Master switch: enable-all / disable-all across top-level models.
-        _set_object_models(db, so.id, {mid: payload["render"] for mid in top_level})
-    if models:
-        # Granular overrides (applied after the master switch).
-        _set_object_models(db, so.id, models)
+    # Merge master switch + granular overrides into ONE state map so each model
+    # id is upserted exactly once. (Two separate _set_object_models calls would
+    # double-insert: the session is autoflush=False, so the second call's
+    # db.get() can't see the first call's still-pending rows → duplicate INSERT
+    # → UNIQUE violation on (scenario_object_id, model_type_id).)
+    states: dict[int, bool] = {mid: payload["render"] for mid in top_level} if has_render else {}
+    states.update(models)   # granular overrides the master switch
+    if states:
+        _set_object_models(db, so.id, states)
 
     # Recompute render = OR(top-level model states). Flush first so the freshly
     # written rows are visible to the query.

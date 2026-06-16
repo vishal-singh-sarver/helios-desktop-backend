@@ -154,9 +154,7 @@ def delete_weather_row(
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    """Delete one row — removes the (date, time) point from every column.
-
-    Same service function as /delete; just a dedicated URL for row deletes."""
+    """Delete one row — removes the (date, time) point from every column."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
     return weather_service.delete(sctx, DeleteRequest(row=body), db)
 

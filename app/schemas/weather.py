@@ -7,6 +7,7 @@ Request bodies for weather endpoints.
     POST  /addRow                   body: AddRowsRequest
     POST  /update                   body: UpdateRequest
     POST /delete  body: DeleteRequest
+    POST /deleteRow  body: RowRef  (row-only convenience)
 
 The `addCol` flow links each new column to the metadata catalog
 (helios_data_types, data_units) and persists a row in weather_data_headers

@@ -77,6 +77,17 @@ def _helios_date_time(date_str: str, time_str: str):
         raise HTTPException(400, f"bad date/time '{date_str}' '{time_str}': {exc}")
 
 
+def _label_has_timestamp(ctx, label: str, date_obj, time_obj) -> bool:
+    """True if this label has a cell at exactly (date, time). O(n) per call."""
+    n = ctx.getTimeseriesLength(label)
+    for i in range(n):
+        d = ctx.queryTimeseriesDate(label, i)
+        t = ctx.queryTimeseriesTime(label, i)
+        if d == date_obj and t == time_obj:
+            return True
+    return False
+
+
 def _clean_float(v: float) -> float | None:
     """NaN → None so JSON serialization doesn't choke. Otherwise float rounded to max 7 decimals."""
     if v is None or (isinstance(v, float) and math.isnan(v)):
@@ -1401,8 +1412,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
     """Remove a row, a column, or wipe everything.
 
     - Whole wipe: clearTimeseriesData (PyHelios) + delete all headers (SQL).
-    - Row delete: deleteTimeseriesDataPoint(date, time) — physically removes that
-      timestamp from every variable; existence checked via the getTimeseriesLength count.
+    - Row delete: updateTimeseriesData(..., NaN) for that timestamp across all vars.
     - Column delete: deleteTimeseriesVariable (PyHelios) + delete header (SQL).
     """
     if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
@@ -1417,22 +1427,18 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         trigger_scenario_autosave(sctx)
         return {"success": True, "row_count": 0, "column_count": 2}
 
-    # STEP A — delete one row (true removal of the timestamp across every column)
+    # STEP A — clear one row
     if req.row is not None:
         date_obj, time_obj = _helios_date_time(req.row.date, req.row.time)
         labels = list(ctx.listTimeseriesVariables())
-        before = sum(ctx.getTimeseriesLength(lbl) for lbl in labels)
-        try:
-            ctx.deleteTimeseriesDataPoint(date_obj, time_obj)
-        except (NotImplementedError, AttributeError) as exc:
+        if not any(_label_has_timestamp(ctx, lbl, date_obj, time_obj) for lbl in labels):
             raise HTTPException(
-                503,
-                "Row delete requires a PyHelios build with deleteTimeseriesDataPoint "
-                f"(helios-core >= v1.3.73): {exc}",
+                404,
+                f"no row at {req.row.date} {req.row.time}",
             )
-        # Total point count unchanged -> that timestamp wasn't present.
-        if sum(ctx.getTimeseriesLength(lbl) for lbl in labels) == before:
-            raise HTTPException(404, f"no row at {req.row.date} {req.row.time}")
+        for label in labels:
+            if _label_has_timestamp(ctx, label, date_obj, time_obj):
+                ctx.updateTimeseriesData(label, date_obj, time_obj, float("nan"))
 
     # STEP B — delete one column
     if req.column is not None:

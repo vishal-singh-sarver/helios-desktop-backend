@@ -1473,6 +1473,77 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
     }
 
 
+# ─── delete_rows — batch row delete (POST /deleteRow) ────────────────────────
+
+
+def delete_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session) -> dict:
+    """Delete one or more rows in a single call.
+
+    Each row is a {"date", "time"} dict; deleteTimeseriesDataPoint physically
+    removes that timestamp from EVERY column. All requested rows must exist —
+    if any is missing, nothing is deleted and a 404 lists the missing rows.
+    An empty list is a 400. Rows-only (like addRow), so there are no SQL writes.
+    """
+    if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
+        raise HTTPException(503, "PyHelios not available")
+    if not rows:
+        raise HTTPException(400, "rows list cannot be empty")
+    ctx = sctx.context
+
+    # Parse every (date, time) up front so bad input is a clean 400.
+    targets = [(row, *_helios_date_time(row["date"], row["time"])) for row in rows]
+
+    # Reject duplicate timestamps in the batch (keeps the deleted count honest).
+    seen: set[tuple[str, str]] = set()
+    for _row, d, t in targets:
+        key = (str(d), str(t))
+        if key in seen:
+            raise HTTPException(400, f"duplicate timestamp in batch: {key}")
+        seen.add(key)
+
+    # The anchor column defines the row grid (timestamps are shared across
+    # columns). Normalise both sides through str() of the parsed objects so
+    # "08:10" and "08:10:00" compare equal.
+    labels = list(ctx.listTimeseriesVariables())
+    existing: set[tuple[str, str]] = set()
+    if labels:
+        anchor = labels[0]
+        for i in range(ctx.getTimeseriesLength(anchor)):
+            existing.add(
+                (
+                    str(ctx.queryTimeseriesDate(anchor, i)),
+                    str(ctx.queryTimeseriesTime(anchor, i)),
+                )
+            )
+
+    missing = [row for row, d, t in targets if (str(d), str(t)) not in existing]
+    if missing:
+        raise HTTPException(404, {"error": "row(s) not found", "not_found": missing})
+
+    try:
+        for _row, d, t in targets:
+            ctx.deleteTimeseriesDataPoint(d, t)
+    except (NotImplementedError, AttributeError) as exc:
+        raise HTTPException(
+            503,
+            "Row delete requires a PyHelios build with deleteTimeseriesDataPoint "
+            f"(helios-core >= v1.3.73): {exc}",
+        )
+
+    labels_after = list(ctx.listTimeseriesVariables())
+    row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0
+    column_count = 2 + len(labels_after)
+    deleted = len(targets)
+    trigger_scenario_autosave(sctx)
+    return {
+        "success": True,
+        "deleted_rows": deleted,
+        "row_count": row_count,
+        "column_count": column_count,
+        "message": f"{deleted} row{'s' if deleted != 1 else ''} has been deleted",
+    }
+
+
 # ─── clear_data — clear both stores ──────────────────────────────────────────
 
 

@@ -150,13 +150,13 @@ def delete_weather(
 def delete_weather_row(
     project_id: str,
     scenario_id: str,
-    body: RowRef = Body(...),
+    body: list[RowRef] = Body(...),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    """Delete one row — removes the (date, time) point from every column."""
+    """Delete one or more rows — each (date, time) removed from every column."""
     sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
-    return weather_service.delete(sctx, DeleteRequest(row=body), db)
+    return weather_service.delete_rows(sctx, [r.model_dump() for r in body], db)
 
 
 @router.delete("/project/{project_id}/scenario/{scenario_id}/clear_data")

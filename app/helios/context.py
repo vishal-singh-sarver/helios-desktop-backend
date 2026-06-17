@@ -55,10 +55,21 @@ if _PYHELIOS_USE_SOURCE:
 
         if _needs_build:
             import subprocess
-            _build_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "build_pyhelios.sh"
+            _scripts_dir = Path(__file__).resolve().parent.parent.parent / "scripts"
+            # Pick the platform-native build script: PowerShell on Windows,
+            # bash elsewhere. (A .sh can't be executed directly on Windows.)
+            if sys.platform == "win32":
+                _build_script = _scripts_dir / "build_pyhelios.ps1"
+                _build_cmd = [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", str(_build_script),
+                ]
+            else:
+                _build_script = _scripts_dir / "build_pyhelios.sh"
+                _build_cmd = [str(_build_script)]
             if _build_script.exists():
                 print("[pyhelios] Building from source (this may take a few minutes)...")
-                _result = subprocess.run([str(_build_script)], cwd=str(_pyhelios_src.parent), timeout=600)
+                _result = subprocess.run(_build_cmd, cwd=str(_pyhelios_src.parent), timeout=600)
                 if _result.returncode == 0 and _lib_path.exists():
                     print("[pyhelios] Build complete.")
                 else:

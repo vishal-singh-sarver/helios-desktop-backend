@@ -362,8 +362,8 @@ def test_scenario_run_configuration(client):
 
 
 def test_scenario_isolation_on_switch(client):
-    """Hydrating one scenario must not leak another scenario's objects
-    into whole-context reads (spec §12.3 scenario switch)."""
+    """Each scenario owns its own PyHelios context (Phase 2), so geometry never
+    leaks across scenarios and BOTH can be live at once — no teardown-on-switch."""
     session_id, pid, sid_a = _setup(client)
     h = {"session-id": session_id}
     r = client.post(f"/api/project/{pid}/scenarios/create",
@@ -386,14 +386,12 @@ def test_scenario_isolation_on_switch(client):
 
     if helios_ctx.PYHELIOS_AVAILABLE:
         from app.core.session_store import registry as session_registry
-        pctx = session_registry.get_or_create_context(session_id, pid)
-        # After touching B last, only B's object may be live in the context
-        assert b["id"] in pctx.persisted_objects
-        assert a["id"] not in pctx.persisted_objects
-        # Touching A again swaps the active scenario back
-        client.get(_base(pid, sid_a) + "/objects", headers=h)
-        assert a["id"] in pctx.persisted_objects
-        assert b["id"] not in pctx.persisted_objects
+        # Geometry lives in each scenario's OWN context — both stay live,
+        # each holding only its own object (no cross-scenario leakage).
+        sctx_a = session_registry.get_or_create_scenario_context(session_id, pid, sid_a)
+        sctx_b = session_registry.get_or_create_scenario_context(session_id, pid, sid_b)
+        assert a["id"] in sctx_a.persisted_objects and b["id"] not in sctx_a.persisted_objects
+        assert b["id"] in sctx_b.persisted_objects and a["id"] not in sctx_b.persisted_objects
 
 
 # ── Groups ───────────────────────────────────────────────────────────────────
@@ -675,3 +673,84 @@ def test_inplace_geometry_edits(client):
                      headers=h).json()["object"]
     assert o["helios_uuids"] != prev_uuids
     assert o["viewport"]["ctx_object_id"] != prev_ctx
+
+
+def _reopen(session_id, pid, sid):
+    """Simulate a restart of one scenario: drop its in-memory context so the
+    next request re-creates it, loadXML's context.xml, and re-hydrates."""
+    from app.core.session_store import registry as session_registry
+    session_registry.remove_scenario(session_id, pid, sid)
+
+
+def test_geometry_persists_to_context_xml_and_reloads(client):
+    """Phase 2: a geometry update writes context.xml; reopening the scenario
+    loads the geometry back from it and re-derives the session-scoped ids."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    from app.core.config import settings
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    props = {**GROUND_PROPS, "rotation_z": 0, "resolution_x": 2, "resolution_y": 2}
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": props}, headers=h).json()["object"]
+    oid = obj["id"]
+    assert len(obj["helios_uuids"]) == 4
+
+    xml = settings.scenario_context_file_dir(pid, sid) / "context.xml"
+    assert xml.exists() and xml.stat().st_size > 0    # written on create
+
+    _reopen(session_id, pid, sid)
+
+    o = client.get(_base(pid, sid) + f"/objects/{oid}", headers=h).json()["object"]
+    assert len(o["helios_uuids"]) == 4                # re-mapped from the loaded object
+    assert o["viewport"]["ctx_object_id"] is not None
+
+
+def test_color_survives_reload_via_material_label(client):
+    """Color is applied through a Helios material label, so it round-trips in
+    context.xml and is restored on reopen with NO repaint from the DB."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    from app.core.session_store import registry as session_registry
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mk_material(client, h, pid, "Radiation", "Reload Color",
+                       {"color_r": 200, "color_g": 50, "color_b": 50})
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client),
+        "properties": {**GROUND_PROPS, "resolution_x": 2, "resolution_y": 2},
+        "materials": [{"material_id": rad["id"], "sync": True}],
+    }, headers=h).json()["object"]
+    oid = obj["id"]
+
+    _reopen(session_id, pid, sid)
+    client.get(_base(pid, sid) + f"/objects/{oid}", headers=h)   # triggers reopen+hydrate
+
+    sctx = session_registry.get_or_create_scenario_context(session_id, pid, sid)
+    # The per-object color material label was serialized and restored — proving
+    # color persisted without a DB repaint.
+    assert sctx.context.doesMaterialExist(f"so_{oid}")
+
+
+def test_material_delete_does_not_repaint_live_geometry(client):
+    """Library delete is DB-only (snapshot model): the live object keeps its
+    geometry + ids (no rebuild/repaint); only the DB assignment cascades."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mk_material(client, h, pid, "Radiation", "ToDelete",
+                       {"color_r": 10, "color_g": 250, "color_b": 10})
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+        "materials": [{"material_id": rad["id"], "sync": True}]}, headers=h).json()["object"]
+    oid = obj["id"]
+    before = client.get(_base(pid, sid) + f"/objects/{oid}", headers=h).json()["object"]
+
+    r = client.delete(f"/api/materials/project/{pid}/library/{rad['id']}", headers=h)
+    assert r.status_code == 200 and r.json()["unassigned_from"] == 1
+
+    after = client.get(_base(pid, sid) + f"/objects/{oid}", headers=h).json()["object"]
+    assert after["viewport"]["ctx_object_id"] == before["viewport"]["ctx_object_id"]
+    assert after["helios_uuids"] == before["helios_uuids"]   # no rebuild
+    assert after["materials"] == []                          # DB assignment cascaded

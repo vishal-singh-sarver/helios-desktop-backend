@@ -8,9 +8,10 @@ material may be assigned to any object regardless of its project/scenario.
 project_id/scenario_id are stored only to record where a material was created
 (both NULL for app-shipped defaults).
 
-Library edits do NOT repaint assigned geometry — assignment is snapshot-on-assign
-(decision #1), so applied values change only on (re)assignment. Deleting a
-material still repaints the geometries that LOSE the assignment.
+Library edits/deletes are DB-only and do NOT repaint assigned geometry —
+assignment is snapshot-on-assign (decision #1), so applied values change only on
+an explicit per-object (re)assignment ("sync again"). A scene reflects whatever
+was last saved to its context.xml until it is reopened or re-synced.
 """
 from __future__ import annotations
 
@@ -20,7 +21,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.session_store import registry as session_registry
 from app.db.models import (
     Datatype,
     MaterialData,
@@ -29,7 +29,6 @@ from app.db.models import (
     ProjectMaterial,
     PropertyType,
     Scenario,
-    ScenarioObject,
     _now,
 )
 from app.services.eav_validation import (
@@ -48,10 +47,6 @@ _TEXTURE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _pctx(session_id: str, project_id: str):
-    return session_registry.get_or_create_context(session_id, project_id)
 
 
 def _material_or_404(db: Session, material_id: int) -> ProjectMaterial:
@@ -119,29 +114,6 @@ def _upsert_values(db: Session, material_id: int, canonical: dict[str, str | Non
                                 property_type_id=pt_id, value=value))
         else:
             row.value = value
-
-
-def _repaint_after_delete(db: Session, session_id: str, project_id: str,
-                          object_ids: list[int], material_type_id: int) -> None:
-    """Repaint geometries that LOST a now-deleted material's assignment: clear
-    that type's per-primitive data and re-apply remaining materials (rebuilding
-    if a baked texture went away). Only objects built in THIS session are
-    touched — a post-commit viewport repair must never fail the request."""
-    if not object_ids:
-        return
-    from app.services import scene_object_service
-    pctx = _pctx(session_id, project_id)
-    for oid in object_ids:
-        if oid not in pctx.persisted_objects:
-            continue            # hydration will paint it correctly later
-        so = db.get(ScenarioObject, oid)
-        if so is None:
-            continue
-        try:
-            scene_object_service._apply_assignment_change(
-                db, pctx, so, cleared_type_id=material_type_id)
-        except Exception:
-            pass
 
 
 # ── Endpoint handlers ────────────────────────────────────────────────────────
@@ -263,7 +235,6 @@ def rename_material(db: Session, session_id: str, project_id: str,
 def delete_material(db: Session, session_id: str, project_id: str, material_id: int) -> dict:
     project_or_404(db, session_id, project_id)
     pm = _material_or_404(db, material_id)
-    material_type_id = pm.material_type_id
 
     affected_object_ids = [
         row[0] for row in db.query(ObjectMaterial.scenario_object_id)
@@ -274,9 +245,9 @@ def delete_material(db: Session, session_id: str, project_id: str, material_id: 
     db.delete(pm)   # cascades material_data + assignments + snapshot rows
     db.commit()
 
-    # Repaint the geometries built this session that lost the assignment.
-    _repaint_after_delete(db, session_id, project_id, affected_object_ids, material_type_id)
-
+    # Library-level deletes are DB-only — live geometry is NOT auto-repainted
+    # (snapshot model; the user re-syncs by re-assigning). Affected scenes show
+    # the prior material until reopened/re-synced; a reopen reflects context.xml.
     return {"success": True, "material_id": material_id,
             "unassigned_from": len(affected_object_ids)}
 

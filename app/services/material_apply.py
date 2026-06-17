@@ -5,7 +5,10 @@ A material assignment applies the material's CURRENT property values directly
 onto the geometry's primitives (decision: snapshot-on-assign — there is no live
 library sync). Two channels are handled here:
 
-    color_r/g/b   -> ctx.setPrimitiveColor(uuids, RGBcolor)          (single-valued)
+    color_r/g/b   -> a per-object Helios material LABEL (addMaterial +
+                     setMaterialColor + assignMaterialToPrimitive). A material
+                     label is serialized by writeXML (a raw setPrimitiveColor is
+                     NOT), so color survives a context.xml reload with no repaint.
     everything    -> ctx.setPrimitiveData<typed>(uuids, name, value) (model data,
     else                                                              one label each)
 
@@ -129,21 +132,31 @@ def _winning_assignment(db: Session, assignments: list[ObjectMaterial]) -> Objec
 # ── Per-primitive writers ────────────────────────────────────────────────────
 
 
-def _reset_color(ctx, uuids: list[int]) -> None:
-    """Reset the color channel to the default (no material). The precedence
-    winner overrides afterward. Texture is owned by the build path, not here."""
-    from pyhelios.types import RGBcolor
-    ctx.setPrimitiveColor(uuids, RGBcolor(*reg.DEFAULT_MATERIAL_COLOR[:3]))
+def _color_label(so) -> str:
+    """Per-object Helios material label that carries the object's color. A
+    material label is serialized by writeXML (a raw setPrimitiveColor is NOT),
+    so color survives a context.xml round-trip with no repaint on reload."""
+    return f"so_{so.id}"
 
 
-def _apply_color(ctx, uuids: list[int], values: dict) -> None:
-    """Apply one material's color (0..255 ints → RGBcolor)."""
-    r, g, b = values.get("color_r"), values.get("color_g"), values.get("color_b")
-    if r is not None or g is not None or b is not None:
-        from pyhelios.types import RGBcolor
-        ctx.setPrimitiveColor(
-            uuids, RGBcolor((r or 0) / 255.0, (g or 0) / 255.0, (b or 0) / 255.0)
-        )
+def _set_color_label(ctx, uuids: list[int], label: str, rgb: tuple[float, float, float]) -> None:
+    """Point the object's primitives at a Helios material whose color is `rgb`
+    (0..1 floats). Created on first use, recoloured on later calls."""
+    from pyhelios.types import RGBAcolor
+    if not ctx.doesMaterialExist(label):
+        ctx.addMaterial(label)
+    ctx.setMaterialColor(label, RGBAcolor(rgb[0], rgb[1], rgb[2], 1.0))
+    ctx.assignMaterialToPrimitive(uuids, label)
+
+
+def _winner_color(db: Session, so_id: int, winner) -> tuple[float, float, float]:
+    """Color (0..1) of the precedence-winning assignment, else the default."""
+    if winner is not None:
+        values = _assignment_snapshot_native(db, so_id, winner.project_material_id)
+        r, g, b = values.get("color_r"), values.get("color_g"), values.get("color_b")
+        if r is not None or g is not None or b is not None:
+            return ((r or 0) / 255.0, (g or 0) / 255.0, (b or 0) / 255.0)
+    return reg.DEFAULT_MATERIAL_COLOR[:3]
 
 
 def _apply_model_data(ctx, uuids: list[int], defs: dict, values: dict) -> None:
@@ -171,19 +184,20 @@ def _apply_model_data(ctx, uuids: list[int], defs: dict, values: dict) -> None:
 # ── Public entry points ──────────────────────────────────────────────────────
 
 
-def clear_material_from_primitives(db: Session, pctx, so, material_type_id: int) -> None:
+def clear_material_from_primitives(db: Session, sctx, so, material_type_id: int) -> None:
     """Remove a material type's model-data labels from the object's primitives
-    (the color/texture channel is reset by reapply_all_materials). Call BEFORE
-    deleting an assignment, with the OLD material type, so stale primitive data
-    never lingers. No-op when headless or the object isn't built this session."""
+    (the color channel is owned by reapply_all_materials via the object's color
+    material label). Call BEFORE deleting an assignment, with the OLD material
+    type, so stale primitive data never lingers. No-op when headless or the
+    object isn't built this session."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         return
-    if so.id not in pctx.persisted_objects:
+    if so.id not in sctx.persisted_objects:
         return
     uuids = json.loads(so.helios_uuids or "[]")
     if not uuids:
         return
-    ctx = helios_ctx.get_context(pctx)
+    ctx = helios_ctx.get_context(sctx)
     defs = load_type_properties(db, material_type_id=material_type_id)
     for name in defs:
         if name in VISUALISATION_PROPERTIES:
@@ -192,24 +206,25 @@ def clear_material_from_primitives(db: Session, pctx, so, material_type_id: int)
             ctx.clearPrimitiveData(uuids, name)
         except Exception:
             pass    # label may not be present on these primitives
-    invalidate_geometry_caches(pctx)
+    invalidate_geometry_caches(sctx)
 
 
-def reapply_all_materials(db: Session, pctx, so) -> None:
+def reapply_all_materials(db: Session, sctx, so) -> None:
     """Re-apply every current assignment's snapshot onto the object's primitives.
 
-    Resets the single-valued color/texture channel, applies every assignment's
-    model-data labels, then lets the precedence winner own color/texture. Falls
-    back to the default color when nothing is assigned. Safe no-op when headless,
-    the object isn't built this session, or it has no live primitives."""
+    Applies every assignment's model-data labels (setPrimitiveData), then sets
+    the object's color material label to the precedence winner's color (default
+    when nothing is assigned). Color goes through a Helios material label so it
+    serializes into context.xml — reload needs no repaint. Safe no-op when
+    headless, the object isn't built this session, or it has no live primitives."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         return
-    if so.id not in pctx.persisted_objects:
+    if so.id not in sctx.persisted_objects:
         return
     uuids = json.loads(so.helios_uuids or "[]")
     if not uuids:
         return
-    ctx = helios_ctx.get_context(pctx)
+    ctx = helios_ctx.get_context(sctx)
 
     assignments = (
         db.query(ObjectMaterial)
@@ -217,24 +232,19 @@ def reapply_all_materials(db: Session, pctx, so) -> None:
         .all()
     )
 
-    _reset_color(ctx, uuids)
-
     for om in assignments:
         defs = load_type_properties(db, material_type_id=om.material_type_id)
         values = _assignment_snapshot_native(db, so.id, om.project_material_id)
         _apply_model_data(ctx, uuids, defs, values)
 
     winner = _winning_assignment(db, assignments)
-    if winner is not None:
-        _apply_color(
-            ctx, uuids, _assignment_snapshot_native(db, so.id, winner.project_material_id)
-        )
+    _set_color_label(ctx, uuids, _color_label(so), _winner_color(db, so.id, winner))
 
-    invalidate_geometry_caches(pctx)
+    invalidate_geometry_caches(sctx)
 
 
-def invalidate_geometry_caches(pctx) -> None:
+def invalidate_geometry_caches(sctx) -> None:
     """The viewport's next binary fetch must see the change."""
-    pctx.geometry_cache = {}
-    pctx.gpu_geometry_cache = {}
-    pctx.gpu_children_cache = {}
+    sctx.geometry_cache = {}
+    sctx.gpu_geometry_cache = {}
+    sctx.gpu_children_cache = {}

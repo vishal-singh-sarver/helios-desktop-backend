@@ -25,6 +25,7 @@ is unavailable (helios_uuids stays []; getObjectGeometry returns 503).
 """
 from __future__ import annotations
 
+import functools
 import json
 import math
 
@@ -52,6 +53,7 @@ from app.db.models import (
 )
 from app.helios import context as helios_ctx
 from app.helios import registry as reg
+from app.helios.persistence import load_scenario_snapshot, trigger_scenario_autosave
 from app.services import material_apply
 from app.services.eav_validation import (
     REQUIRED_OBJECT_PROPERTIES,
@@ -65,6 +67,11 @@ from app.services.eav_validation import (
 )
 
 _GROUP_PREFIX = "Group"
+
+# Object-data key stamped on every built object so hydration can re-map a loaded
+# compound object back to its DB scenario_object.id (objIDs/UUIDs are NOT
+# preserved across writeXML/loadXML, but object data is).
+_SO_ID_TAG = "helios_gui_so_id"
 
 
 # ── Scope / lookup helpers ───────────────────────────────────────────────────
@@ -83,8 +90,33 @@ def _resolve_scope(db: Session, session_id: str, project_id: str, scenario_id: s
     return scenario
 
 
-def _pctx(session_id: str, project_id: str):
-    return session_registry.get_or_create_context(session_id, project_id)
+def _sctx(session_id: str, project_id: str, scenario_id: str):
+    """Per-scenario context (the SAME instance weather uses), with its PyHelios
+    Context created + snapshot loaded on first use. Geometry and weather share
+    this context → both persist to scenarios/<sid>/context_file/context.xml.
+    Caller has already validated scope via _resolve_scope.
+
+    The scenario lock is held ONLY to create the context (idempotent get-or-
+    create), then released — it must NOT be held across return (the plain Lock
+    is not re-entrant; mutation blocks re-acquire it separately)."""
+    with session_registry._scenario_lock:
+        sctx = session_registry.get_or_create_scenario_context(session_id, project_id, scenario_id)
+        if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
+            sctx.context = helios_ctx.Context()
+            load_scenario_snapshot(sctx)
+    return sctx
+
+
+def _with_scenario_lock(fn):
+    """Serialize a context-touching helper under the (re-entrant) scenario lock.
+    Geometry + weather now share one sctx.context, so every read/mutation/
+    serialize of it must be serialized. RLock makes the nested calls safe
+    (e.g. _apply_assignment_change → _rebuild → _teardown + _build)."""
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        with session_registry._scenario_lock:
+            return fn(*args, **kwargs)
+    return _wrapper
 
 
 def _object_or_404(db: Session, scenario_id: str, object_id: int) -> ScenarioObject:
@@ -230,29 +262,31 @@ def _winner_texture_path(db: Session, so: ScenarioObject) -> str | None:
     return material_apply.resolve_texture_path(values.get("texture_file"))
 
 
-def _teardown(pctx, so: ScenarioObject) -> None:
+@_with_scenario_lock
+def _teardown(sctx, so: ScenarioObject) -> None:
     """Remove the compound object (and its primitives) + runtime entries from
     the live context. ctx_object_id on the DB row is cleared (best-effort
     session cache; never trusted without a persisted_objects membership check)."""
-    ctx_object_id = pctx.ctx_objects.pop(so.id, None)
-    obj_id = pctx.persisted_objects.pop(so.id, None)
-    if obj_id is not None and obj_id in pctx.registry:
-        reg.delete_object(pctx, obj_id)
-    if helios_ctx.PYHELIOS_AVAILABLE and pctx.context is not None:
+    ctx_object_id = sctx.ctx_objects.pop(so.id, None)
+    obj_id = sctx.persisted_objects.pop(so.id, None)
+    if obj_id is not None and obj_id in sctx.registry:
+        reg.delete_object(sctx, obj_id)
+    if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is not None:
         try:
-            if ctx_object_id is not None and pctx.context.doesObjectExist(ctx_object_id):
-                pctx.context.deleteObject(ctx_object_id)
+            if ctx_object_id is not None and sctx.context.doesObjectExist(ctx_object_id):
+                sctx.context.deleteObject(ctx_object_id)
             else:
                 uuids = json.loads(so.helios_uuids or "[]")
                 if uuids:
-                    pctx.context.deletePrimitive(uuids)
+                    sctx.context.deletePrimitive(uuids)
         except Exception:
             pass    # object/primitives may already be gone (fresh context)
     so.ctx_object_id = None
-    material_apply.invalidate_geometry_caches(pctx)
+    material_apply.invalidate_geometry_caches(sctx)
 
 
-def _build(db: Session, pctx, so: ScenarioObject) -> list[int]:
+@_with_scenario_lock
+def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
     """Build the ground as a TileObject from its intrinsic properties, capture
     the compound-object id, persist the primitive UUIDs, then apply materials.
 
@@ -275,7 +309,7 @@ def _build(db: Session, pctx, so: ScenarioObject) -> list[int]:
     texture_path = _winner_texture_path(db, so)
 
     try:
-        ctx = helios_ctx.get_context(pctx)
+        ctx = helios_ctx.get_context(sctx)
         from pyhelios.types import RGBcolor, SphericalCoord, int2, vec2, vec3
 
         center = vec3(props.get("position_x") or 0,
@@ -298,6 +332,9 @@ def _build(db: Session, pctx, so: ScenarioObject) -> list[int]:
                 color=RGBcolor(*reg.DEFAULT_MATERIAL_COLOR[:3]),
             )
         uuids = list(ctx.getObjectPrimitiveUUIDs(ctx_object_id))
+        # Tag the object with its DB id so hydration can re-map it back to this
+        # row after a loadXML (object data round-trips; objIDs/UUIDs do not).
+        ctx.setObjectDataUInt(ctx_object_id, _SO_ID_TAG, so.id)
     except HTTPException:
         raise
     except Exception:
@@ -308,29 +345,40 @@ def _build(db: Session, pctx, so: ScenarioObject) -> list[int]:
                         "Unable to create geometry. Please try again")
 
     obj_id = reg.register_object(
-        pctx, so.name, "ground", uuids,
+        sctx, so.name, "ground", uuids,
         scenario_object_id=so.id,
         ctx_object_id=ctx_object_id,
         # The texture baked into THIS build — the rebuild-vs-reapply check.
         built_texture=texture_path,
     )
-    pctx.persisted_objects[so.id] = obj_id
-    pctx.ctx_objects[so.id] = ctx_object_id
+    sctx.persisted_objects[so.id] = obj_id
+    sctx.ctx_objects[so.id] = ctx_object_id
 
     so.helios_uuids = json.dumps(uuids)
     so.ctx_object_id = ctx_object_id
     db.commit()
 
-    material_apply.reapply_all_materials(db, pctx, so)
+    material_apply.reapply_all_materials(db, sctx, so)
+    _autosave(sctx)
     return uuids
 
 
-def _rebuild(db: Session, pctx, so: ScenarioObject) -> None:
-    _teardown(pctx, so)
-    _build(db, pctx, so)
+@_with_scenario_lock
+def _autosave(sctx) -> None:
+    """Persist the scenario's context (geometry + weather) to context.xml after
+    a geometry change. Locked so writeXML never serializes a context mid-mutation.
+    Best-effort — `trigger_scenario_autosave` no-ops when headless and
+    swallows/logs any writeXML failure (never fails the request)."""
+    trigger_scenario_autosave(sctx)
 
 
-def _apply_assignment_change(db: Session, pctx, so: ScenarioObject,
+def _rebuild(db: Session, sctx, so: ScenarioObject) -> None:
+    _teardown(sctx, so)
+    _build(db, sctx, so)
+
+
+@_with_scenario_lock
+def _apply_assignment_change(db: Session, sctx, so: ScenarioObject,
                              cleared_type_id: int | None = None) -> None:
     """Repaint after an assignment add/remove/edit. Rebuild when the winning
     texture changed (texture is baked into the TileObject), else clear the
@@ -338,17 +386,18 @@ def _apply_assignment_change(db: Session, pctx, so: ScenarioObject,
     in place. Safe no-op when headless or the object isn't built this session."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         return
-    if so.id not in pctx.persisted_objects:
+    if so.id not in sctx.persisted_objects:
         return    # hydration will paint it correctly later
     desired = _winner_texture_path(db, so)
-    obj_id = pctx.persisted_objects.get(so.id)
-    built = pctx.registry.get(obj_id, {}).get("built_texture") if obj_id is not None else None
+    obj_id = sctx.persisted_objects.get(so.id)
+    built = sctx.registry.get(obj_id, {}).get("built_texture") if obj_id is not None else None
     if (desired or None) != (built or None):
-        _rebuild(db, pctx, so)    # fresh primitives; _build re-applies everything
+        _rebuild(db, sctx, so)    # fresh primitives; _build re-applies everything
         return
     if cleared_type_id is not None:
-        material_apply.clear_material_from_primitives(db, pctx, so, cleared_type_id)
-    material_apply.reapply_all_materials(db, pctx, so)
+        material_apply.clear_material_from_primitives(db, sctx, so, cleared_type_id)
+    material_apply.reapply_all_materials(db, sctx, so)
+    _autosave(sctx)   # rebuild branch already autosaved via _build + returned
 
 
 # Intrinsic Ground properties that map to an in-place PyHelios object op.
@@ -360,24 +409,25 @@ _INPLACE_KEYS = _TRANSLATE_KEYS | _SCALE_KEYS | _RESOLUTION_KEYS | {"rotation_z"
 _RECREATE_KEYS = {"texture_x", "texture_y"}
 
 
-def _apply_intrinsic_change(db: Session, pctx, so: ScenarioObject,
+@_with_scenario_lock
+def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
                             old_vals: dict, new_vals: dict, changed: set[str]) -> None:
     """Apply an intrinsic-property change WITHOUT a full rebuild where possible
     (decision #6): position→translateObject, length/breadth→scaleObject,
     rotation_z→rotateObject, resolution→setTileObjectSubdivisionCount. texture
     repeat (and any non-decomposable change) recreates the one object. Falls back
     to a rebuild whenever the live object id is missing/dead."""
-    if not helios_ctx.PYHELIOS_AVAILABLE or so.id not in pctx.persisted_objects:
+    if not helios_ctx.PYHELIOS_AVAILABLE or so.id not in sctx.persisted_objects:
         return
-    ctx = helios_ctx.get_context(pctx)
-    ctx_object_id = pctx.ctx_objects.get(so.id)
+    ctx = helios_ctx.get_context(sctx)
+    ctx_object_id = sctx.ctx_objects.get(so.id)
     if ctx_object_id is None or not ctx.doesObjectExist(ctx_object_id):
-        _rebuild(db, pctx, so)
+        _rebuild(db, sctx, so)
         return
 
     # texture-repeat or a non-decomposable key → recreate this object only.
     if (changed & _RECREATE_KEYS) or (changed - _INPLACE_KEYS - _RECREATE_KEYS):
-        _rebuild(db, pctx, so)
+        _rebuild(db, sctx, so)
         return
 
     from pyhelios.types import int2, vec3
@@ -400,7 +450,7 @@ def _apply_intrinsic_change(db: Session, pctx, so: ScenarioObject,
         # shear it, so recreate when the (post-change) tile is rotated. Apply
         # rotation first (above) so a rotate-to-zero is already in effect here.
         if (new_vals.get("rotation_z") or 0) % 360 != 0:
-            _rebuild(db, pctx, so)
+            _rebuild(db, sctx, so)
             return
         old_l = old_vals.get("length") or 1
         old_b = old_vals.get("breadth") or 1
@@ -416,59 +466,89 @@ def _apply_intrinsic_change(db: Session, pctx, so: ScenarioObject,
         # Subdivision REGENERATES the tile's primitives — re-read UUIDs and
         # re-apply materials. If the object id didn't survive, recreate.
         if not ctx.doesObjectExist(ctx_object_id):
-            _rebuild(db, pctx, so)
+            _rebuild(db, sctx, so)
             return
         uuids = list(ctx.getObjectPrimitiveUUIDs(ctx_object_id))
         so.helios_uuids = json.dumps(uuids)
         db.commit()
-        material_apply.reapply_all_materials(db, pctx, so)
+        material_apply.reapply_all_materials(db, sctx, so)
 
-    material_apply.invalidate_geometry_caches(pctx)
+    material_apply.invalidate_geometry_caches(sctx)
+    _autosave(sctx)
 
 
-def ensure_hydrated(db: Session, pctx, scenario_id: str) -> None:
-    """Hydrate this scenario's persisted objects into the live context —
-    stored UUIDs are session-scoped (spec §12.3). Cheap no-op once done.
+@_with_scenario_lock
+def ensure_hydrated(db: Session, sctx, scenario_id: str) -> None:
+    """Make this scenario's geometry live in its own context, exactly once.
 
-    Scenario switch (spec §12.3): the per-project context holds ONE active
-    scenario at a time — other scenarios' persisted objects are torn down
-    first, so whole-context reads never mix scenarios.
+    The scenario's `context.xml` (loaded by `_sctx` via `load_scenario_snapshot`)
+    already holds the saved geometry + materials + weather. Re-map each loaded
+    compound object back to its DB row via the `helios_gui_so_id` object-data tag
+    — objIDs/UUIDs are NOT preserved across the XML round-trip, so refresh the
+    session-scoped `ctx_object_id`/`helios_uuids`. There is NO material repaint:
+    color (material label), model data, and texture all came back with the XML.
 
-    The scenario is marked hydrated only after the loop; individual build
-    failures are skipped (object stays DB-only with helios_uuids=[]) and
-    retried on the next touch via the rebuild-first paths.
-    """
-    if scenario_id in pctx.hydrated_scenarios:
+    DB rows with no tagged object in the XML are built from the DB (the normal
+    `_build` path — applies materials + tags + autosaves). Tagged objects with no
+    DB row are deleted (the DB owns the object set). Marked hydrated only after
+    the pass; per-object build failures leave the row DB-only and are retried."""
+    if sctx.hydrated:
+        return
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        sctx.hydrated = True
         return
 
-    # Tear down persisted objects belonging to OTHER scenarios.
-    if pctx.persisted_objects:
-        foreign = (
-            db.query(ScenarioObject)
-            .filter(
-                ScenarioObject.id.in_(list(pctx.persisted_objects.keys())),
-                ScenarioObject.scenario_id != scenario_id,
-            )
-            .all()
-        )
-        for so in foreign:
-            _teardown(pctx, so)
-        if foreign:
-            pctx.hydrated_scenarios.clear()
-
+    ctx = helios_ctx.get_context(sctx)
     rows = (
         db.query(ScenarioObject)
         .filter(ScenarioObject.scenario_id == scenario_id)
         .order_by(ScenarioObject.created_at, ScenarioObject.id)
         .all()
     )
-    for so in rows:
-        if so.id not in pctx.persisted_objects:
+    by_id = {so.id: so for so in rows}
+    mapped: set[int] = set()
+
+    # Re-map objects restored from context.xml back to their DB rows via the tag.
+    try:
+        loaded_obj_ids = list(ctx.getAllObjectIDs())
+    except Exception:
+        loaded_obj_ids = []
+    for obj_id in loaded_obj_ids:
+        try:
+            if not ctx.doesObjectDataExist(obj_id, _SO_ID_TAG):
+                continue
+            so_id = int(ctx.getObjectData(obj_id, _SO_ID_TAG))
+        except Exception:
+            continue
+        so = by_id.get(so_id)
+        if so is None:
             try:
-                _build(db, pctx, so)
+                ctx.deleteObject(obj_id)   # orphan: DB owns the object set
+            except Exception:
+                pass
+            continue
+        uuids = list(ctx.getObjectPrimitiveUUIDs(obj_id))
+        reg_id = reg.register_object(
+            sctx, so.name, "ground", uuids,
+            scenario_object_id=so.id, ctx_object_id=obj_id,
+            built_texture=_winner_texture_path(db, so),
+        )
+        sctx.persisted_objects[so.id] = reg_id
+        sctx.ctx_objects[so.id] = obj_id
+        so.helios_uuids = json.dumps(uuids)
+        so.ctx_object_id = obj_id
+        mapped.add(so.id)
+
+    # DB rows missing from the XML → build from DB (applies materials + tags).
+    for so in rows:
+        if so.id not in mapped and so.id not in sctx.persisted_objects:
+            try:
+                _build(db, sctx, so)
             except HTTPException:
                 continue    # leave DB-only; retried by rebuild-first paths
-    pctx.hydrated_scenarios.add(scenario_id)
+
+    db.commit()
+    sctx.hydrated = True
 
 
 # ── Serialization ────────────────────────────────────────────────────────────
@@ -636,15 +716,15 @@ def _assignment_payload(db: Session, so: ScenarioObject, om: ObjectMaterial) -> 
     return payload
 
 
-def serialize_object(db: Session, pctx, so: ScenarioObject,
+def serialize_object(db: Session, sctx, so: ScenarioObject,
                      include_materials: bool = True) -> dict:
     ot = db.get(ObjectType, so.object_type_id)
     defs = load_type_properties(db, object_type_id=so.object_type_id)
     values = _intrinsic_native(db, so.id)
-    obj_id = pctx.persisted_objects.get(so.id)
+    obj_id = sctx.persisted_objects.get(so.id)
     # ctx_object_id is session-scoped — only meaningful when the object is built
     # in THIS session; emit null otherwise so a stale DB value never leaks.
-    ctx_object_id = pctx.ctx_objects.get(so.id) if so.id in pctx.persisted_objects else None
+    ctx_object_id = sctx.ctx_objects.get(so.id) if so.id in sctx.persisted_objects else None
     out = {
         "id": so.id,
         "name": so.name,
@@ -676,8 +756,8 @@ def serialize_object(db: Session, pctx, so: ScenarioObject,
 def create_object(db: Session, session_id: str, project_id: str,
                   scenario_id: str, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
 
     ot = db.get(ObjectType, body.object_type_id)
     if ot is None:
@@ -740,21 +820,21 @@ def create_object(db: Session, session_id: str, project_id: str,
     db.refresh(so)
 
     try:
-        _build(db, pctx, so)
+        _build(db, sctx, so)
     except HTTPException:
         # Compensate: a create whose build failed must not leave a
         # DB-only object behind (user story: "Unable to create geometry").
         db.delete(so)
         db.commit()
         raise
-    return {"success": True, "object": serialize_object(db, pctx, so)}
+    return {"success": True, "object": serialize_object(db, sctx, so)}
 
 
 def list_objects(db: Session, session_id: str, project_id: str,
                  scenario_id: str, search: str | None) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
 
     rows = (
         db.query(ScenarioObject)
@@ -781,7 +861,7 @@ def list_objects(db: Session, session_id: str, project_id: str,
             "object_type": type_names.get(so.object_type_id),
             "group_id": so.group_id,
             "visibility": _visibility_of(db, so),
-            "viewport": {"object_id": pctx.persisted_objects.get(so.id)},
+            "viewport": {"object_id": sctx.persisted_objects.get(so.id)},
             "material_count": material_counts.get(so.id, 0),
             "created_at": so.created_at,
             "updated_at": so.updated_at,
@@ -793,17 +873,17 @@ def list_objects(db: Session, session_id: str, project_id: str,
 def get_object(db: Session, session_id: str, project_id: str,
                scenario_id: str, object_id: int) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
-    return {"object": serialize_object(db, pctx, so)}
+    return {"object": serialize_object(db, sctx, so)}
 
 
 def update_object(db: Session, session_id: str, project_id: str,
                   scenario_id: str, object_id: int, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
 
     intrinsic_change = None
@@ -845,14 +925,14 @@ def update_object(db: Session, session_id: str, project_id: str,
     db.refresh(so)
 
     if intrinsic_change is not None:
-        _apply_intrinsic_change(db, pctx, so, *intrinsic_change)
-    return {"success": True, "object": serialize_object(db, pctx, so)}
+        _apply_intrinsic_change(db, sctx, so, *intrinsic_change)
+    return {"success": True, "object": serialize_object(db, sctx, so)}
 
 
 def rename_object(db: Session, session_id: str, project_id: str,
                   scenario_id: str, object_id: int, name: str) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
     new_name = validate_name(name)
     if new_name.lower() != so.name.lower() and new_name.lower() in _object_names_lower(db, scenario_id):
@@ -860,9 +940,9 @@ def rename_object(db: Session, session_id: str, project_id: str,
     so.name = new_name
     db.commit()
     db.refresh(so)
-    obj_id = pctx.persisted_objects.get(so.id)
-    if obj_id is not None and obj_id in pctx.registry:
-        pctx.registry[obj_id]["name"] = new_name
+    obj_id = sctx.persisted_objects.get(so.id)
+    if obj_id is not None and obj_id in sctx.registry:
+        sctx.registry[obj_id]["name"] = new_name
     return {"success": True,
             "object": {"id": so.id, "name": so.name, "updated_at": so.updated_at}}
 
@@ -870,15 +950,16 @@ def rename_object(db: Session, session_id: str, project_id: str,
 def delete_object(db: Session, session_id: str, project_id: str,
                   scenario_id: str, object_id: int) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
 
     # deleteObject removes the compound object and its primitives, so the
     # per-primitive material data dies with them — no label cleanup needed.
-    _teardown(pctx, so)
+    _teardown(sctx, so)
     db.delete(so)   # cascades intrinsic + snapshot rows + assignments
     db.commit()
+    _autosave(sctx)
     return {"success": True, "object_id": object_id}
 
 
@@ -891,24 +972,26 @@ def next_name(db: Session, session_id: str, project_id: str,
     return {"name": next_default_name(_object_names_lower(db, scenario_id), ot.object)}
 
 
+@_with_scenario_lock
 def get_object_geometry_binary(db: Session, session_id: str, project_id: str,
                                scenario_id: str, object_id: int) -> bytes:
     """getObjectGeometry (spec §5.8): binary buffer for the stored UUIDs.
     Rebuild-first contract: an object not built in this session is built
     before serving, so stale prior-session UUIDs are never packed."""
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
     if not helios_ctx.PYHELIOS_AVAILABLE:
         raise api_error(503, "PYHELIOS_UNAVAILABLE", "PyHelios not available")
-    if so.id not in pctx.persisted_objects:
-        _build(db, pctx, so)    # retry path for a previously failed build
+    if so.id not in sctx.persisted_objects:
+        _build(db, sctx, so)    # retry path for a previously failed build
     uuids = json.loads(so.helios_uuids or "[]")
     from app.services.geometry_pack import pack_primitives_binary
-    return pack_primitives_binary(helios_ctx.get_context(pctx), uuids)
+    return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
 
 
+@_with_scenario_lock
 def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
                               scenario_id: str) -> bytes:
     """Whole-scene binary for one scenario's persisted objects (spec §12.3
@@ -919,8 +1002,8 @@ def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
     endpoint is the supported whole-scene fetch for persisted geometry.
     """
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     if not helios_ctx.PYHELIOS_AVAILABLE:
         raise api_error(503, "PYHELIOS_UNAVAILABLE", "PyHelios not available")
     rows = (
@@ -931,10 +1014,10 @@ def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
     )
     uuids: list[int] = []
     for so in rows:
-        if so.id in pctx.persisted_objects:
+        if so.id in sctx.persisted_objects:
             uuids.extend(json.loads(so.helios_uuids or "[]"))
     from app.services.geometry_pack import pack_primitives_binary
-    return pack_primitives_binary(helios_ctx.get_context(pctx), uuids)
+    return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
 
 
 # ── Scenario-level run configuration (spec §5.9) ─────────────────────────────
@@ -1106,17 +1189,18 @@ def delete_group_objects(db: Session, session_id: str, project_id: str,
     purge). Each member is torn down from the live context, then the DB rows
     cascade (intrinsic + snapshot + assignment + per-model rows)."""
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)   # so live objects exist for teardown
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)   # so live objects exist for teardown
     grp = _group_or_404(db, scenario_id, group_id)
 
     members = _group_members(db, group_id)
     deleted = [so.id for so in members]
     for so in members:
-        _teardown(pctx, so)
+        _teardown(sctx, so)
         db.delete(so)
     db.delete(grp)
     db.commit()
+    _autosave(sctx)
     return {"success": True, "group_id": group_id, "deleted_object_ids": deleted}
 
 
@@ -1126,8 +1210,8 @@ def delete_group_objects(db: Session, session_id: str, project_id: str,
 def assign_material(db: Session, session_id: str, project_id: str,
                     scenario_id: str, object_id: int, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
 
     # Materials are GLOBAL (migration 019) — no same-project/scenario check.
@@ -1152,7 +1236,7 @@ def assign_material(db: Session, session_id: str, project_id: str,
     _snapshot_frozen(db, so.id, pm.id)   # snapshot every assignment
     db.commit()
 
-    _apply_assignment_change(db, pctx, so)
+    _apply_assignment_change(db, sctx, so)
     om = db.get(ObjectMaterial, (so.id, pm.id))
     return {"success": True, "assignment": _assignment_payload(db, so, om)}
 
@@ -1160,8 +1244,8 @@ def assign_material(db: Session, session_id: str, project_id: str,
 def list_assignments(db: Session, session_id: str, project_id: str,
                      scenario_id: str, object_id: int) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
     assignments = (
         db.query(ObjectMaterial)
@@ -1183,8 +1267,8 @@ def _assignment_or_404(db: Session, so_id: int, material_id: int) -> ObjectMater
 def update_assignment(db: Session, session_id: str, project_id: str,
                       scenario_id: str, object_id: int, material_id: int, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
     om = _assignment_or_404(db, so.id, material_id)
 
@@ -1227,7 +1311,7 @@ def update_assignment(db: Session, session_id: str, project_id: str,
     # Clear this material type's stale labels then re-apply (or rebuild if the
     # winning texture changed). cleared_type_id drops labels a property edit
     # may have removed.
-    _apply_assignment_change(db, pctx, so, cleared_type_id=om.material_type_id)
+    _apply_assignment_change(db, sctx, so, cleared_type_id=om.material_type_id)
 
     om = db.get(ObjectMaterial, (so.id, material_id))
     return {"success": True, "assignment": _assignment_payload(db, so, om)}
@@ -1236,8 +1320,8 @@ def update_assignment(db: Session, session_id: str, project_id: str,
 def unassign_material(db: Session, session_id: str, project_id: str,
                       scenario_id: str, object_id: int, material_id: int) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
-    pctx = _pctx(session_id, project_id)
-    ensure_hydrated(db, pctx, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
     om = _assignment_or_404(db, so.id, material_id)
 
@@ -1246,5 +1330,5 @@ def unassign_material(db: Session, session_id: str, project_id: str,
     db.commit()
     # Clear the removed material type's labels + reset color, then re-apply the
     # remaining assignments (or the default when none remain).
-    _apply_assignment_change(db, pctx, so, cleared_type_id=old_type_id)
+    _apply_assignment_change(db, sctx, so, cleared_type_id=old_type_id)
     return {"success": True, "object_id": object_id, "material_id": material_id}

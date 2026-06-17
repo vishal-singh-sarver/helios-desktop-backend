@@ -36,6 +36,12 @@ class ScenarioContext:
         "gpu_geometry_cache",
         "gpu_children_cache",
         "script_object_counter",
+        # Persisted scene objects (Phase 2) — DB scenario_object.id → runtime
+        # registry object_id, and → live PyHelios compound-object id. `hydrated`
+        # guards the one-time loadXML/build of this scenario's geometry.
+        "persisted_objects",
+        "ctx_objects",
+        "hydrated",
     )
 
     def __init__(self, project_id: str, scenario_id: str):
@@ -52,6 +58,9 @@ class ScenarioContext:
         self.gpu_geometry_cache = {}
         self.gpu_children_cache = {}
         self.script_object_counter = 0
+        self.persisted_objects = {}
+        self.ctx_objects = {}
+        self.hydrated = False
 
     def reset(self):
         """Wipe all state for a fresh load. Old C++ context gets GC'd."""
@@ -66,3 +75,6 @@ class ScenarioContext:
         self.gpu_geometry_cache = {}
         self.gpu_children_cache = {}
         self.script_object_counter = 0
+        self.persisted_objects = {}
+        self.ctx_objects = {}
+        self.hydrated = False

@@ -23,8 +23,11 @@ class SessionRegistry:
         self._store: dict[str, dict[str, ProjectContext]] = {}
         # {session_id: {project_id: {scenario_id: ScenarioContext}}}
         self._scenarios: dict[str, dict[str, dict[str, ScenarioContext]]] = {}
-        # Lock to prevent race conditions during scenario initialization/loading
-        self._scenario_lock = threading.Lock()
+        # Serializes access to a scenario's shared PyHelios context (geometry +
+        # weather live in the same sctx.context now). Re-entrant so the nested
+        # scene-object helpers (e.g. _apply_assignment_change → _rebuild →
+        # _build, each acquiring) don't self-deadlock.
+        self._scenario_lock = threading.RLock()
 
     # ── Session level ────────────────────────────────────────────────
 

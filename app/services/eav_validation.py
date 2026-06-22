@@ -45,8 +45,13 @@ _EXCLUSIVE_MIN: set[str] = set()
 # Required intrinsic properties per object type (the catalog has no
 # `required` column — this is the single source for both the catalog
 # response and create-time validation).
+#
+# Story (create ground): the form populates EVERY parameter with a default, and
+# clearing any one (on create or edit) must fail "Field is required" — so every
+# Ground parameter is required, including position_x/y/z and rotation_z.
 REQUIRED_OBJECT_PROPERTIES = {
     "Ground": {"length", "breadth", "resolution_x", "resolution_y",
+               "position_x", "position_y", "position_z", "rotation_z",
                "texture_x", "texture_y"},
 }
 

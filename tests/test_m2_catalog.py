@@ -26,7 +26,9 @@ def test_object_types_ground_properties(client):
     assert by_prop["resolution_x"]["max"] == 25000
     assert by_prop["resolution_x"]["required"] is True
     assert by_prop["rotation_z"]["max"] == 360
-    assert by_prop["rotation_z"]["required"] is False
+    # Every Ground parameter is required (story: clearing any → "Field is required").
+    assert by_prop["rotation_z"]["required"] is True
+    assert by_prop["position_x"]["required"] is True
     assert by_prop["position_x"]["min"] is None
 
     # Crop is seeded with no property links yet

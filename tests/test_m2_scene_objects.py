@@ -179,6 +179,39 @@ def test_ground_size_and_texture_resolution_bounds(client):
     assert r.status_code == 400 and r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
 
 
+def test_all_ground_params_required(client):
+    """Story: every Ground parameter is populated with a default and clearing any
+    one (on create OR edit) must fail "Field is required". position_x/y/z and
+    rotation_z were previously optional — this locks them in alongside the rest."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    ot = _ot_id(client)
+    url = _base(pid, sid) + "/objects"
+
+    # CREATE: each newly-required param is rejected when omitted or cleared (null).
+    for field in ("position_x", "position_y", "position_z", "rotation_z"):
+        missing = {k: v for k, v in GROUND_PROPS.items() if k != field}
+        r = client.post(url, json={"object_type_id": ot, "properties": missing}, headers=h)
+        assert r.status_code == 400, f"{field} omitted should fail"
+        assert r.json()["detail"] == {"error": f"{field} is required",
+                                      "code": "MISSING_REQUIRED_PROPERTY"}
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, **{field: None})}, headers=h)
+        assert r.status_code == 400, f"{field} cleared should fail"
+        assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
+
+    # EDIT: clearing a required param is rejected and the geometry stays unchanged.
+    oid = client.post(url, json={"object_type_id": ot,
+                      "properties": GROUND_PROPS}, headers=h).json()["object"]["id"]
+    for field in ("position_y", "rotation_z"):
+        r = client.patch(f"{url}/{oid}", json={"properties": {field: None}}, headers=h)
+        assert r.status_code == 400, f"clearing {field} on edit should fail"
+        assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
+    o = client.get(f"{url}/{oid}", headers=h).json()["object"]
+    assert o["properties"]["position_y"] == GROUND_PROPS["position_y"]
+    assert o["properties"]["rotation_z"] == GROUND_PROPS["rotation_z"]
+
+
 def test_list_get_update_rename_delete(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
@@ -266,11 +299,11 @@ def test_patch_cannot_null_required_property(client):
                      json={"properties": {"length": None}}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
-    # Optional properties may still be cleared
+    # Every Ground param is required now (incl. rotation_z) — none can be nulled.
     r = client.patch(_base(pid, sid) + f"/objects/{obj['id']}",
                      json={"properties": {"rotation_z": None}}, headers=h)
-    assert r.status_code == 200
-    assert r.json()["object"]["properties"]["rotation_z"] is None
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
 
 
 def _model_ids(client):

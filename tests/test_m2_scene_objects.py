@@ -101,11 +101,14 @@ def test_create_ground_validation(client):
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
 
-    # length must be strictly positive (exclusive lower bound)
+    # length/breadth bound is inclusive [1, 1,000,000]; 0 is below the min.
+    # The message shows plain integers (1000000, not 1e+06).
     bad = dict(GROUND_PROPS, length=0)
     r = client.post(_base(pid, sid) + "/objects",
                     json={"object_type_id": ot, "properties": bad}, headers=h)
     assert r.status_code == 400
+    assert r.json()["detail"] == {"error": "Values should be between (1 - 1000000)",
+                                  "code": "VALUE_OUT_OF_RANGE"}
 
     # Unknown property
     bad = dict(GROUND_PROPS, wingspan=3)
@@ -128,6 +131,52 @@ def test_create_ground_validation(client):
                     json={"object_type_id": _ot_id(client, "Crop"), "properties": {}},
                     headers=h)
     assert r.status_code == 400
+
+
+def test_ground_size_and_texture_resolution_bounds(client):
+    """Story 'create a ground': size (length/breadth) is the inclusive range
+    [1, 1,000,000], and the texture repeat count may not exceed the resolution —
+    enforced on both create and update (the update rule sees the merged values)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    ot = _ot_id(client)
+    url = _base(pid, sid) + "/objects"
+
+    # Inclusive boundaries: length 1 and 1,000,000 are both accepted.
+    for boundary in (1, 1_000_000):
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, length=boundary)}, headers=h)
+        assert r.status_code == 201, r.text
+
+    # Just past the max is rejected.
+    r = client.post(url, json={"object_type_id": ot,
+                    "properties": dict(GROUND_PROPS, length=1_000_001)}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+
+    # texture_x must not exceed resolution_x on create (resolution is 100); the
+    # message reports the resolution as a plain integer.
+    r = client.post(url, json={"object_type_id": ot,
+                    "properties": dict(GROUND_PROPS, texture_x=200)}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"] == {"error": "Values should be between (1 - 100)",
+                                  "code": "VALUE_OUT_OF_RANGE"}
+
+    # texture == resolution is allowed (inclusive upper bound).
+    r = client.post(url, json={"object_type_id": ot, "name": "EdgeTex",
+                    "properties": dict(GROUND_PROPS, texture_x=100, texture_y=100)},
+                    headers=h)
+    assert r.status_code == 201, r.text
+
+    # On update the rule sees the MERGED values: raising texture above the
+    # stored resolution is rejected...
+    oid = client.post(url, json={"object_type_id": ot, "name": "UpdMe",
+                      "properties": GROUND_PROPS}, headers=h).json()["object"]["id"]
+    r = client.patch(f"{url}/{oid}", json={"properties": {"texture_x": 200}}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+    # ...and so is lowering the resolution below the already-stored texture.
+    r = client.patch(f"{url}/{oid}", json={"properties": {"resolution_x": 2}}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
 
 
 def test_list_get_update_rename_delete(client):
@@ -405,6 +454,15 @@ def test_groups_lifecycle(client):
         "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
     o2 = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
+
+    # A group needs at least 2 distinct geometries: one member is rejected,
+    # and the same id listed twice still counts as one.
+    r = client.post(_base(pid, sid) + "/groups",
+                    json={"member_ids": [o1["id"]]}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "GROUP_MIN_MEMBERS"
+    r = client.post(_base(pid, sid) + "/groups",
+                    json={"member_ids": [o1["id"], o1["id"]]}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "GROUP_MIN_MEMBERS"
 
     r = client.post(_base(pid, sid) + "/groups",
                     json={"member_ids": [o1["id"], o2["id"]]}, headers=h)
@@ -690,7 +748,8 @@ def test_geometry_persists_to_context_xml_and_reloads(client):
     from app.core.config import settings
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    props = {**GROUND_PROPS, "rotation_z": 0, "resolution_x": 2, "resolution_y": 2}
+    props = {**GROUND_PROPS, "rotation_z": 0, "resolution_x": 2, "resolution_y": 2,
+             "texture_x": 1, "texture_y": 1}
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client), "properties": props}, headers=h).json()["object"]
     oid = obj["id"]
@@ -718,7 +777,8 @@ def test_color_survives_reload_via_material_label(client):
                        {"color_r": 200, "color_g": 50, "color_b": 50})
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
-        "properties": {**GROUND_PROPS, "resolution_x": 2, "resolution_y": 2},
+        "properties": {**GROUND_PROPS, "resolution_x": 2, "resolution_y": 2,
+                       "texture_x": 1, "texture_y": 1},
         "materials": [{"material_id": rad["id"], "sync": True}],
     }, headers=h).json()["object"]
     oid = obj["id"]

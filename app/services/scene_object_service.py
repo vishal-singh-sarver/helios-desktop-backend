@@ -329,7 +329,7 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
         else:
             ctx_object_id = ctx.addTileObject(
                 center=center, size=size, rotation=rotation, subdiv=subdiv,
-                color=RGBcolor(*reg.DEFAULT_MATERIAL_COLOR[:3]),
+                texturefile=material_apply._DEFAULT_GROUND_TEXTURE, texture_repeat=subdiv,
             )
         uuids = list(ctx.getObjectPrimitiveUUIDs(ctx_object_id))
         # Tag the object with its DB id so hydration can re-map it back to this

@@ -22,6 +22,7 @@ from app.routers import (
     catalog,
     scene_objects,
     material_library,
+    textures,
 )
 
 app = FastAPI(
@@ -68,3 +69,5 @@ app.include_router(data_unit.router,        prefix="/api/data-units", tags=["cat
 app.include_router(catalog.router,          prefix="/api/catalog",    tags=["m2-catalog"])
 app.include_router(scene_objects.router,    prefix="/api/geometry",   tags=["m2-geometry"])
 app.include_router(material_library.router, prefix="/api/materials",  tags=["m2-materials"])
+# Texture image serving for the 3D viewport (GET /api/textures/serve?path=…).
+app.include_router(textures.router,         prefix="/api/textures",   tags=["textures"])

@@ -12,11 +12,12 @@ library sync). Two channels are handled here:
     everything    -> ctx.setPrimitiveData<typed>(uuids, name, value) (model data,
     else                                                              one label each)
 
-The TEXTURE channel (texture_file) is NOT handled here: PyHelios can only tile a
-texture (texture_repeat) when the texture is baked into the TileObject at build
-time, so scene_object_service._build owns texture, and a texture change forces a
-rebuild of that one object. reapply_all_materials therefore never touches the
-primitive texture.
+The TEXTURE channel (texture_file) is applied here too, on the SAME per-object
+label: setMaterialTexture puts the winning texture — or the default soil when
+nothing is assigned — on the label; an empty string clears it so the material
+colour shows. The UVs/tiling are baked into the TileObject by
+scene_object_service._build (subdiv x texture_repeat); only the texture *image*
+is set here.
 
 Snapshot source: object_property_data rows for the (object, material) pair —
 written on assign by scene_object_service._snapshot_frozen for EVERY assignment.
@@ -57,6 +58,34 @@ from app.services.eav_validation import (
 # question #6): the Radiation-type material owns the single-valued color/texture
 # channel; otherwise the most recently assigned one does.
 _PRECEDENCE_TYPE = "Radiation"
+
+def _resolve_default_ground_texture() -> str:
+    """Absolute path to the bundled PyHelios soil texture
+    (plugins/visualizer/textures/dirt.jpg), used as the default ground surface
+    when no material texture is assigned. The existing plugin texture is used
+    directly — no copy — and it sits inside get_texture_dirs(), so
+    /api/textures/serve is allowed to serve it."""
+    try:
+        import pyhelios
+        # __path__[0] is the inner package; the plugin trees live at its parent.
+        bases = [Path(p) for p in pyhelios.__path__]
+        bases += [b.parent for b in bases]
+    except Exception:
+        return ""
+    for base in bases:
+        for cand in (
+            base / "pyhelios_build/build/plugins/visualizer/textures/dirt.jpg",
+            base / "helios-core/plugins/visualizer/textures/dirt.jpg",
+        ):
+            if cand.exists():
+                return str(cand)
+    return ""
+
+
+# Default ground surface texture — the bundled PyHelios soil
+# (plugins/visualizer/textures/dirt.jpg). SINGLE source for the path;
+# scene_object_service._build bakes the same file at create time.
+_DEFAULT_GROUND_TEXTURE = _resolve_default_ground_texture()
 
 # datatype -> the Context.setPrimitiveData<typed> method that stores it.
 # boolean has no native bool setter, so it rides UInt as 0/1 (matching Helios'
@@ -139,13 +168,17 @@ def _color_label(so) -> str:
     return f"so_{so.id}"
 
 
-def _set_color_label(ctx, uuids: list[int], label: str, rgb: tuple[float, float, float]) -> None:
-    """Point the object's primitives at a Helios material whose color is `rgb`
-    (0..1 floats). Created on first use, recoloured on later calls."""
+def _set_color_label(ctx, uuids: list[int], label: str,
+                     rgb: tuple[float, float, float], tex: str) -> None:
+    """Point the object's primitives at the per-object Helios material, carrying
+    its colour (`rgb`, 0..1) AND its texture (`tex`: a file path to show that
+    image, or "" to show the solid colour). Created on first use, updated after.
+    The texture image lives on this material; the UVs were baked at build time."""
     from pyhelios.types import RGBAcolor
     if not ctx.doesMaterialExist(label):
         ctx.addMaterial(label)
     ctx.setMaterialColor(label, RGBAcolor(rgb[0], rgb[1], rgb[2], 1.0))
+    ctx.setMaterialTexture(label, tex)
     ctx.assignMaterialToPrimitive(uuids, label)
 
 
@@ -157,6 +190,19 @@ def _winner_color(db: Session, so_id: int, winner) -> tuple[float, float, float]
         if r is not None or g is not None or b is not None:
             return ((r or 0) / 255.0, (g or 0) / 255.0, (b or 0) / 255.0)
     return reg.DEFAULT_MATERIAL_COLOR[:3]
+
+
+def _winner_texture(db: Session, so_id: int, winner) -> str:
+    """Texture string for the object's material, decided by the precedence winner:
+        no material        -> the default soil (an unstyled ground reads as soil)
+        texture winner     -> that texture's resolved path
+        color-only winner  -> "" (cleared, so the winner's solid colour shows)
+    Fed to setMaterialTexture: a path renders the image, "" renders the colour
+    (geometry_pack keys off getPrimitiveTextureFile being non-empty vs empty)."""
+    if winner is None:
+        return _DEFAULT_GROUND_TEXTURE
+    values = _assignment_snapshot_native(db, so_id, winner.project_material_id)
+    return resolve_texture_path(values.get("texture_file")) or ""
 
 
 def _apply_model_data(ctx, uuids: list[int], defs: dict, values: dict) -> None:
@@ -212,11 +258,12 @@ def clear_material_from_primitives(db: Session, sctx, so, material_type_id: int)
 def reapply_all_materials(db: Session, sctx, so) -> None:
     """Re-apply every current assignment's snapshot onto the object's primitives.
 
-    Applies every assignment's model-data labels (setPrimitiveData), then sets
-    the object's color material label to the precedence winner's color (default
-    when nothing is assigned). Color goes through a Helios material label so it
-    serializes into context.xml — reload needs no repaint. Safe no-op when
-    headless, the object isn't built this session, or it has no live primitives."""
+    Applies every assignment's model-data labels (setPrimitiveData), then sets the
+    object's per-object material to the precedence winner's colour AND texture
+    (default soil texture + default colour when nothing is assigned). Both go
+    through a Helios material label so they serialize into context.xml — reload
+    needs no repaint. Safe no-op when headless, the object isn't built this
+    session, or it has no live primitives."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         return
     if so.id not in sctx.persisted_objects:
@@ -238,7 +285,9 @@ def reapply_all_materials(db: Session, sctx, so) -> None:
         _apply_model_data(ctx, uuids, defs, values)
 
     winner = _winning_assignment(db, assignments)
-    _set_color_label(ctx, uuids, _color_label(so), _winner_color(db, so.id, winner))
+    _set_color_label(ctx, uuids, _color_label(so),
+                     _winner_color(db, so.id, winner),
+                     _winner_texture(db, so.id, winner))
 
     invalidate_geometry_caches(sctx)
 

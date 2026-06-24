@@ -26,8 +26,12 @@ def test_object_types_ground_properties(client):
     assert by_prop["resolution_x"]["max"] == 25000
     assert by_prop["resolution_x"]["required"] is True
     assert by_prop["rotation_z"]["max"] == 360
-    assert by_prop["rotation_z"]["required"] is False
-    assert by_prop["position_x"]["min"] is None
+    # Every Ground parameter is required (story: clearing any → "Field is required").
+    assert by_prop["rotation_z"]["required"] is True
+    assert by_prop["position_x"]["required"] is True
+    # Position is the inclusive range [-1,000,000, +1,000,000] (migration 020).
+    assert by_prop["position_x"]["min"] == -1000000
+    assert by_prop["position_x"]["max"] == 1000000
 
     # Crop is seeded with no property links yet
     assert by_name["Crop"]["properties"] == []

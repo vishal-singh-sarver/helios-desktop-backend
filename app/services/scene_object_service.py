@@ -62,6 +62,7 @@ from app.services.eav_validation import (
     load_type_properties,
     next_default_name,
     project_or_404,
+    validate_cross_field,
     validate_name,
     validate_properties,
 )
@@ -771,6 +772,11 @@ def create_object(db: Session, session_id: str, project_id: str,
         body.properties, defs, type_label=ot.object,
         required=REQUIRED_OBJECT_PROPERTIES.get(ot.object),
     )
+    validate_cross_field(
+        {n: decode_value(v, defs[n].datatype)
+         for n, v in canonical.items() if v is not None},
+        ot.object,
+    )
 
     taken = _object_names_lower(db, scenario_id)
     if body.name is None:
@@ -905,6 +911,7 @@ def update_object(db: Session, session_id: str, project_id: str,
                 new_vals.pop(name, None)
             else:
                 new_vals[name] = decode_value(ctext, defs[name].datatype)
+        validate_cross_field(new_vals, ot.object)
         _upsert_intrinsic(db, so.id, canonical, defs)
         changed = {name for name in canonical if old_vals.get(name) != new_vals.get(name)}
         if changed:
@@ -1073,6 +1080,9 @@ def update_scenario_models(db: Session, session_id: str, project_id: str,
 def create_group(db: Session, session_id: str, project_id: str,
                  scenario_id: str, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
+    if len(set(body.member_ids)) < 2:
+        raise api_error(400, "GROUP_MIN_MEMBERS",
+                        "A group must contain at least 2 geometries")
     taken = _group_names_lower(db, project_id)
     if body.name is None:
         name = next_default_name(taken, _GROUP_PREFIX)

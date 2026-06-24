@@ -38,15 +38,21 @@ from app.db.models import (
     PropertyType,
 )
 
-# Properties whose lower bound is exclusive (> min, not >= min). The DDL
-# stores min=0; the user story requires strictly positive values.
+# Properties whose lower bound is exclusive (> min, not >= min). Ground size
+# (length/breadth) is > 0: migration 020 sets the catalog min to 0, and listing
+# them here makes the bound exclusive — so 0 is rejected but 0.5 is accepted.
 _EXCLUSIVE_MIN = {"length", "breadth"}
 
 # Required intrinsic properties per object type (the catalog has no
 # `required` column — this is the single source for both the catalog
 # response and create-time validation).
+#
+# Story (create ground): the form populates EVERY parameter with a default, and
+# clearing any one (on create or edit) must fail "Field is required" — so every
+# Ground parameter is required, including position_x/y/z and rotation_z.
 REQUIRED_OBJECT_PROPERTIES = {
     "Ground": {"length", "breadth", "resolution_x", "resolution_y",
+               "position_x", "position_y", "position_z", "rotation_z",
                "texture_x", "texture_y"},
 }
 
@@ -151,6 +157,17 @@ def _canonical_number(value, prop: PropDef) -> str:
     return text or "0"
 
 
+def _fmt_bound(x: float | None) -> str:
+    """Human-readable range bound: a plain integer for whole numbers
+    (1000000, not 1e+06), a trimmed decimal otherwise, 'unbounded' for None."""
+    if x is None:
+        return "unbounded"
+    f = float(x)
+    if f.is_integer():
+        return str(int(f))
+    return f"{f:.7f}".rstrip("0").rstrip(".")
+
+
 def _check_range(value: float, prop: PropDef) -> None:
     lo, hi = prop.min, prop.max
     if lo is None and hi is None:
@@ -161,8 +178,8 @@ def _check_range(value: float, prop: PropDef) -> None:
         or (hi is not None and value > hi)
     )
     if out:
-        lo_s = "unbounded" if lo is None else format(lo, "g")
-        hi_s = "unbounded" if hi is None else format(hi, "g")
+        lo_s = _fmt_bound(lo)
+        hi_s = _fmt_bound(hi)
         raise api_error(
             400, "VALUE_OUT_OF_RANGE",
             f"Values should be between ({lo_s} - {hi_s})",
@@ -279,6 +296,25 @@ def validate_properties(
         if out.get(name) is None:
             raise api_error(400, "MISSING_REQUIRED_PROPERTY", f"{name} is required")
     return out
+
+
+def validate_cross_field(values: dict, object_type: str) -> None:
+    """Cross-field range rules a single property can't express on its own.
+
+    Ground: the texture repeat counts must not exceed the resolution
+    (texture_x <= resolution_x, texture_y <= resolution_y). `values` holds the
+    EFFECTIVE native values (on create the full set; on update the existing
+    values merged with the patch). A pair is skipped when either side is absent.
+    """
+    if object_type != "Ground":
+        return
+    for tex, res in (("texture_x", "resolution_x"), ("texture_y", "resolution_y")):
+        t, r = values.get(tex), values.get(res)
+        if t is not None and r is not None and t > r:
+            raise api_error(
+                400, "VALUE_OUT_OF_RANGE",
+                f"Values should be between (1 - {int(r)})",
+            )
 
 
 # ── Name rules (geometry / material / group names) ───────────────────────────

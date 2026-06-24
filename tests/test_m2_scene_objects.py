@@ -101,11 +101,14 @@ def test_create_ground_validation(client):
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
 
-    # length must be strictly positive (exclusive lower bound)
+    # length/breadth bound is exclusive > 0 (max 1,000,000); 0 is rejected.
+    # The message shows plain integers (1000000, not 1e+06).
     bad = dict(GROUND_PROPS, length=0)
     r = client.post(_base(pid, sid) + "/objects",
                     json={"object_type_id": ot, "properties": bad}, headers=h)
     assert r.status_code == 400
+    assert r.json()["detail"] == {"error": "Values should be between (0 - 1000000)",
+                                  "code": "VALUE_OUT_OF_RANGE"}
 
     # Unknown property
     bad = dict(GROUND_PROPS, wingspan=3)
@@ -128,6 +131,99 @@ def test_create_ground_validation(client):
                     json={"object_type_id": _ot_id(client, "Crop"), "properties": {}},
                     headers=h)
     assert r.status_code == 400
+
+
+def test_ground_size_and_texture_resolution_bounds(client):
+    """Story 'create a ground': size (length/breadth) is the exclusive range
+    (0, 1,000,000] — 0 is rejected but sub-1 values like 0.5 are accepted;
+    position (x/y/z) is the inclusive range [-1,000,000, +1,000,000]; and the
+    texture repeat count may not exceed the resolution (enforced on create and
+    update; the update rule sees the merged values)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    ot = _ot_id(client)
+    url = _base(pid, sid) + "/objects"
+
+    # Accepted: a sub-1 value (> 0) and the max boundary.
+    for ok_size in (0.5, 1, 1_000_000):
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, length=ok_size)}, headers=h)
+        assert r.status_code == 201, r.text
+
+    # Rejected: 0, negative, and just past the max.
+    for bad_size in (0, -5, 1_000_001):
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, length=bad_size)}, headers=h)
+        assert r.status_code == 400, f"length={bad_size} should be rejected"
+        assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+
+    # Position is the inclusive range [-1,000,000, +1,000,000].
+    for ok_pos in (0, -1_000_000, 1_000_000):
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, position_x=ok_pos)}, headers=h)
+        assert r.status_code == 201, r.text
+    for bad_pos in (1_000_001, -1_000_001):
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, position_x=bad_pos)}, headers=h)
+        assert r.status_code == 400, f"position_x={bad_pos} should be rejected"
+        assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+
+    # texture_x must not exceed resolution_x on create (resolution is 100); the
+    # message reports the resolution as a plain integer.
+    r = client.post(url, json={"object_type_id": ot,
+                    "properties": dict(GROUND_PROPS, texture_x=200)}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"] == {"error": "Values should be between (1 - 100)",
+                                  "code": "VALUE_OUT_OF_RANGE"}
+
+    # texture == resolution is allowed (inclusive upper bound).
+    r = client.post(url, json={"object_type_id": ot, "name": "EdgeTex",
+                    "properties": dict(GROUND_PROPS, texture_x=100, texture_y=100)},
+                    headers=h)
+    assert r.status_code == 201, r.text
+
+    # On update the rule sees the MERGED values: raising texture above the
+    # stored resolution is rejected...
+    oid = client.post(url, json={"object_type_id": ot, "name": "UpdMe",
+                      "properties": GROUND_PROPS}, headers=h).json()["object"]["id"]
+    r = client.patch(f"{url}/{oid}", json={"properties": {"texture_x": 200}}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+    # ...and so is lowering the resolution below the already-stored texture.
+    r = client.patch(f"{url}/{oid}", json={"properties": {"resolution_x": 2}}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+
+
+def test_all_ground_params_required(client):
+    """Story: every Ground parameter is populated with a default and clearing any
+    one (on create OR edit) must fail "Field is required". position_x/y/z and
+    rotation_z were previously optional — this locks them in alongside the rest."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    ot = _ot_id(client)
+    url = _base(pid, sid) + "/objects"
+
+    # CREATE: each newly-required param is rejected when omitted or cleared (null).
+    for field in ("position_x", "position_y", "position_z", "rotation_z"):
+        missing = {k: v for k, v in GROUND_PROPS.items() if k != field}
+        r = client.post(url, json={"object_type_id": ot, "properties": missing}, headers=h)
+        assert r.status_code == 400, f"{field} omitted should fail"
+        assert r.json()["detail"] == {"error": f"{field} is required",
+                                      "code": "MISSING_REQUIRED_PROPERTY"}
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, **{field: None})}, headers=h)
+        assert r.status_code == 400, f"{field} cleared should fail"
+        assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
+
+    # EDIT: clearing a required param is rejected and the geometry stays unchanged.
+    oid = client.post(url, json={"object_type_id": ot,
+                      "properties": GROUND_PROPS}, headers=h).json()["object"]["id"]
+    for field in ("position_y", "rotation_z"):
+        r = client.patch(f"{url}/{oid}", json={"properties": {field: None}}, headers=h)
+        assert r.status_code == 400, f"clearing {field} on edit should fail"
+        assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
+    o = client.get(f"{url}/{oid}", headers=h).json()["object"]
+    assert o["properties"]["position_y"] == GROUND_PROPS["position_y"]
+    assert o["properties"]["rotation_z"] == GROUND_PROPS["rotation_z"]
 
 
 def test_list_get_update_rename_delete(client):
@@ -217,11 +313,11 @@ def test_patch_cannot_null_required_property(client):
                      json={"properties": {"length": None}}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
-    # Optional properties may still be cleared
+    # Every Ground param is required now (incl. rotation_z) — none can be nulled.
     r = client.patch(_base(pid, sid) + f"/objects/{obj['id']}",
                      json={"properties": {"rotation_z": None}}, headers=h)
-    assert r.status_code == 200
-    assert r.json()["object"]["properties"]["rotation_z"] is None
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
 
 
 def _model_ids(client):
@@ -405,6 +501,15 @@ def test_groups_lifecycle(client):
         "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
     o2 = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
+
+    # A group needs at least 2 distinct geometries: one member is rejected,
+    # and the same id listed twice still counts as one.
+    r = client.post(_base(pid, sid) + "/groups",
+                    json={"member_ids": [o1["id"]]}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "GROUP_MIN_MEMBERS"
+    r = client.post(_base(pid, sid) + "/groups",
+                    json={"member_ids": [o1["id"], o1["id"]]}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "GROUP_MIN_MEMBERS"
 
     r = client.post(_base(pid, sid) + "/groups",
                     json={"member_ids": [o1["id"], o2["id"]]}, headers=h)
@@ -690,7 +795,8 @@ def test_geometry_persists_to_context_xml_and_reloads(client):
     from app.core.config import settings
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    props = {**GROUND_PROPS, "rotation_z": 0, "resolution_x": 2, "resolution_y": 2}
+    props = {**GROUND_PROPS, "rotation_z": 0, "resolution_x": 2, "resolution_y": 2,
+             "texture_x": 1, "texture_y": 1}
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client), "properties": props}, headers=h).json()["object"]
     oid = obj["id"]
@@ -718,7 +824,8 @@ def test_color_survives_reload_via_material_label(client):
                        {"color_r": 200, "color_g": 50, "color_b": 50})
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
-        "properties": {**GROUND_PROPS, "resolution_x": 2, "resolution_y": 2},
+        "properties": {**GROUND_PROPS, "resolution_x": 2, "resolution_y": 2,
+                       "texture_x": 1, "texture_y": 1},
         "materials": [{"material_id": rad["id"], "sync": True}],
     }, headers=h).json()["object"]
     oid = obj["id"]

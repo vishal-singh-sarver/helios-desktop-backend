@@ -59,14 +59,33 @@ from app.services.eav_validation import (
 # channel; otherwise the most recently assigned one does.
 _PRECEDENCE_TYPE = "Radiation"
 
-# Default ground surface texture (app/assets/default_ground.jpg), shown on any
-# Ground with no winning texture so an unstyled ground reads as soil. This is the
-# SINGLE source for the path — scene_object_service._build bakes the same file at
-# create time. Resolved relative to this package so it works in dev and the
-# PyInstaller bundle.
-_DEFAULT_GROUND_TEXTURE = str(
-    Path(__file__).resolve().parent.parent / "assets" / "default_ground.jpg"
-)
+def _resolve_default_ground_texture() -> str:
+    """Absolute path to the bundled PyHelios soil texture
+    (plugins/visualizer/textures/dirt.jpg), used as the default ground surface
+    when no material texture is assigned. The existing plugin texture is used
+    directly — no copy — and it sits inside get_texture_dirs(), so
+    /api/textures/serve is allowed to serve it."""
+    try:
+        import pyhelios
+        # __path__[0] is the inner package; the plugin trees live at its parent.
+        bases = [Path(p) for p in pyhelios.__path__]
+        bases += [b.parent for b in bases]
+    except Exception:
+        return ""
+    for base in bases:
+        for cand in (
+            base / "pyhelios_build/build/plugins/visualizer/textures/dirt.jpg",
+            base / "helios-core/plugins/visualizer/textures/dirt.jpg",
+        ):
+            if cand.exists():
+                return str(cand)
+    return ""
+
+
+# Default ground surface texture — the bundled PyHelios soil
+# (plugins/visualizer/textures/dirt.jpg). SINGLE source for the path;
+# scene_object_service._build bakes the same file at create time.
+_DEFAULT_GROUND_TEXTURE = _resolve_default_ground_texture()
 
 # datatype -> the Context.setPrimitiveData<typed> method that stores it.
 # boolean has no native bool setter, so it rides UInt as 0/1 (matching Helios'

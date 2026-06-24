@@ -24,15 +24,14 @@ _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 
 
 def _allowed_texture_dirs() -> list[Path]:
-    """Directories a texture may legitimately live in: the bundled default ground
-    texture (`app/assets`), user-uploaded textures (`data_dir/uploads`), and the
-    PyHelios plugin texture libraries."""
+    """Directories a texture may legitimately live in: user-uploaded textures
+    (`data_dir/uploads`) and the PyHelios plugin texture libraries — the latter
+    also covers the default ground soil (plugins/visualizer/textures/dirt.jpg)."""
     dirs: list[Path] = [
-        Path(__file__).resolve().parent.parent / "assets",   # app/assets/default_ground.jpg
         settings.data_dir / "uploads",                        # user-uploaded textures
     ]
     try:
-        dirs.extend(tex_dir for _, tex_dir in get_texture_dirs())   # plugin texture libraries
+        dirs.extend(tex_dir for _, tex_dir in get_texture_dirs())   # plugin libs incl. default soil
     except Exception:
         pass
     return dirs

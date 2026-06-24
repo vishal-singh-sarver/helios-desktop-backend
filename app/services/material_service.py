@@ -30,19 +30,25 @@ def material_snapshot(ctx, label: str) -> dict:
 
 def get_texture_dirs() -> list:
     dirs = []
+    seen = set()
     try:
         import pyhelios
-        base = Path(pyhelios.__file__).parent
-        for candidate in [
-            base / "assets" / "build" / "plugins",
-            base / "pyhelios_build" / "build" / "plugins",
-            base / "helios-core" / "plugins",
-        ]:
-            if candidate.exists():
-                for plugin_dir in candidate.iterdir():
-                    for tex_dir in (plugin_dir / "textures", plugin_dir / "assets"):
-                        if tex_dir.exists():
-                            dirs.append((plugin_dir.name, tex_dir))
+        # pyhelios.__path__[0] is the inner package dir, but the plugin trees live
+        # at the submodule root (its parent) — so check both bases.
+        bases = [Path(p) for p in pyhelios.__path__]
+        bases += [b.parent for b in bases]
+        for base in bases:
+            for candidate in (
+                base / "assets" / "build" / "plugins",
+                base / "pyhelios_build" / "build" / "plugins",
+                base / "helios-core" / "plugins",
+            ):
+                if candidate.exists():
+                    for plugin_dir in candidate.iterdir():
+                        for tex_dir in (plugin_dir / "textures", plugin_dir / "assets"):
+                            if tex_dir.exists() and tex_dir not in seen:
+                                seen.add(tex_dir)
+                                dirs.append((plugin_dir.name, tex_dir))
     except Exception:
         pass
     return dirs

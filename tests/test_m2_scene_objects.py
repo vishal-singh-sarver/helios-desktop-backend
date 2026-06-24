@@ -101,13 +101,13 @@ def test_create_ground_validation(client):
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
 
-    # length/breadth bound is inclusive [1, 1,000,000]; 0 is below the min.
+    # length/breadth bound is exclusive > 0 (max 1,000,000); 0 is rejected.
     # The message shows plain integers (1000000, not 1e+06).
     bad = dict(GROUND_PROPS, length=0)
     r = client.post(_base(pid, sid) + "/objects",
                     json={"object_type_id": ot, "properties": bad}, headers=h)
     assert r.status_code == 400
-    assert r.json()["detail"] == {"error": "Values should be between (1 - 1000000)",
+    assert r.json()["detail"] == {"error": "Values should be between (0 - 1000000)",
                                   "code": "VALUE_OUT_OF_RANGE"}
 
     # Unknown property
@@ -134,25 +134,39 @@ def test_create_ground_validation(client):
 
 
 def test_ground_size_and_texture_resolution_bounds(client):
-    """Story 'create a ground': size (length/breadth) is the inclusive range
-    [1, 1,000,000], and the texture repeat count may not exceed the resolution —
-    enforced on both create and update (the update rule sees the merged values)."""
+    """Story 'create a ground': size (length/breadth) is the exclusive range
+    (0, 1,000,000] — 0 is rejected but sub-1 values like 0.5 are accepted;
+    position (x/y/z) is the inclusive range [-1,000,000, +1,000,000]; and the
+    texture repeat count may not exceed the resolution (enforced on create and
+    update; the update rule sees the merged values)."""
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     ot = _ot_id(client)
     url = _base(pid, sid) + "/objects"
 
-    # Inclusive boundaries: length 1 and 1,000,000 are both accepted.
-    for boundary in (1, 1_000_000):
+    # Accepted: a sub-1 value (> 0) and the max boundary.
+    for ok_size in (0.5, 1, 1_000_000):
         r = client.post(url, json={"object_type_id": ot,
-                        "properties": dict(GROUND_PROPS, length=boundary)}, headers=h)
+                        "properties": dict(GROUND_PROPS, length=ok_size)}, headers=h)
         assert r.status_code == 201, r.text
 
-    # Just past the max is rejected.
-    r = client.post(url, json={"object_type_id": ot,
-                    "properties": dict(GROUND_PROPS, length=1_000_001)}, headers=h)
-    assert r.status_code == 400
-    assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+    # Rejected: 0, negative, and just past the max.
+    for bad_size in (0, -5, 1_000_001):
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, length=bad_size)}, headers=h)
+        assert r.status_code == 400, f"length={bad_size} should be rejected"
+        assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+
+    # Position is the inclusive range [-1,000,000, +1,000,000].
+    for ok_pos in (0, -1_000_000, 1_000_000):
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, position_x=ok_pos)}, headers=h)
+        assert r.status_code == 201, r.text
+    for bad_pos in (1_000_001, -1_000_001):
+        r = client.post(url, json={"object_type_id": ot,
+                        "properties": dict(GROUND_PROPS, position_x=bad_pos)}, headers=h)
+        assert r.status_code == 400, f"position_x={bad_pos} should be rejected"
+        assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
 
     # texture_x must not exceed resolution_x on create (resolution is 100); the
     # message reports the resolution as a plain integer.

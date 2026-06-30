@@ -38,10 +38,10 @@ from app.db.models import (
     PropertyType,
 )
 
-# Properties whose lower bound is exclusive (> min, not >= min). Ground size
-# (length/breadth) is > 0: migration 020 sets the catalog min to 0, and listing
-# them here makes the bound exclusive — so 0 is rejected but 0.5 is accepted.
-_EXCLUSIVE_MIN = {"length", "breadth"}
+# Properties whose lower bound is exclusive (> min, not >= min). Currently none:
+# ground size (length/breadth) uses an INCLUSIVE floor of 0.01 m (migration 021),
+# so the catalog min alone enforces value >= 0.01 (0.01 accepted, 0.009 rejected).
+_EXCLUSIVE_MIN: set[str] = set()
 
 # Required intrinsic properties per object type (the catalog has no
 # `required` column — this is the single source for both the catalog

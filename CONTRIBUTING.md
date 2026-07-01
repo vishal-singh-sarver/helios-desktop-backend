@@ -1,4 +1,4 @@
-# Helios Backend API — Claude Context
+# Contributing to Helios Backend API
 
 FastAPI backend for HeliosGUI. Owns the PyHelios 3D context, persists projects to SQLite, and exposes geometry/tree/plant-architecture APIs consumed by the Electron frontend over HTTP + SSE. This repo is a git submodule of [helios_gui](../) but has its own lifecycle.
 
@@ -105,8 +105,8 @@ Interactive docs at `/docs` when running.
 ## Cross-Repo Notes
 
 - This repo's HEAD is tracked as a submodule pointer by the parent [helios_gui](../) repo. A commit here followed by a submodule-pointer bump in the parent is needed for the frontend to see backend changes.
-- The frontend contract is in [../CLAUDE.md](../CLAUDE.md). Breaking an existing `/api/...` shape requires a coordinated frontend change — check `src/renderer/src/containers/*/saga.ts` in the parent repo before renaming or removing routes.
+- The frontend contract is in [../CONTRIBUTING.md](../CONTRIBUTING.md). Breaking an existing `/api/...` shape requires a coordinated frontend change — check `src/renderer/src/containers/*/saga.ts` in the parent repo before renaming or removing routes.
 
 ## Task Intake
 
-For non-trivial changes, fill out [TASK.md](TASK.md) before implementation — it enforces testable acceptance criteria.
+For non-trivial changes, write up the task before starting work — a one-sentence goal, testable acceptance criteria, affected files, and constraints.

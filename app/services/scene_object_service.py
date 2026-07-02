@@ -431,6 +431,7 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
         _rebuild(db, sctx, so)
         return
 
+    from pyhelios.exceptions import HeliosRuntimeError
     from pyhelios.types import int2, vec3
 
     if changed & _TRANSLATE_KEYS:
@@ -463,7 +464,15 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
     if changed & _RESOLUTION_KEYS:
         rx = int(new_vals.get("resolution_x") or 1)
         ry = int(new_vals.get("resolution_y") or 1)
-        ctx.setTileObjectSubdivisionCount(ctx_object_id, int2(rx, ry))
+        try:
+            ctx.setTileObjectSubdivisionCount(ctx_object_id, int2(rx, ry))
+        except HeliosRuntimeError:
+            # helios caps subdivisions at the ground texture's pixel resolution
+            # (subdiv < repeat * texture_px); above it the engine raises. Surface
+            # a clean validation error instead of a raw 500.
+            raise api_error(422, "RESOLUTION_TOO_HIGH",
+                            "Ground resolution is too high for the ground texture. "
+                            "Lower the resolution and try again.")
         # Subdivision REGENERATES the tile's primitives — re-read UUIDs and
         # re-apply materials. If the object id didn't survive, recreate.
         if not ctx.doesObjectExist(ctx_object_id):

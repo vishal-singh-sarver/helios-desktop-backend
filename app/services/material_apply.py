@@ -19,10 +19,12 @@ colour shows. The UVs/tiling are baked into the TileObject by
 scene_object_service._build (subdiv x texture_repeat); only the texture *image*
 is set here.
 
-Snapshot source: object_property_data rows for the (object, material) pair —
-written on assign by scene_object_service._snapshot_frozen for EVERY assignment.
-reapply_all_materials re-applies from these rows, so hydration and in-place
-regeneration repaint without re-reading the (possibly edited) library.
+Snapshot source: object_property_data rows for the (object, member) pair —
+written by material_sync_service._snapshot_frozen for EVERY materialized
+member (assign + reconcile). reapply_all_materials re-applies from these rows,
+so hydration and in-place regeneration repaint without re-reading the
+(possibly edited) library — including STALE rows whose library member/group
+was deleted: they keep painting until the scenario is synced (migration 022).
 
 The single-valued color channel is owned by the precedence-winning assignment
 (Radiation wins, else most-recently created). Model-data labels are additive —

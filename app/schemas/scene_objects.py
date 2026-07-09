@@ -1,11 +1,11 @@
-"""Request models for persisted scene objects, groups and material
-assignment (milestone 2, spec §5, §6, §8)."""
+"""Request models for persisted scene objects, geometry groups, material-group
+assignment and scenario material-sync (milestone 2 / migration 022)."""
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
-class AssignmentIn(BaseModel):
-    material_id: int
+class GroupAssignmentIn(BaseModel):
+    group_id: int
     sync: bool = True
 
 
@@ -14,7 +14,10 @@ class SceneObjectCreateRequest(BaseModel):
     name: Optional[str] = None              # omitted → auto 'Ground.001'
     properties: dict[str, Any] = Field(default_factory=dict)
     visibility: Optional[dict[str, Any]] = None
-    materials: list[AssignmentIn] = Field(default_factory=list)
+    # Material-GROUP assignments (migration 022). The field keeps the pre-022
+    # name `materials` — the old per-material shape ({material_id, sync}) is
+    # dead, and the frontend's existing `materials: []` lands here unchanged.
+    materials: list[GroupAssignmentIn] = Field(default_factory=list)
 
 
 class SceneObjectUpdateRequest(BaseModel):
@@ -43,14 +46,27 @@ class GroupVisibilityRequest(BaseModel):
     visibility: dict[str, Any] = Field(default_factory=dict)
 
 
-class AssignMaterialRequest(BaseModel):
-    material_id: int
+class AssignMaterialGroupRequest(BaseModel):
+    group_id: int
     sync: bool = True
 
 
-class AssignmentUpdateRequest(BaseModel):
+class FrozenMaterialPatch(BaseModel):
+    """Per-member frozen-value edit, addressed by material type (members are
+    nameless — identity is (group, material type))."""
+    material_type_id: int
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class GroupAssignmentUpdateRequest(BaseModel):
     sync: Optional[bool] = None
-    properties: Optional[dict[str, Any]] = None
+    materials: Optional[list[FrozenMaterialPatch]] = None
+
+
+class MaterialSyncRequest(BaseModel):
+    """PUT material-sync scoping — omitted/None = reconcile everything."""
+    group_ids: Optional[list[int]] = None
+    object_ids: Optional[list[int]] = None
 
 
 class ScenarioModelsUpdateRequest(BaseModel):

@@ -16,11 +16,12 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import get_session_id
 from app.db.database import get_db
 from app.schemas.scene_objects import (
-    AssignMaterialRequest,
-    AssignmentUpdateRequest,
+    AssignMaterialGroupRequest,
+    GroupAssignmentUpdateRequest,
     GroupCreateRequest,
     GroupRenameRequest,
     GroupVisibilityRequest,
+    MaterialSyncRequest,
     SceneObjectCreateRequest,
     SceneObjectRenameRequest,
     SceneObjectUpdateRequest,
@@ -240,22 +241,23 @@ def delete_group_objects(
     return svc.delete_group_objects(db, session_id, project_id, scenario_id, group_id)
 
 
-# ── Material assignment (spec §8) ────────────────────────────────────────────
+# ── Material-group assignment (migration 022) ────────────────────────────────
 
 
-@router.post(_BASE + "/objects/{object_id}/materials", status_code=201)
-def assign_material(
+@router.post(_BASE + "/objects/{object_id}/material-groups", status_code=201)
+def assign_material_group(
     project_id: str,
     scenario_id: str,
     object_id: int,
-    body: AssignMaterialRequest,
+    body: AssignMaterialGroupRequest,
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.assign_material(db, session_id, project_id, scenario_id, object_id, body)
+    return svc.assign_material_group(db, session_id, project_id, scenario_id,
+                                     object_id, body)
 
 
-@router.get(_BASE + "/objects/{object_id}/materials")
+@router.get(_BASE + "/objects/{object_id}/material-groups")
 def list_assignments(
     project_id: str,
     scenario_id: str,
@@ -266,28 +268,54 @@ def list_assignments(
     return svc.list_assignments(db, session_id, project_id, scenario_id, object_id)
 
 
-@router.patch(_BASE + "/objects/{object_id}/materials/{material_id}")
-def update_assignment(
+@router.patch(_BASE + "/objects/{object_id}/material-groups/{group_id}")
+def update_group_assignment(
     project_id: str,
     scenario_id: str,
     object_id: int,
-    material_id: int,
-    body: AssignmentUpdateRequest,
+    group_id: int,
+    body: GroupAssignmentUpdateRequest,
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.update_assignment(db, session_id, project_id, scenario_id,
-                                 object_id, material_id, body)
+    return svc.update_group_assignment(db, session_id, project_id, scenario_id,
+                                       object_id, group_id, body)
 
 
-@router.delete(_BASE + "/objects/{object_id}/materials/{material_id}")
-def unassign_material(
+@router.delete(_BASE + "/objects/{object_id}/material-groups/{group_id}")
+def unassign_material_group(
     project_id: str,
     scenario_id: str,
     object_id: int,
-    material_id: int,
+    group_id: int,
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.unassign_material(db, session_id, project_id, scenario_id,
-                                 object_id, material_id)
+    return svc.unassign_material_group(db, session_id, project_id, scenario_id,
+                                       object_id, group_id)
+
+
+# ── Scenario material-sync (migration 022) ───────────────────────────────────
+
+
+@router.get(_BASE + "/material-sync")
+def get_material_sync(
+    project_id: str,
+    scenario_id: str,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Drift report: is this scenario's applied material state in sync with
+    the library, and what would PUT change (dry-run)."""
+    return svc.get_material_sync(db, session_id, project_id, scenario_id)
+
+
+@router.put(_BASE + "/material-sync")
+def apply_material_sync(
+    project_id: str,
+    scenario_id: str,
+    body: MaterialSyncRequest,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    return svc.apply_material_sync(db, session_id, project_id, scenario_id, body)

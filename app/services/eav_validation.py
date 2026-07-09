@@ -63,9 +63,15 @@ VISUALISATION_PROPERTIES = {"color_r", "color_g", "color_b", "texture_file"}
 _MAX_DECIMALS = 7
 
 
-def api_error(status: int, code: str, message: str) -> HTTPException:
-    """House error shape: detail = {"error": ..., "code": ...}."""
-    return HTTPException(status, {"error": message, "code": code})
+def api_error(status: int, code: str, message: str,
+              extra: dict | None = None) -> HTTPException:
+    """House error shape: detail = {"error": ..., "code": ...}. `extra` merges
+    additional structured fields into the detail (e.g. the `conflicts` list on
+    DUPLICATE_MATERIAL_TYPE_ASSIGNMENT)."""
+    detail = {"error": message, "code": code}
+    if extra:
+        detail.update(extra)
+    return HTTPException(status, detail)
 
 
 def project_or_404(db: Session, session_id: str, project_id: str) -> Project:

@@ -37,10 +37,12 @@ from app.core.session_store import registry as session_registry
 from app.db.models import (
     Datatype,
     MaterialData,
+    MaterialGroup,
     MaterialType,
     ModelType,
     ObjectGroup,
     ObjectMaterial,
+    ObjectMaterialGroup,
     ObjectPropertyData,
     ObjectType,
     ProjectMaterial,
@@ -55,6 +57,7 @@ from app.helios import context as helios_ctx
 from app.helios import registry as reg
 from app.helios.persistence import load_scenario_snapshot, trigger_scenario_autosave
 from app.services import material_apply
+from app.services import material_sync_service as sync_svc
 from app.services.eav_validation import (
     REQUIRED_OBJECT_PROPERTIES,
     api_error,
@@ -208,40 +211,9 @@ def _upsert_intrinsic(db: Session, so_id: int, canonical: dict[str, str | None],
             row.value = value
 
 
-def _material_values_canonical(db: Session, material_id: int) -> dict[int, str]:
-    rows = (
-        db.query(MaterialData.property_type_id, MaterialData.value)
-        .filter(MaterialData.project_material_id == material_id)
-        .all()
-    )
-    return {pt: v for pt, v in rows if v is not None}
-
-
-def _frozen_rows(db: Session, so_id: int, material_id: int) -> list[ObjectPropertyData]:
-    return (
-        db.query(ObjectPropertyData)
-        .filter(
-            ObjectPropertyData.scenario_object_id == so_id,
-            ObjectPropertyData.project_material_id == material_id,
-        )
-        .all()
-    )
-
-
-def _snapshot_frozen(db: Session, so_id: int, material_id: int) -> None:
-    """Copy the material's CURRENT library values into the assignment's snapshot
-    rows (object_property_data). Run for EVERY assignment regardless of sync —
-    these rows are the single source of truth the viewport re-applies from, so
-    later library edits never propagate (decision #1: snapshot-on-assign)."""
-    for row in _frozen_rows(db, so_id, material_id):
-        db.delete(row)
-    db.flush()
-    for pt_id, value in _material_values_canonical(db, material_id).items():
-        db.add(ObjectPropertyData(scenario_object_id=so_id, project_material_id=material_id,
-                                  property_type_id=pt_id, value=value))
-    # The session runs with autoflush=False — flush so follow-up queries in
-    # the same request (e.g. freeze-and-edit) see the snapshot rows.
-    db.flush()
+# Snapshot primitives (_snapshot_frozen & co.) moved to material_sync_service
+# (migration 022) — the reconcile engine and these endpoints share one
+# implementation. Imported here as sync_svc.
 
 
 # ── Viewport build (spec §12.1) ──────────────────────────────────────────────
@@ -380,10 +352,10 @@ def _rebuild(db: Session, sctx, so: ScenarioObject) -> None:
 
 @_with_scenario_lock
 def _apply_assignment_change(db: Session, sctx, so: ScenarioObject,
-                             cleared_type_id: int | None = None) -> None:
-    """Repaint after an assignment add/remove/edit. Rebuild when the winning
+                             cleared_type_ids: list[int] | None = None) -> None:
+    """Repaint after an assignment/reconcile change. Rebuild when the winning
     texture changed (texture is baked into the TileObject), else clear the
-    removed/edited material type's stale labels and re-apply color/model data
+    removed/edited material types' stale labels and re-apply color/model data
     in place. Safe no-op when headless or the object isn't built this session."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         return
@@ -395,8 +367,8 @@ def _apply_assignment_change(db: Session, sctx, so: ScenarioObject,
     if (desired or None) != (built or None):
         _rebuild(db, sctx, so)    # fresh primitives; _build re-applies everything
         return
-    if cleared_type_id is not None:
-        material_apply.clear_material_from_primitives(db, sctx, so, cleared_type_id)
+    for type_id in cleared_type_ids or []:
+        material_apply.clear_material_from_primitives(db, sctx, so, type_id)
     material_apply.reapply_all_materials(db, sctx, so)
     _autosave(sctx)   # rebuild branch already autosaved via _build + returned
 
@@ -680,36 +652,39 @@ def _visibility_of(db: Session, so: ScenarioObject) -> dict:
     }
 
 
-def _assignment_payload(db: Session, so: ScenarioObject, om: ObjectMaterial) -> dict:
+def _member_payload(db: Session, so: ScenarioObject, om: ObjectMaterial,
+                    group_sync: bool) -> dict:
+    """One materialized member of an assigned group. STALE-tolerant: when the
+    library member is gone (or moved) the payload falls back to the snapshot
+    values and is flagged stale — never a 500."""
     pm = db.get(ProjectMaterial, om.project_material_id)
+    live = pm is not None and pm.material_group_id == om.material_group_id
     mt = db.get(MaterialType, om.material_type_id)
     defs = load_type_properties(db, material_type_id=om.material_type_id)
 
     def _native(rows):
         return {prop: decode_value(value, dt) for prop, value, dt in rows}
 
-    library_rows = (
-        db.query(PropertyType.property, MaterialData.value, Datatype.name)
-        .join(MaterialData, MaterialData.property_type_id == PropertyType.id)
-        .join(Datatype, Datatype.id == PropertyType.datatype_id)
-        .filter(MaterialData.project_material_id == om.project_material_id)
-        .all()
-    )
-    library = _native(library_rows)
+    library: dict = {}
+    if live:
+        library_rows = (
+            db.query(PropertyType.property, MaterialData.value, Datatype.name)
+            .join(MaterialData, MaterialData.property_type_id == PropertyType.id)
+            .join(Datatype, Datatype.id == PropertyType.datatype_id)
+            .filter(MaterialData.project_material_id == om.project_material_id)
+            .all()
+        )
+        library = _native(library_rows)
 
     payload = {
-        "object_id": so.id,
         "material_id": om.project_material_id,
-        "name": pm.name if pm else None,
         "material_type_id": om.material_type_id,
         "material_type": mt.materialtype if mt else None,
-        "sync": bool(om.sync),
-        "source": "library" if om.sync else "frozen",
     }
-    if om.sync:
+    if group_sync and live:
         values = library
     else:
-        frozen_db_rows = (
+        snapshot_rows = (
             db.query(PropertyType.property, ObjectPropertyData.value, Datatype.name)
             .join(ObjectPropertyData, ObjectPropertyData.property_type_id == PropertyType.id)
             .join(Datatype, Datatype.id == PropertyType.datatype_id)
@@ -719,10 +694,39 @@ def _assignment_payload(db: Session, so: ScenarioObject, om: ObjectMaterial) -> 
             )
             .all()
         )
-        values = _native(frozen_db_rows)
-        if any(values.get(k) != library.get(k) for k in defs):
+        values = _native(snapshot_rows)
+        if live and not group_sync and any(values.get(k) != library.get(k) for k in defs):
             payload["library_drift"] = True
+    if not live:
+        payload["stale"] = True
     payload["properties"] = {name: values.get(name) for name in defs}
+    return payload
+
+
+def _group_assignment_payload(db: Session, so: ScenarioObject,
+                              omg: ObjectMaterialGroup) -> dict:
+    """One assigned group on a geometry. STALE-tolerant: a deleted group keeps
+    its assignment row (and its painted members) until the scenario syncs."""
+    grp = db.get(MaterialGroup, omg.material_group_id)
+    members = (
+        db.query(ObjectMaterial)
+        .filter(
+            ObjectMaterial.scenario_object_id == so.id,
+            ObjectMaterial.material_group_id == omg.material_group_id,
+        )
+        .order_by(ObjectMaterial.material_type_id)
+        .all()
+    )
+    payload = {
+        "object_id": so.id,
+        "group_id": omg.material_group_id,
+        "name": grp.name if grp else None,
+        "sync": bool(omg.sync),
+        "source": "library" if omg.sync else "frozen",
+        "materials": [_member_payload(db, so, om, bool(omg.sync)) for om in members],
+    }
+    if grp is None:
+        payload["stale"] = True
     return payload
 
 
@@ -751,12 +755,13 @@ def serialize_object(db: Session, sctx, so: ScenarioObject,
     }
     if include_materials:
         assignments = (
-            db.query(ObjectMaterial)
-            .filter(ObjectMaterial.scenario_object_id == so.id)
-            .order_by(ObjectMaterial.created_at)
+            db.query(ObjectMaterialGroup)
+            .filter(ObjectMaterialGroup.scenario_object_id == so.id)
+            .order_by(ObjectMaterialGroup.created_at)
             .all()
         )
-        out["materials"] = [_assignment_payload(db, so, om) for om in assignments]
+        out["material_groups"] = [_group_assignment_payload(db, so, omg)
+                                  for omg in assignments]
     return out
 
 
@@ -795,25 +800,41 @@ def create_object(db: Session, session_id: str, project_id: str,
         if name.lower() in taken:
             raise api_error(409, "GEOMETRY_NAME_EXISTS", "Geometry name already exists")
 
-    # Validate requested assignments before writing anything.
+    # Validate requested GROUP assignments before writing anything. `materials`
+    # carries group assignments ({group_id, sync}) since migration 022 — the
+    # pre-022 per-material shape is gone. Groups are GLOBAL — no
+    # project/scenario scope validation.
+    seen_groups: set[int] = set()
     seen_types: dict[int, int] = {}
-    materials: list[tuple[ProjectMaterial, bool]] = []
+    group_assignments: list[tuple[MaterialGroup, list[ProjectMaterial], bool]] = []
     for entry in body.materials:
-        # Materials are GLOBAL (migration 019): any material may be assigned to
-        # any object regardless of its project/scenario — no scope validation.
-        pm = db.get(ProjectMaterial, entry.material_id)
-        if pm is None:
-            raise api_error(404, "MATERIAL_NOT_FOUND",
-                            f"Material {entry.material_id} not found")
-        if pm.material_type_id in seen_types:
-            mt = db.get(MaterialType, pm.material_type_id)
-            raise api_error(
-                409, "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT",
-                f"A {mt.materialtype if mt else 'material of this type'} material "
-                "is already assigned to this geometry",
-            )
-        seen_types[pm.material_type_id] = pm.id
-        materials.append((pm, entry.sync))
+        grp = db.get(MaterialGroup, entry.group_id)
+        if grp is None:
+            raise api_error(404, "MATERIAL_GROUP_NOT_FOUND",
+                            f"Material group {entry.group_id} not found")
+        if grp.id in seen_groups:
+            raise api_error(409, "MATERIAL_GROUP_ALREADY_ASSIGNED",
+                            f"Material group {grp.name} is already assigned "
+                            "to this geometry")
+        seen_groups.add(grp.id)
+        members = (
+            db.query(ProjectMaterial)
+            .filter(ProjectMaterial.material_group_id == grp.id)
+            .order_by(ProjectMaterial.material_type_id)
+            .all()
+        )
+        # No duplicate material type ACROSS the requested groups (the DB
+        # UNIQUE(scenario_object_id, material_type_id) is the backstop).
+        for pm in members:
+            if pm.material_type_id in seen_types:
+                mt = db.get(MaterialType, pm.material_type_id)
+                raise api_error(
+                    409, "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT",
+                    f"A {mt.materialtype if mt else 'material of this type'} material "
+                    "is already assigned to this geometry",
+                )
+            seen_types[pm.material_type_id] = pm.id
+        group_assignments.append((grp, members, entry.sync))
 
     so = ScenarioObject(scenario_id=scenario_id, project_id=project_id,
                         name=name, object_type_id=ot.id)
@@ -826,11 +847,12 @@ def create_object(db: Session, session_id: str, project_id: str,
     _upsert_intrinsic(db, so.id, canonical, defs)
     if body.visibility is not None:
         _apply_visibility(db, so, body.visibility)
-    for pm, sync in materials:
-        db.add(ObjectMaterial(scenario_object_id=so.id, project_material_id=pm.id,
-                              material_type_id=pm.material_type_id, sync=1 if sync else 0))
+    for grp, members, sync in group_assignments:
+        db.add(ObjectMaterialGroup(scenario_object_id=so.id, material_group_id=grp.id,
+                                   sync=1 if sync else 0))
         db.flush()
-        _snapshot_frozen(db, so.id, pm.id)   # snapshot every assignment
+        for pm in members:
+            sync_svc.materialize_member(db, so.id, pm)   # row + snapshot each
     db.commit()
     db.refresh(so)
 
@@ -1223,41 +1245,80 @@ def delete_group_objects(db: Session, session_id: str, project_id: str,
     return {"success": True, "group_id": group_id, "deleted_object_ids": deleted}
 
 
-# ── Assignment endpoints (spec §8) ───────────────────────────────────────────
+# ── Assignment endpoints (group-level, migration 022) ────────────────────────
 
 
-def assign_material(db: Session, session_id: str, project_id: str,
-                    scenario_id: str, object_id: int, body) -> dict:
+def _group_assignment_or_404(db: Session, so_id: int, group_id: int) -> ObjectMaterialGroup:
+    omg = db.get(ObjectMaterialGroup, (so_id, group_id))
+    if omg is None:
+        raise api_error(404, "ASSIGNMENT_NOT_FOUND",
+                        f"Material group {group_id} is not assigned to this geometry")
+    return omg
+
+
+def _type_conflict_409(db: Session, so: ScenarioObject,
+                       blockers: list[ObjectMaterial]):
+    """Named 409 for a material-type collision, listing the rows that own the
+    contested slots. `stale: true` blockers are unsynced leftovers — the client
+    can offer 'sync this scenario first' (PUT material-sync)."""
+    return api_error(
+        409, "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT",
+        "A material of this type is already assigned to this geometry",
+        extra={"conflicts": [sync_svc.blocker_conflict(db, so, b) for b in blockers]},
+    )
+
+
+def assign_material_group(db: Session, session_id: str, project_id: str,
+                          scenario_id: str, object_id: int, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
 
-    # Materials are GLOBAL (migration 019) — no same-project/scenario check.
-    pm = db.get(ProjectMaterial, body.material_id)
-    if pm is None:
-        raise api_error(404, "MATERIAL_NOT_FOUND", f"Material {body.material_id} not found")
+    # Groups are GLOBAL — no same-project/scenario check.
+    grp = db.get(MaterialGroup, body.group_id)
+    if grp is None:
+        raise api_error(404, "MATERIAL_GROUP_NOT_FOUND",
+                        f"Material group {body.group_id} not found")
+    if db.get(ObjectMaterialGroup, (so.id, grp.id)) is not None:
+        raise api_error(409, "MATERIAL_GROUP_ALREADY_ASSIGNED",
+                        f"Material group {grp.name} is already assigned to this geometry")
 
-    om = ObjectMaterial(scenario_object_id=so.id, project_material_id=pm.id,
-                        material_type_id=pm.material_type_id,
-                        sync=1 if body.sync else 0)
-    db.add(om)
+    members = (
+        db.query(ProjectMaterial)
+        .filter(ProjectMaterial.material_group_id == grp.id)
+        .order_by(ProjectMaterial.material_type_id)
+        .all()
+    )
+    # No duplicate material type across this geometry's groups. Reads
+    # object_material directly so STALE rows count as blockers.
+    blockers = sync_svc.find_type_blockers(
+        db, [so.id], [pm.material_type_id for pm in members])
+    if blockers:
+        raise _type_conflict_409(db, so, blockers)
+
+    db.add(ObjectMaterialGroup(scenario_object_id=so.id, material_group_id=grp.id,
+                               sync=1 if body.sync else 0))
     try:
         db.flush()
+        for pm in members:
+            sync_svc.materialize_member(db, so.id, pm)   # row + snapshot each
     except IntegrityError:
+        # Backstop for a write that raced past the pre-checks: re-query the
+        # committed state for the matching named 409.
         db.rollback()
-        mt = db.get(MaterialType, pm.material_type_id)
-        raise api_error(
-            409, "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT",
-            f"A {mt.materialtype if mt else 'material of this type'} material "
-            "is already assigned to this geometry",
-        )
-    _snapshot_frozen(db, so.id, pm.id)   # snapshot every assignment
+        if db.get(ObjectMaterialGroup, (so.id, grp.id)) is not None:
+            raise api_error(409, "MATERIAL_GROUP_ALREADY_ASSIGNED",
+                            f"Material group {grp.name} is already assigned "
+                            "to this geometry")
+        blockers = sync_svc.find_type_blockers(
+            db, [so.id], [pm.material_type_id for pm in members])
+        raise _type_conflict_409(db, so, blockers)
     db.commit()
 
     _apply_assignment_change(db, sctx, so)
-    om = db.get(ObjectMaterial, (so.id, pm.id))
-    return {"success": True, "assignment": _assignment_payload(db, so, om)}
+    omg = db.get(ObjectMaterialGroup, (so.id, grp.id))
+    return {"success": True, "assignment": _group_assignment_payload(db, so, omg)}
 
 
 def list_assignments(db: Session, session_id: str, project_id: str,
@@ -1267,87 +1328,150 @@ def list_assignments(db: Session, session_id: str, project_id: str,
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
     assignments = (
-        db.query(ObjectMaterial)
-        .filter(ObjectMaterial.scenario_object_id == so.id)
-        .order_by(ObjectMaterial.created_at)
+        db.query(ObjectMaterialGroup)
+        .filter(ObjectMaterialGroup.scenario_object_id == so.id)
+        .order_by(ObjectMaterialGroup.created_at)
         .all()
     )
-    return {"materials": [_assignment_payload(db, so, om) for om in assignments]}
+    return {"material_groups": [_group_assignment_payload(db, so, omg)
+                                for omg in assignments]}
 
 
-def _assignment_or_404(db: Session, so_id: int, material_id: int) -> ObjectMaterial:
-    om = db.get(ObjectMaterial, (so_id, material_id))
-    if om is None:
-        raise api_error(404, "ASSIGNMENT_NOT_FOUND",
-                        f"Material {material_id} is not assigned to this geometry")
-    return om
-
-
-def update_assignment(db: Session, session_id: str, project_id: str,
-                      scenario_id: str, object_id: int, material_id: int, body) -> dict:
+def update_group_assignment(db: Session, session_id: str, project_id: str,
+                            scenario_id: str, object_id: int, group_id: int,
+                            body) -> dict:
+    """PATCH one group assignment: toggle sync and/or edit frozen per-member
+    values (members addressed by material_type_id). Works on STALE assignments
+    too (frozen edits of surviving snapshots stay possible until a sync)."""
     _resolve_scope(db, session_id, project_id, scenario_id)
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
-    om = _assignment_or_404(db, so.id, material_id)
+    omg = _group_assignment_or_404(db, so.id, group_id)
 
-    target_sync = bool(om.sync) if body.sync is None else body.sync
+    target_sync = bool(omg.sync) if body.sync is None else body.sync
+    cleared: set[int] = set()
 
-    if body.sync is not None and body.sync != bool(om.sync):
+    if body.sync is not None and body.sync != bool(omg.sync):
         if body.sync:
-            # Unfreeze = relink + refresh: re-snapshot the CURRENT library values
-            # (the snapshot stays the source of truth — there is no live sync).
-            _snapshot_frozen(db, so.id, material_id)
-            om.sync = 1
+            # Unfreeze = relink + refresh every LIVE member from the current
+            # library values (a stale member has no library row to refresh
+            # from — PUT material-sync is what removes it).
+            for om in sync_svc.group_member_rows(db, so.id, group_id):
+                pm = db.get(ProjectMaterial, om.project_material_id)
+                if pm is not None and pm.material_group_id == group_id:
+                    sync_svc._snapshot_frozen(db, so.id, om.project_material_id)
+                    cleared.add(om.material_type_id)
+            omg.sync = 1
         else:
-            # Freeze = detach: keep the existing snapshot as the editable copy.
-            om.sync = 0
+            # Freeze = detach: keep the existing snapshots as the editable copy.
+            omg.sync = 0
+        omg.updated_at = _now()
 
-    if body.properties:
+    if body.materials:
         if target_sync:
             raise api_error(400, "CANNOT_EDIT_SYNCED",
-                            "Freeze the material before editing per-geometry values")
-        mt = db.get(MaterialType, om.material_type_id)
-        defs = load_type_properties(db, material_type_id=om.material_type_id)
-        canonical = validate_properties(
-            body.properties, defs, type_label=mt.materialtype, type_kind="material type"
-        )
-        existing = {row.property_type_id: row for row in _frozen_rows(db, so.id, material_id)}
-        for name, value in canonical.items():
-            pt_id = defs[name].property_type_id
-            row = existing.get(pt_id)
-            if value is None:
-                if row is not None:
-                    db.delete(row)
-            elif row is None:
-                db.add(ObjectPropertyData(scenario_object_id=so.id,
-                                          project_material_id=material_id,
-                                          property_type_id=pt_id, value=value))
-            else:
-                row.value = value
+                            "Freeze the material group before editing per-geometry values")
+        # Duplicate types in one payload would double-insert the same snapshot
+        # row under autoflush=False (unhandled IntegrityError at commit).
+        patched_types = [p.material_type_id for p in body.materials]
+        if len(patched_types) != len(set(patched_types)):
+            raise api_error(400, "DUPLICATE_MATERIAL_TYPE_IN_GROUP",
+                            "A material type appears more than once")
+        for patch in body.materials:
+            om = (
+                db.query(ObjectMaterial)
+                .filter(ObjectMaterial.scenario_object_id == so.id,
+                        ObjectMaterial.material_group_id == group_id,
+                        ObjectMaterial.material_type_id == patch.material_type_id)
+                .first()
+            )
+            if om is None:
+                raise api_error(404, "MATERIAL_TYPE_NOT_IN_GROUP",
+                                f"material_type_id {patch.material_type_id} is not "
+                                "applied by this group on this geometry")
+            mt = db.get(MaterialType, om.material_type_id)
+            defs = load_type_properties(db, material_type_id=om.material_type_id)
+            canonical = validate_properties(
+                patch.properties, defs,
+                type_label=mt.materialtype if mt else "material",
+                type_kind="material type",
+            )
+            existing = {row.property_type_id: row
+                        for row in sync_svc._frozen_rows(db, so.id, om.project_material_id)}
+            for name, value in canonical.items():
+                pt_id = defs[name].property_type_id
+                row = existing.get(pt_id)
+                if value is None:
+                    if row is not None:
+                        db.delete(row)
+                elif row is None:
+                    db.add(ObjectPropertyData(scenario_object_id=so.id,
+                                              project_material_id=om.project_material_id,
+                                              property_type_id=pt_id, value=value))
+                else:
+                    row.value = value
+            cleared.add(om.material_type_id)
 
     db.commit()
-    # Clear this material type's stale labels then re-apply (or rebuild if the
-    # winning texture changed). cleared_type_id drops labels a property edit
-    # may have removed.
-    _apply_assignment_change(db, sctx, so, cleared_type_id=om.material_type_id)
+    # Clear the touched material types' stale labels then re-apply (or rebuild
+    # if the winning texture changed).
+    _apply_assignment_change(db, sctx, so, cleared_type_ids=sorted(cleared))
 
-    om = db.get(ObjectMaterial, (so.id, material_id))
-    return {"success": True, "assignment": _assignment_payload(db, so, om)}
+    omg = db.get(ObjectMaterialGroup, (so.id, group_id))
+    return {"success": True, "assignment": _group_assignment_payload(db, so, omg)}
 
 
-def unassign_material(db: Session, session_id: str, project_id: str,
-                      scenario_id: str, object_id: int, material_id: int) -> dict:
+def unassign_material_group(db: Session, session_id: str, project_id: str,
+                            scenario_id: str, object_id: int, group_id: int) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
-    om = _assignment_or_404(db, so.id, material_id)
+    omg = _group_assignment_or_404(db, so.id, group_id)
 
-    old_type_id = om.material_type_id   # capture BEFORE the delete cascades it
-    db.delete(om)   # cascades the assignment's snapshot rows
+    # Works on STALE assignments too (group possibly gone from the library) —
+    # rows are found via the attribution column, not a library join.
+    members = sync_svc.group_member_rows(db, so.id, group_id)
+    cleared = sorted({om.material_type_id for om in members})
+    for om in members:
+        db.delete(om)   # snapshot rows cascade via the composite FK
+    db.delete(omg)
     db.commit()
-    # Clear the removed material type's labels + reset color, then re-apply the
+    # Clear the removed material types' labels + reset color, then re-apply the
     # remaining assignments (or the default when none remain).
-    _apply_assignment_change(db, sctx, so, cleared_type_id=old_type_id)
-    return {"success": True, "object_id": object_id, "material_id": material_id}
+    _apply_assignment_change(db, sctx, so, cleared_type_ids=cleared)
+    return {"success": True, "object_id": object_id, "group_id": group_id}
+
+
+# ── Scenario material-sync endpoints (migration 022) ─────────────────────────
+
+
+def get_material_sync(db: Session, session_id: str, project_id: str,
+                      scenario_id: str) -> dict:
+    """Drift report: what PUT material-sync would change (dry-run)."""
+    _resolve_scope(db, session_id, project_id, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
+    return sync_svc.compute_sync(db, scenario_id)
+
+
+def apply_material_sync(db: Session, session_id: str, project_id: str,
+                        scenario_id: str, body) -> dict:
+    """Reconcile this scenario's applied material state to library truth
+    (optionally scoped by group_ids/object_ids), then repaint live objects.
+    Conflicts are skipped + reported — partial success is normal, never 409."""
+    _resolve_scope(db, session_id, project_id, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
+
+    result = sync_svc.apply_sync(db, scenario_id,
+                                 group_ids=body.group_ids,
+                                 object_ids=body.object_ids)
+    db.commit()
+    for so_id, cleared in result["cleared_type_ids"].items():
+        so = db.get(ScenarioObject, so_id)
+        if so is not None:
+            _apply_assignment_change(db, sctx, so, cleared_type_ids=cleared)
+    return {"success": True, "scenario_id": scenario_id,
+            "applied": result["applied"], "conflicts": result["conflicts"]}

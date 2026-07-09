@@ -38,14 +38,22 @@ def _mt_id(client, name):
     return next(mt["id"] for mt in r.json()["material_types"] if mt["materialtype"] == name)
 
 
-def _mk_material(client, h, pid, type_name, name=None, properties=None):
-    r = client.post(f"/api/materials/project/{pid}/library", json={
-        "material_type_id": _mt_id(client, type_name),
+def _mk_group(client, h, type_specs, name=None):
+    """Create a material group; type_specs = [(type_name, properties_or_None)]."""
+    r = client.post("/api/materials/library/groups", json={
         **({"name": name} if name else {}),
-        "properties": properties or {},
+        "materials": [
+            {"material_type_id": _mt_id(client, tn), "properties": props or {}}
+            for tn, props in type_specs
+        ],
     }, headers=h)
     assert r.status_code == 201, r.text
-    return r.json()["material"]
+    return r.json()["group"]
+
+
+def _grp_member(assignment_or_group, type_name):
+    return next(m for m in assignment_or_group["materials"]
+                if m["material_type"] == type_name)
 
 
 # ── Geometry CRUD ────────────────────────────────────────────────────────────
@@ -71,7 +79,7 @@ def test_create_ground_auto_name_and_shape(client):
     assert obj["visibility"]["render"] is True
     assert len(obj["visibility"]["models"]) == 6
     assert all(v is True for v in obj["visibility"]["models"].values())
-    assert obj["materials"] == []
+    assert obj["material_groups"] == []
     assert isinstance(obj["helios_uuids"], list)
     if helios_ctx.PYHELIOS_AVAILABLE:
         assert obj["helios_uuids"], "build should produce primitives"
@@ -101,13 +109,13 @@ def test_create_ground_validation(client):
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
 
-    # length/breadth bound is exclusive > 0 (max 1,000,000); 0 is rejected.
-    # The message shows plain integers (1000000, not 1e+06).
+    # length/breadth floor is 0.01 m inclusive (migration 021; max 1,000,000);
+    # 0 is rejected. The message shows plain integers (1000000, not 1e+06).
     bad = dict(GROUND_PROPS, length=0)
     r = client.post(_base(pid, sid) + "/objects",
                     json={"object_type_id": ot, "properties": bad}, headers=h)
     assert r.status_code == 400
-    assert r.json()["detail"] == {"error": "Values should be between (0 - 1000000)",
+    assert r.json()["detail"] == {"error": "Values should be between (0.01 - 1000000)",
                                   "code": "VALUE_OUT_OF_RANGE"}
 
     # Unknown property
@@ -611,132 +619,265 @@ def test_group_bulk_visibility_and_delete(client):
     assert client.get(_base(pid, sid) + "/groups", headers=h).json()["groups"] == []
 
 
-# ── Material assignment + sync/frozen ────────────────────────────────────────
+# ── Material-group assignment + sync/frozen (migration 022) ──────────────────
 
 
-def test_assignment_sync_freeze_lifecycle(client):
+def test_group_assignment_sync_freeze_lifecycle(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
     }, headers=h).json()["object"]
-    rad = _mk_material(client, h, pid, "Radiation", "Grass Rad",
-                       {"color_r": 90, "color_g": 200, "color_b": 90, "reflectivity": 0.2})
-    eb = _mk_material(client, h, pid, "Energy Balance", "Soil EB",
-                      {"wind_speed": 3.5, "air_temperature": 298})
-    rad2 = _mk_material(client, h, pid, "Radiation", "Rad Two")
+    grass = _mk_group(client, h, [
+        ("Radiation", {"color_r": 90, "color_g": 200, "color_b": 90, "reflectivity": 0.2}),
+    ], name="Grass Set")
+    soil = _mk_group(client, h, [
+        ("Energy Balance", {"wind_speed": 3.5, "air_temperature": 298}),
+    ], name="Soil Set")
+    rad_two = _mk_group(client, h, [("Radiation", None)], name="Rad Two")
 
     obj_url = _base(pid, sid) + f"/objects/{obj['id']}"
 
-    # Assign synced Radiation
-    r = client.post(obj_url + "/materials", json={"material_id": rad["id"]}, headers=h)
+    # Assign synced group
+    r = client.post(obj_url + "/material-groups", json={"group_id": grass["id"]}, headers=h)
     assert r.status_code == 201, r.text
     a = r.json()["assignment"]
+    assert a["name"] == "Grass Set"
     assert a["sync"] is True and a["source"] == "library"
-    assert a["properties"]["reflectivity"] == 0.2
+    assert _grp_member(a, "Radiation")["properties"]["reflectivity"] == 0.2
 
-    # One material per type per geometry
-    r = client.post(obj_url + "/materials", json={"material_id": rad2["id"]}, headers=h)
+    # Same group twice → its own 409
+    r = client.post(obj_url + "/material-groups", json={"group_id": grass["id"]}, headers=h)
     assert r.status_code == 409
-    assert r.json()["detail"]["code"] == "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT"
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_ALREADY_ASSIGNED"
 
-    # A second TYPE is fine — assign frozen Energy Balance
-    r = client.post(obj_url + "/materials",
-                    json={"material_id": eb["id"], "sync": False}, headers=h)
+    # No duplicate material type ACROSS the geometry's groups; the 409 names
+    # the blocking group.
+    r = client.post(obj_url + "/material-groups", json={"group_id": rad_two["id"]}, headers=h)
+    assert r.status_code == 409
+    d = r.json()["detail"]
+    assert d["code"] == "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT"
+    assert d["conflicts"][0]["group_id"] == grass["id"]
+    assert d["conflicts"][0]["group_name"] == "Grass Set"
+    assert d["conflicts"][0]["material_type"] == "Radiation"
+    assert "stale" not in d["conflicts"][0]
+
+    # A disjoint TYPE set is fine — assign frozen Energy Balance group
+    r = client.post(obj_url + "/material-groups",
+                    json={"group_id": soil["id"], "sync": False}, headers=h)
     assert r.status_code == 201
     a = r.json()["assignment"]
     assert a["sync"] is False and a["source"] == "frozen"
-    assert a["properties"]["wind_speed"] == 3.5      # snapshot of library values
+    assert _grp_member(a, "Energy Balance")["properties"]["wind_speed"] == 3.5
 
-    # Editing the library does NOT touch the frozen copy (and flags drift)
-    r = client.patch(f"/api/materials/project/{pid}/library/{eb['id']}",
-                     json={"properties": {"wind_speed": 9}}, headers=h)
-    assert r.status_code == 200
-    r = client.get(obj_url + "/materials", headers=h)
-    frozen = next(m for m in r.json()["materials"] if m["material_id"] == eb["id"])
-    assert frozen["properties"]["wind_speed"] == 3.5
-    assert frozen.get("library_drift") is True
-    synced = next(m for m in r.json()["materials"] if m["material_id"] == rad["id"])
+    # Editing the library (no eager scenario) does NOT touch the frozen copy
+    # (and flags drift on it).
+    r = client.put(f"/api/materials/library/groups/{soil['id']}", json={
+        "materials": [{"material_type_id": _mt_id(client, "Energy Balance"),
+                       "properties": {"wind_speed": 9}}],
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    r = client.get(obj_url + "/material-groups", headers=h)
+    groups = r.json()["material_groups"]
+    frozen = next(g for g in groups if g["group_id"] == soil["id"])
+    m = _grp_member(frozen, "Energy Balance")
+    assert m["properties"]["wind_speed"] == 3.5
+    assert m.get("library_drift") is True
+    synced = next(g for g in groups if g["group_id"] == grass["id"])
     assert synced["source"] == "library"
 
     # Editing a synced assignment's values is rejected
-    r = client.patch(obj_url + f"/materials/{rad['id']}",
-                     json={"properties": {"reflectivity": 0.5}}, headers=h)
+    r = client.patch(obj_url + f"/material-groups/{grass['id']}", json={
+        "materials": [{"material_type_id": _mt_id(client, "Radiation"),
+                       "properties": {"reflectivity": 0.5}}]}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "CANNOT_EDIT_SYNCED"
 
-    # Edit frozen per-geometry values (validated against the catalog)
-    r = client.patch(obj_url + f"/materials/{eb['id']}",
-                     json={"properties": {"wind_speed": 4.2}}, headers=h)
-    assert r.status_code == 200
-    assert r.json()["assignment"]["properties"]["wind_speed"] == 4.2
-    r = client.patch(obj_url + f"/materials/{eb['id']}",
-                     json={"properties": {"wind_speed": 999}}, headers=h)
+    # Edit frozen per-member values (validated against the catalog; addressed
+    # by material type).
+    eb_type = _mt_id(client, "Energy Balance")
+    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={
+        "materials": [{"material_type_id": eb_type,
+                       "properties": {"wind_speed": 4.2}}]}, headers=h)
+    assert r.status_code == 200, r.text
+    assert _grp_member(r.json()["assignment"], "Energy Balance")["properties"]["wind_speed"] == 4.2
+    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={
+        "materials": [{"material_type_id": eb_type,
+                       "properties": {"wind_speed": 999}}]}, headers=h)
     assert r.status_code == 400        # range 0-60
+    # A type this group does not apply here → 404
+    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={
+        "materials": [{"material_type_id": _mt_id(client, "Radiation"),
+                       "properties": {"reflectivity": 0.1}}]}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
 
     # Library is unaffected by frozen edits
-    r = client.get(f"/api/materials/project/{pid}/library/{eb['id']}", headers=h)
-    assert r.json()["material"]["properties"]["wind_speed"] == 9
+    r = client.get(f"/api/materials/library/groups/{soil['id']}", headers=h)
+    assert _grp_member(r.json()["group"], "Energy Balance")["properties"]["wind_speed"] == 9
 
-    # Unfreeze → follows the library again
-    r = client.patch(obj_url + f"/materials/{eb['id']}", json={"sync": True}, headers=h)
+    # Unfreeze → re-snapshots and follows the library again
+    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={"sync": True}, headers=h)
     assert r.status_code == 200
     a = r.json()["assignment"]
-    assert a["source"] == "library" and a["properties"]["wind_speed"] == 9
+    assert a["source"] == "library"
+    assert _grp_member(a, "Energy Balance")["properties"]["wind_speed"] == 9
 
     # Freeze-and-edit in one call
-    r = client.patch(obj_url + f"/materials/{eb['id']}",
-                     json={"sync": False, "properties": {"wind_speed": 1.5}}, headers=h)
+    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={
+        "sync": False,
+        "materials": [{"material_type_id": eb_type, "properties": {"wind_speed": 1.5}}],
+    }, headers=h)
     assert r.status_code == 200
-    assert r.json()["assignment"]["properties"]["wind_speed"] == 1.5
+    assert _grp_member(r.json()["assignment"], "Energy Balance")["properties"]["wind_speed"] == 1.5
 
-    # Unassign drops frozen values
-    r = client.delete(obj_url + f"/materials/{eb['id']}", headers=h)
-    assert r.json() == {"success": True, "object_id": obj["id"], "material_id": eb["id"]}
-    r = client.get(obj_url + "/materials", headers=h)
-    assert [m["material_id"] for m in r.json()["materials"]] == [rad["id"]]
+    # Unassign drops the group's applied rows
+    r = client.delete(obj_url + f"/material-groups/{soil['id']}", headers=h)
+    assert r.json() == {"success": True, "object_id": obj["id"], "group_id": soil["id"]}
+    r = client.get(obj_url + "/material-groups", headers=h)
+    assert [g["group_id"] for g in r.json()["material_groups"]] == [grass["id"]]
 
     # Unknown assignment
-    r = client.delete(obj_url + f"/materials/{eb['id']}", headers=h)
+    r = client.delete(obj_url + f"/material-groups/{soil['id']}", headers=h)
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "ASSIGNMENT_NOT_FOUND"
 
 
-def test_material_delete_cascades_assignments(client):
+def test_group_delete_keeps_applied_state_until_sync(client):
+    """The migration-022 break point: deleting a group WITHOUT the eager
+    scenario hook leaves the geometry's applied rows + snapshots in place,
+    flagged stale — cleanup happens via PUT material-sync."""
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
     }, headers=h).json()["object"]
-    rad = _mk_material(client, h, pid, "Radiation")
+    grp = _mk_group(client, h, [("Radiation", {"reflectivity": 0.2})], name="Doomed")
     obj_url = _base(pid, sid) + f"/objects/{obj['id']}"
-    client.post(obj_url + "/materials",
-                json={"material_id": rad["id"], "sync": False}, headers=h)
+    client.post(obj_url + "/material-groups",
+                json={"group_id": grp["id"], "sync": False}, headers=h)
 
-    r = client.delete(f"/api/materials/project/{pid}/library/{rad['id']}", headers=h)
+    r = client.delete(f"/api/materials/library/groups/{grp['id']}", headers=h)
     assert r.status_code == 200
-    assert r.json()["unassigned_from"] == 1
+    assert r.json()["unassigned_from"] == 0   # nothing eagerly cleaned (no scenario_id)
 
-    # Geometry survives with no assignments
-    r = client.get(obj_url, headers=h)
-    assert r.status_code == 200
-    assert r.json()["object"]["materials"] == []
+    # The assignment survives as STALE, painted from its snapshots.
+    r = client.get(obj_url + "/material-groups", headers=h)
+    groups = r.json()["material_groups"]
+    assert len(groups) == 1
+    assert groups[0]["stale"] is True and groups[0]["name"] is None
+    m = _grp_member(groups[0], "Radiation")
+    assert m["stale"] is True
+    assert m["properties"]["reflectivity"] == 0.2   # snapshot values
+
+    # PUT material-sync cleans it up.
+    r = client.put(_base(pid, sid) + "/material-sync", json={}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"]["removed_groups"] == 1
+    r = client.get(obj_url + "/material-groups", headers=h)
+    assert r.json()["material_groups"] == []
 
 
-def test_assignment_in_create_call(client):
+def test_group_delete_eager_scenario_cleans_immediately(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    rad = _mk_material(client, h, pid, "Radiation", "Grass Rad",
-                       {"color_r": 90, "color_g": 200, "color_b": 90})
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+    }, headers=h).json()["object"]
+    grp = _mk_group(client, h, [("Radiation", None)], name="EagerDoom")
+    obj_url = _base(pid, sid) + f"/objects/{obj['id']}"
+    client.post(obj_url + "/material-groups", json={"group_id": grp["id"]}, headers=h)
+
+    r = client.delete(f"/api/materials/library/groups/{grp['id']}?scenario_id={sid}",
+                      headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["unassigned_from"] == 1
+    r = client.get(obj_url + "/material-groups", headers=h)
+    assert r.json()["material_groups"] == []
+
+
+def test_group_assignment_in_create_call(client):
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    grass = _mk_group(client, h, [
+        ("Radiation", {"color_r": 90, "color_g": 200, "color_b": 90}),
+    ], name="Grass Set")
     r = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
         "properties": GROUND_PROPS,
-        "materials": [{"material_id": rad["id"], "sync": True}],
+        "materials": [{"group_id": grass["id"], "sync": True}],
     }, headers=h)
     assert r.status_code == 201, r.text
-    mats = r.json()["object"]["materials"]
-    assert len(mats) == 1 and mats[0]["material_id"] == rad["id"]
-    assert mats[0]["properties"]["color_r"] == 90
+    groups = r.json()["object"]["material_groups"]
+    assert len(groups) == 1 and groups[0]["group_id"] == grass["id"]
+    assert _grp_member(groups[0], "Radiation")["properties"]["color_r"] == 90
+
+    # Duplicate TYPE across the requested groups → 409, nothing created.
+    rad_two = _mk_group(client, h, [("Radiation", None)], name="Rad Two")
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+        "materials": [{"group_id": grass["id"]}, {"group_id": rad_two["id"]}],
+    }, headers=h)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT"
+
+    # Unknown group id → 404.
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+        "materials": [{"group_id": 999999}],
+    }, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NOT_FOUND"
+
+
+def test_create_materials_field_takes_group_assignments(client):
+    """`materials` on object create carries GROUP assignments since migration
+    022 (elements {group_id, sync}); the pre-022 per-material shape is gone.
+    The frontend's stub `materials: []` still creates cleanly; a pre-022
+    element shape is now a plain 422 (typed field, no silent tolerance)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client),
+        "properties": GROUND_PROPS,
+        "materials": [],
+    }, headers=h)
+    assert r.status_code == 201, r.text
+    assert r.json()["object"]["material_groups"] == []
+
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client),
+        "properties": GROUND_PROPS,
+        "materials": [{"material_id": 12345, "sync": True}],   # pre-022 shape
+    }, headers=h)
+    assert r.status_code == 422
+
+
+def test_assignment_conflict_names_stale_blocker(client):
+    """A stale leftover (deleted group, not yet synced) still owns its type
+    slot: assigning another group of that type 409s with stale: true, and
+    succeeds after a sync."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+    }, headers=h).json()["object"]
+    obj_url = _base(pid, sid) + f"/objects/{obj['id']}"
+
+    old = _mk_group(client, h, [("Radiation", None)], name="Old Rad")
+    client.post(obj_url + "/material-groups", json={"group_id": old["id"]}, headers=h)
+    client.delete(f"/api/materials/library/groups/{old['id']}", headers=h)   # no eager
+
+    new = _mk_group(client, h, [("Radiation", None)], name="New Rad")
+    r = client.post(obj_url + "/material-groups", json={"group_id": new["id"]}, headers=h)
+    assert r.status_code == 409
+    c = r.json()["detail"]["conflicts"][0]
+    assert c["group_id"] == old["id"] and c["group_name"] is None
+    assert c["stale"] is True
+
+    client.put(_base(pid, sid) + "/material-sync", json={}, headers=h)
+    r = client.post(obj_url + "/material-groups", json={"group_id": new["id"]}, headers=h)
+    assert r.status_code == 201, r.text
 
 
 def test_inplace_geometry_edits(client):
@@ -820,13 +961,14 @@ def test_color_survives_reload_via_material_label(client):
     from app.core.session_store import registry as session_registry
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    rad = _mk_material(client, h, pid, "Radiation", "Reload Color",
-                       {"color_r": 200, "color_g": 50, "color_b": 50})
+    grp = _mk_group(client, h, [
+        ("Radiation", {"color_r": 200, "color_g": 50, "color_b": 50}),
+    ], name="Reload Color")
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
         "properties": {**GROUND_PROPS, "resolution_x": 2, "resolution_y": 2,
                        "texture_x": 1, "texture_y": 1},
-        "materials": [{"material_id": rad["id"], "sync": True}],
+        "materials": [{"group_id": grp["id"], "sync": True}],
     }, headers=h).json()["object"]
     oid = obj["id"]
 
@@ -839,25 +981,28 @@ def test_color_survives_reload_via_material_label(client):
     assert sctx.context.doesMaterialExist(f"so_{oid}")
 
 
-def test_material_delete_does_not_repaint_live_geometry(client):
-    """Library delete is DB-only (snapshot model): the live object keeps its
-    geometry + ids (no rebuild/repaint); only the DB assignment cascades."""
+def test_group_delete_does_not_repaint_live_geometry(client):
+    """Library delete without the eager hook is DB-only (break point): the live
+    object keeps its geometry + ids AND its stale applied state."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         pytest.skip("native PyHelios unavailable")
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    rad = _mk_material(client, h, pid, "Radiation", "ToDelete",
-                       {"color_r": 10, "color_g": 250, "color_b": 10})
+    grp = _mk_group(client, h, [
+        ("Radiation", {"color_r": 10, "color_g": 250, "color_b": 10}),
+    ], name="ToDelete")
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
-        "materials": [{"material_id": rad["id"], "sync": True}]}, headers=h).json()["object"]
+        "materials": [{"group_id": grp["id"], "sync": True}]}, headers=h).json()["object"]
     oid = obj["id"]
     before = client.get(_base(pid, sid) + f"/objects/{oid}", headers=h).json()["object"]
 
-    r = client.delete(f"/api/materials/project/{pid}/library/{rad['id']}", headers=h)
-    assert r.status_code == 200 and r.json()["unassigned_from"] == 1
+    r = client.delete(f"/api/materials/library/groups/{grp['id']}", headers=h)
+    assert r.status_code == 200 and r.json()["unassigned_from"] == 0
 
     after = client.get(_base(pid, sid) + f"/objects/{oid}", headers=h).json()["object"]
     assert after["viewport"]["ctx_object_id"] == before["viewport"]["ctx_object_id"]
     assert after["helios_uuids"] == before["helios_uuids"]   # no rebuild
-    assert after["materials"] == []                          # DB assignment cascaded
+    # The applied state survives as stale until a sync (break point).
+    assert len(after["material_groups"]) == 1
+    assert after["material_groups"][0]["stale"] is True

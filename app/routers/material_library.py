@@ -1,109 +1,108 @@
 """
-Persisted material library endpoints (milestone 2, spec §7).
+Material-group library endpoints (migration 022).
 
 All under:
-    /api/materials/project/{project_id}/library...
+    /api/materials/library/groups...
 
-Required header: session-id. Distinct from the legacy in-memory
-/api/materials/* label endpoints, which remain preview-only.
+No project segment — material groups are GLOBAL (project_id/scenario_id are
+creation provenance in the request body). Required header: session-id.
+
+This router shares its /api/materials mount with the legacy in-memory label
+router (app/routers/materials.py). Keep every route here ≥2 segments under
+/library and never define a bare "/library" route — it would be captured by
+the legacy single-segment routes (e.g. DELETE /{label}).
+
+PUT / DELETE / file-upload accept ?scenario_id= — the ACTIVE scenario, which
+is reconciled + repainted inline (full-cascade semantics). Other scenarios
+keep their applied state and settle drift via the material-sync APIs.
 """
+from typing import Optional
+
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_session_id
 from app.db.database import get_db
 from app.schemas.material_library import (
-    MaterialCreateRequest,
-    MaterialRenameRequest,
-    MaterialUpdateRequest,
+    MaterialGroupCreateRequest,
+    MaterialGroupPutRequest,
 )
 from app.services import material_library_service as svc
 
 router = APIRouter()
 
-_BASE = "/project/{project_id}/library"
+_BASE = "/library"
 
 
-@router.post(_BASE, status_code=201)
-def create_material(
-    project_id: str,
-    body: MaterialCreateRequest,
+@router.post(_BASE + "/groups", status_code=201)
+def create_group(
+    body: MaterialGroupCreateRequest,
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.create_material(db, session_id, project_id, body)
+    return svc.create_group(db, session_id, body)
 
 
-@router.get(_BASE)
-def list_materials(
-    project_id: str,
-    search: str | None = Query(default=None),
-    material_type_id: int | None = Query(default=None),
+@router.get(_BASE + "/groups")
+def list_groups(
+    search: Optional[str] = Query(default=None),
+    material_type_id: Optional[int] = Query(default=None),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.list_materials(db, session_id, project_id, search, material_type_id)
+    return svc.list_groups(db, session_id, search, material_type_id)
 
 
-@router.get(_BASE + "/next-name")
+# Registered BEFORE /groups/{group_id}: group_id is int-typed, so a later
+# /groups/next-name request would otherwise 422 on the path param.
+@router.get(_BASE + "/groups/next-name")
 def next_name(
-    project_id: str,
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.next_name(db, session_id, project_id)
+    return svc.next_name(db, session_id)
 
 
-@router.get(_BASE + "/{material_id}")
-def get_material(
-    project_id: str,
-    material_id: int,
+@router.get(_BASE + "/groups/{group_id}")
+def get_group(
+    group_id: int,
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.get_material(db, session_id, project_id, material_id)
+    return svc.get_group(db, session_id, group_id)
 
 
-@router.patch(_BASE + "/{material_id}")
-def update_material(
-    project_id: str,
-    material_id: int,
-    body: MaterialUpdateRequest,
+@router.put(_BASE + "/groups/{group_id}")
+def update_group(
+    group_id: int,
+    body: MaterialGroupPutRequest,
+    scenario_id: Optional[str] = Query(default=None),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.update_material(db, session_id, project_id, material_id, body)
+    return svc.update_group(db, session_id, group_id, body, scenario_id)
 
 
-@router.patch(_BASE + "/{material_id}/rename")
-def rename_material(
-    project_id: str,
-    material_id: int,
-    body: MaterialRenameRequest,
+@router.delete(_BASE + "/groups/{group_id}")
+def delete_group(
+    group_id: int,
+    scenario_id: Optional[str] = Query(default=None),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return svc.rename_material(db, session_id, project_id, material_id, body.name)
+    return svc.delete_group(db, session_id, group_id, scenario_id)
 
 
-@router.delete(_BASE + "/{material_id}")
-def delete_material(
-    project_id: str,
-    material_id: int,
-    session_id: str = Depends(get_session_id),
-    db: Session = Depends(get_db),
-):
-    return svc.delete_material(db, session_id, project_id, material_id)
-
-
-@router.post(_BASE + "/{material_id}/files/{property_name}")
+@router.post(_BASE + "/groups/{group_id}/materials/{material_type_id}/files/{property_name}")
 async def upload_file_property(
-    project_id: str,
-    material_id: int,
+    group_id: int,
+    material_type_id: int,
     property_name: str,
+    scenario_id: Optional[str] = Query(default=None),
     file: UploadFile = File(...),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return await svc.upload_file_property(db, session_id, project_id,
-                                          material_id, property_name, file)
+    return await svc.upload_file_property(db, session_id, group_id,
+                                          material_type_id, property_name,
+                                          file, scenario_id)

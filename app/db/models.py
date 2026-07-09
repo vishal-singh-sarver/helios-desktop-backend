@@ -338,30 +338,45 @@ class MaterialPropertyType(Base):
     display_order    = Column(Integer, nullable=False, default=0)
 
 
-class ProjectMaterial(Base):
-    """A material instance in the GLOBAL library — exactly one material type.
+class MaterialGroup(Base):
+    """A named material group — the user-facing library object (migration 022).
 
-    Migration 019 makes materials global: project_id/scenario_id are nullable
-    (NULL project_id = an app-shipped default or a material not bound to a
-    project; both are set when a material is created inside a scenario) and the
-    name is GLOBALLY unique (one flat namespace). Assignment does NOT validate
-    that a material shares the object's project/scenario.
-    UNIQUE(id, material_type_id) is the target of object_material's composite FK,
-    making the denormalized type on the assignment provably consistent.
+    GLOBAL: the name is unique across everything (NOCASE); project_id and
+    scenario_id are pure provenance (where the group was created) and are SET
+    NULL when their parent dies — a group never dies with a project/scenario.
+    Members live in project_material (one per material type). Distinct from
+    ObjectGroup, which groups GEOMETRY in the scene tree.
+    """
+    __tablename__ = "material_group"
+    __table_args__ = (
+        Index("idx_material_group_name_ci", "name", unique=True),
+    )
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    project_id  = Column(Text, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
+    scenario_id = Column(Text, ForeignKey("scenarios.id", ondelete="SET NULL"), nullable=True)
+    name        = Column(Text, nullable=False)
+    created_at  = Column(Text, nullable=False, default=_now)
+    updated_at  = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ProjectMaterial(Base):
+    """A nameless material-group MEMBER — exactly one material type
+    (migration 022). Identity is (group, material type); the group carries the
+    user-facing name; EAV values live in material_data. Ids are never reused
+    (AUTOINCREMENT), so a stale soft reference in object_material can never
+    re-bind to a new member.
     """
     __tablename__ = "project_material"
     __table_args__ = (
-        UniqueConstraint("id", "material_type_id"),
-        Index("idx_project_material_name_ci", "name", unique=True),
+        UniqueConstraint("material_group_id", "material_type_id"),
     )
 
-    id               = Column(Integer, primary_key=True, autoincrement=True)
-    project_id       = Column(Text, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
-    scenario_id      = Column(Text, ForeignKey("scenarios.id", ondelete="SET NULL"), nullable=True)
-    material_type_id = Column(Integer, ForeignKey("material_type.id", ondelete="RESTRICT"), nullable=False)
-    name             = Column(Text, nullable=False)
-    created_at       = Column(Text, nullable=False, default=_now)
-    updated_at       = Column(Text, nullable=False, default=_now, onupdate=_now)
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    material_group_id = Column(Integer, ForeignKey("material_group.id", ondelete="CASCADE"), nullable=False, index=True)
+    material_type_id  = Column(Integer, ForeignKey("material_type.id", ondelete="RESTRICT"), nullable=False)
+    created_at        = Column(Text, nullable=False, default=_now)
+    updated_at        = Column(Text, nullable=False, default=_now, onupdate=_now)
 
 
 class MaterialData(Base):
@@ -380,29 +395,50 @@ class MaterialData(Base):
 
 
 class ObjectMaterial(Base):
-    """Assignment of a library material to a geometry (+ sync flag).
+    """MATERIALIZED member application: one row per (geometry, group member),
+    maintained by material_sync_service — never by FK cascade (migration 022).
 
-    sync=1 → the geometry follows the library values live.
-    sync=0 → frozen: per-geometry values live in object_property_data.
-    UNIQUE(scenario_object_id, material_type_id) = one material per type
-    per geometry; the composite FK keeps the denormalized type honest.
+    project_material_id and material_group_id are SOFT references (no FK — the
+    "break point"): deleting library rows must not reach into other scenarios'
+    applied state. A row whose member/group no longer exists is STALE — it
+    keeps painting (material_apply reads it + its snapshots) and keeps owning
+    its type slot until the scenario is synced. material_group_id attributes
+    the row to its group even after the library row is gone.
+    UNIQUE(scenario_object_id, material_type_id) is the DB-level enforcer of
+    "no duplicate material type across the groups assigned to one geometry".
     """
     __tablename__ = "object_material"
     __table_args__ = (
         UniqueConstraint("scenario_object_id", "material_type_id"),
-        ForeignKeyConstraint(
-            ["project_material_id", "material_type_id"],
-            ["project_material.id", "project_material.material_type_id"],
-            ondelete="CASCADE",
-        ),
+        Index("idx_object_material_group", "scenario_object_id", "material_group_id"),
     )
 
     scenario_object_id  = Column(Integer, ForeignKey("scenario_object.id", ondelete="CASCADE"), primary_key=True)
     project_material_id = Column(Integer, primary_key=True)
+    material_group_id   = Column(Integer, nullable=False)
     material_type_id    = Column(Integer, ForeignKey("material_type.id", ondelete="RESTRICT"), nullable=False)
-    sync                = Column(Integer, nullable=False, default=1)
     created_at          = Column(Text, nullable=False, default=_now)
     updated_at          = Column(Text, nullable=False, default=_now, onupdate=_now)
+
+
+class ObjectMaterialGroup(Base):
+    """The user-facing assignment: a material group applied to a geometry,
+    with ONE sync flag per pair (migration 022).
+
+    sync=1 → follows the library (reconciled eagerly in the active scenario,
+             via PUT material-sync elsewhere).
+    sync=0 → frozen: snapshot values in object_property_data are never
+             refreshed (membership add/remove still applies on sync).
+    material_group_id is a SOFT reference (no FK) — an assignment whose group
+    was deleted survives as the out-of-sync signal until the scenario syncs.
+    """
+    __tablename__ = "object_material_group"
+
+    scenario_object_id = Column(Integer, ForeignKey("scenario_object.id", ondelete="CASCADE"), primary_key=True)
+    material_group_id  = Column(Integer, primary_key=True)
+    sync               = Column(Integer, nullable=False, default=1)
+    created_at         = Column(Text, nullable=False, default=_now)
+    updated_at         = Column(Text, nullable=False, default=_now, onupdate=_now)
 
 
 class ObjectPropertyData(Base):
@@ -410,12 +446,17 @@ class ObjectPropertyData(Base):
 
     project_material_id IS NULL     → intrinsic geometry parameter
                                       (length, breadth, position, ...).
-    project_material_id IS NOT NULL → frozen material value for that
-                                      assignment (sync=0).
+    project_material_id IS NOT NULL → snapshot value for one materialized
+                                      member (object_material row) — written
+                                      for EVERY member; refreshed on sync when
+                                      the assignment follows the library.
     Uniqueness is enforced by two partial unique indexes because SQLite
     treats NULLs as distinct in a plain UNIQUE. The composite FK to
     object_material is skipped by SQLite when project_material_id is NULL,
-    so intrinsic rows are exempt while frozen rows cascade on unassign.
+    so intrinsic rows are exempt while snapshot rows cascade when their
+    object_material row is deleted (the only FK that still reaches this
+    table from the material side — the migration-022 "break point" keeps
+    library deletes away from applied state).
     """
     __tablename__ = "object_property_data"
     __table_args__ = (

@@ -24,6 +24,8 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import get_session_id
 from app.db.database import get_db
 from app.schemas.material_library import (
+    GroupMaterialIn,
+    GroupMaterialPatchRequest,
     MaterialGroupCreateRequest,
     MaterialGroupPutRequest,
 )
@@ -91,6 +93,45 @@ def delete_group(
     db: Session = Depends(get_db),
 ):
     return svc.delete_group(db, session_id, group_id, scenario_id)
+
+
+# ── Per-member CRUD (members addressed by material type; a group may be empty) ──
+
+
+@router.post(_BASE + "/groups/{group_id}/materials", status_code=201)
+def add_group_material(
+    group_id: int,
+    body: GroupMaterialIn,
+    scenario_id: Optional[str] = Query(default=None),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    return svc.add_group_material(db, session_id, group_id, body, scenario_id)
+
+
+@router.patch(_BASE + "/groups/{group_id}/materials/{material_type_id}")
+def update_group_material(
+    group_id: int,
+    material_type_id: int,
+    body: GroupMaterialPatchRequest,
+    scenario_id: Optional[str] = Query(default=None),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    return svc.update_group_material(db, session_id, group_id, material_type_id,
+                                     body, scenario_id)
+
+
+@router.delete(_BASE + "/groups/{group_id}/materials/{material_type_id}")
+def remove_group_material(
+    group_id: int,
+    material_type_id: int,
+    scenario_id: Optional[str] = Query(default=None),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    return svc.remove_group_material(db, session_id, group_id, material_type_id,
+                                     scenario_id)
 
 
 @router.post(_BASE + "/groups/{group_id}/materials/{material_type_id}/files/{property_name}")

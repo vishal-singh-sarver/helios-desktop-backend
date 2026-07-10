@@ -1006,3 +1006,25 @@ def test_group_delete_does_not_repaint_live_geometry(client):
     # The applied state survives as stale until a sync (break point).
     assert len(after["material_groups"]) == 1
     assert after["material_groups"][0]["stale"] is True
+
+def test_assign_empty_group(client):
+    """An EMPTY group is assignable: the assignment exists with zero members,
+    the geometry keeps its default paint, and the scenario stays in sync."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+    }, headers=h).json()["object"]
+    grp = _mk_group(client, h, [], name="Empty Set")
+
+    obj_url = _base(pid, sid) + f"/objects/{obj['id']}"
+    r = client.post(obj_url + "/material-groups", json={"group_id": grp["id"]}, headers=h)
+    assert r.status_code == 201, r.text
+    a = r.json()["assignment"]
+    assert a["name"] == "Empty Set" and a["materials"] == []
+
+    r = client.get(_base(pid, sid) + "/material-sync", headers=h)
+    assert r.json()["in_sync"] is True
+
+    r = client.delete(obj_url + f"/material-groups/{grp['id']}", headers=h)
+    assert r.status_code == 200

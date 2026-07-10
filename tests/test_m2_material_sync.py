@@ -355,3 +355,28 @@ def test_upload_file_eager_refreshes_active_scenario(client):
     assert len(stale) == 1 and "texture_file" in stale[0]["changed_properties"]
     result = _sync(client, h, pid, sid_b)
     assert result["applied"]["refreshed_values"] == 1
+
+def test_last_member_removed_syncs_to_empty_assigned_group(client):
+    """DELETE of a group's last member (no eager hook) leaves the other
+    scenario painted from its snapshot; its sync removes the row and lands in
+    the empty-assigned steady state — assignment kept, in_sync true."""
+    h, pid, sid_a, sid_b, obj_a, obj_b = _setup(client)
+    rad = _mt_id(client, "Radiation")
+    grp = _mk_group(client, h, [("Radiation", {"reflectivity": 0.3})], name="Shrinking")
+    _assign(client, h, pid, sid_b, obj_b, grp)
+
+    r = client.delete(LIB + f"/groups/{grp['id']}/materials/{rad}", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["group"]["materials"] == []          # group now empty
+
+    status = _status(client, h, pid, sid_b)
+    removed = _issues(status, "member_removed")
+    assert len(removed) == 1 and removed[0]["group_name"] == "Shrinking"
+
+    result = _sync(client, h, pid, sid_b)
+    assert result["applied"]["removed_members"] == 1
+    assert result["applied"]["removed_groups"] == 0      # assignment survives
+
+    groups = _assignments(client, h, pid, sid_b, obj_b)
+    assert len(groups) == 1 and groups[0]["materials"] == []
+    assert _status(client, h, pid, sid_b)["in_sync"] is True

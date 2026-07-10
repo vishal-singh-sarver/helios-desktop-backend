@@ -3,15 +3,19 @@ Global material-group library (migration 022).
 
 Materials exist only as members of a named MATERIAL GROUP: one member per
 material type, EAV values in material_data, no per-member name — identity is
-(group, material type). Groups are GLOBAL: names are unique across everything;
-project_id/scenario_id are pure provenance (SET NULL when the parent dies).
+(group, material type). A group may be EMPTY (zero members). Groups are
+GLOBAL: names are unique across everything; project_id/scenario_id are pure
+provenance (SET NULL when the parent dies). Members are managed in bulk (PUT
+full member set) or one at a time (POST/PATCH/DELETE
+/groups/{id}/materials[/{material_type_id}]).
 
-Library writes are DB-only EXCEPT for the optional eager hook: PUT/DELETE/
-file-upload accept ?scenario_id= (the ACTIVE scenario) and run the shared
-reconcile engine (material_sync_service.apply_sync) on it inline — full
-"cascade" semantics plus repaint. Every other scenario keeps its last-applied
-snapshot state (the migration-022 break point) and reports/settles the drift
-through the GET/PUT material-sync APIs.
+Library writes are DB-only EXCEPT for the optional eager hook: every mutating
+endpoint (PUT/DELETE group, member add/update/remove, file-upload) accepts
+?scenario_id= (the ACTIVE scenario) and runs the shared reconcile engine
+(material_sync_service.apply_sync) on it inline — full "cascade" semantics
+plus repaint. Every other scenario keeps its last-applied snapshot state (the
+migration-022 break point) and reports/settles the drift through the GET/PUT
+material-sync APIs.
 """
 from __future__ import annotations
 
@@ -139,29 +143,76 @@ def serialize_group(db: Session, grp: MaterialGroup) -> dict:
     }
 
 
+def _validate_member_entry(db: Session, material_type_id: int, properties: dict) -> tuple:
+    """One member's validation → (MaterialType, defs, canonical). Shared by the
+    bulk POST/PUT payload validator and the single add-member endpoint."""
+    mt = db.get(MaterialType, material_type_id)
+    if mt is None:
+        raise api_error(404, "MATERIAL_TYPE_NOT_FOUND",
+                        f"material_type_id {material_type_id} not found")
+    defs = load_type_properties(db, material_type_id=mt.id)
+    canonical = validate_properties(
+        properties, defs, type_label=mt.materialtype, type_kind="material type"
+    )
+    return mt, defs, canonical
+
+
 def _validate_members_payload(db: Session, materials) -> list[tuple]:
     """Shared POST/PUT member-list validation → [(MaterialType, defs, canonical)].
-    ≥1 member, no duplicate types, known type ids, per-member property checks."""
-    if not materials:
-        raise api_error(400, "MATERIAL_GROUP_EMPTY",
-                        "A material group must contain at least one material type")
+    No duplicate types, known type ids, per-member property checks. An EMPTY
+    list is legal (a group may hold no material types)."""
     out: list[tuple] = []
     seen: set[int] = set()
     for entry in materials:
-        mt = db.get(MaterialType, entry.material_type_id)
-        if mt is None:
-            raise api_error(404, "MATERIAL_TYPE_NOT_FOUND",
-                            f"material_type_id {entry.material_type_id} not found")
+        mt, defs, canonical = _validate_member_entry(
+            db, entry.material_type_id, entry.properties)
         if mt.id in seen:
             raise api_error(400, "DUPLICATE_MATERIAL_TYPE_IN_GROUP",
                             f"Material type {mt.materialtype} appears more than once")
         seen.add(mt.id)
-        defs = load_type_properties(db, material_type_id=mt.id)
-        canonical = validate_properties(
-            entry.properties, defs, type_label=mt.materialtype, type_kind="material type"
-        )
         out.append((mt, defs, canonical))
     return out
+
+
+def _member_or_404(db: Session, group_id: int, material_type_id: int) -> ProjectMaterial:
+    pm = (
+        db.query(ProjectMaterial)
+        .filter(ProjectMaterial.material_group_id == group_id,
+                ProjectMaterial.material_type_id == material_type_id)
+        .first()
+    )
+    if pm is None:
+        raise api_error(404, "MATERIAL_TYPE_NOT_IN_GROUP",
+                        f"material_type_id {material_type_id} is not in this group")
+    return pm
+
+
+def _precheck_add_conflicts(db: Session, grp: MaterialGroup, scenario_id: str,
+                            type_ids: list[int]) -> None:
+    """Advisory (UX) pre-check for the eager path: would materializing the
+    added types onto the ACTIVE scenario's assigned geometries hit a
+    material-type collision? Reads object_material directly, so STALE rows
+    count as blockers; the group's own rows are excluded (the same reconcile
+    pass deletes them first). Other scenarios surface conflicts at their own
+    sync time; the engine itself always skips + reports."""
+    if not type_ids:
+        return
+    so_ids = _assigned_object_ids(db, grp.id, scenario_id)
+    blockers = sync_svc.find_type_blockers(db, so_ids, type_ids,
+                                           exclude_group_id=grp.id)
+    if not blockers:
+        return
+    so_map = {so.id: so for so in db.query(ScenarioObject)
+              .filter(ScenarioObject.id.in_({b.scenario_object_id for b in blockers}))}
+    raise api_error(
+        409, "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT",
+        "A material of this type is already assigned to a geometry "
+        "using this group",
+        extra={"conflicts": [
+            sync_svc.blocker_conflict(db, so_map[b.scenario_object_id], b)
+            for b in blockers
+        ]},
+    )
 
 
 def _resolve_provenance(db: Session, session_id: str,
@@ -357,29 +408,9 @@ def update_group(db: Session, session_id: str, group_id: int, body,
     to_update = [(current[type_id], payload)
                  for type_id, payload in desired.items() if type_id in current]
 
-    # Advisory pre-check (UX): would the ACTIVE scenario's eager reconcile hit a
-    # type conflict on the added members? Reads object_material directly, so
-    # STALE rows count as blockers; the group's own rows are excluded (the same
-    # reconcile pass deletes them first). Other scenarios surface conflicts at
-    # their own sync time; the engine itself always skips + reports.
     if scn is not None and to_add:
-        so_ids = _assigned_object_ids(db, grp.id, scn.id)
-        blockers = sync_svc.find_type_blockers(
-            db, so_ids, [mt.id for mt, _defs, _canonical in to_add],
-            exclude_group_id=grp.id,
-        )
-        if blockers:
-            so_map = {so.id: so for so in db.query(ScenarioObject)
-                      .filter(ScenarioObject.id.in_({b.scenario_object_id for b in blockers}))}
-            raise api_error(
-                409, "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT",
-                "A material of this type is already assigned to a geometry "
-                "using this group",
-                extra={"conflicts": [
-                    sync_svc.blocker_conflict(db, so_map[b.scenario_object_id], b)
-                    for b in blockers
-                ]},
-            )
+        _precheck_add_conflicts(db, grp, scn.id,
+                                [mt.id for mt, _defs, _canonical in to_add])
 
     for pm in to_remove:
         db.delete(pm)   # library cascade only (material_data); applied rows wait for sync
@@ -406,6 +437,99 @@ def update_group(db: Session, session_id: str, group_id: int, body,
     if scn is not None:
         result = _eager_reconcile(db, session_id, scn, grp.id)
         out["sync"] = _sync_block(scn, result)
+    db.refresh(grp)
+    out["group"] = serialize_group(db, grp)
+    return out
+
+
+def add_group_material(db: Session, session_id: str, group_id: int, body,
+                       scenario_id: str | None) -> dict:
+    """POST one member into a group. The eager `scenario_id` hook materializes
+    it (row + snapshot) onto that scenario's assigned geometries + repaints;
+    other scenarios pick it up via their material-sync."""
+    grp = _group_or_404(db, group_id)
+    scn = _scenario_scope_or_404(db, session_id, scenario_id) if scenario_id else None
+    mt, defs, canonical = _validate_member_entry(db, body.material_type_id, body.properties)
+
+    existing = (
+        db.query(ProjectMaterial)
+        .filter(ProjectMaterial.material_group_id == grp.id,
+                ProjectMaterial.material_type_id == mt.id)
+        .first()
+    )
+    if existing is not None:
+        raise api_error(409, "DUPLICATE_MATERIAL_TYPE_IN_GROUP",
+                        f"Material type {mt.materialtype} is already in this group")
+    if scn is not None:
+        _precheck_add_conflicts(db, grp, scn.id, [mt.id])
+
+    pm = ProjectMaterial(material_group_id=grp.id, material_type_id=mt.id)
+    db.add(pm)
+    try:
+        db.flush()
+        _upsert_values(db, pm.id, canonical, defs)
+        grp.updated_at = _now()
+        db.commit()
+    except IntegrityError:
+        # UNIQUE(material_group_id, material_type_id) backstop for a race.
+        db.rollback()
+        raise api_error(409, "DUPLICATE_MATERIAL_TYPE_IN_GROUP",
+                        f"Material type {mt.materialtype} is already in this group")
+
+    out = {"success": True}
+    if scn is not None:
+        out["sync"] = _sync_block(scn, _eager_reconcile(db, session_id, scn, grp.id))
+    db.refresh(grp)
+    out["group"] = serialize_group(db, grp)
+    return out
+
+
+def update_group_material(db: Session, session_id: str, group_id: int,
+                          material_type_id: int, body,
+                          scenario_id: str | None) -> dict:
+    """PATCH one member's properties standalone (merge-upsert: provided keys
+    written, explicit null clears, absent keys untouched). The eager
+    `scenario_id` hook refreshes that scenario's sync=1 snapshots + repaints."""
+    grp = _group_or_404(db, group_id)
+    scn = _scenario_scope_or_404(db, session_id, scenario_id) if scenario_id else None
+    pm = _member_or_404(db, grp.id, material_type_id)
+
+    mt = db.get(MaterialType, pm.material_type_id)
+    defs = load_type_properties(db, material_type_id=pm.material_type_id)
+    canonical = validate_properties(
+        body.properties, defs,
+        type_label=mt.materialtype if mt else "material", type_kind="material type"
+    )
+    _upsert_values(db, pm.id, canonical, defs)
+    pm.updated_at = _now()
+    grp.updated_at = _now()
+    db.commit()
+
+    out = {"success": True}
+    if scn is not None:
+        out["sync"] = _sync_block(scn, _eager_reconcile(db, session_id, scn, grp.id))
+    db.refresh(grp)
+    out["group"] = serialize_group(db, grp)
+    return out
+
+
+def remove_group_material(db: Session, session_id: str, group_id: int,
+                          material_type_id: int, scenario_id: str | None) -> dict:
+    """DELETE one member from a group (removing the last member leaves a legal
+    EMPTY group). Library cascade only (material_data); applied state in other
+    scenarios survives as out-of-sync until their material-sync — the eager
+    `scenario_id` hook cleans the active scenario immediately."""
+    grp = _group_or_404(db, group_id)
+    scn = _scenario_scope_or_404(db, session_id, scenario_id) if scenario_id else None
+    pm = _member_or_404(db, grp.id, material_type_id)
+
+    db.delete(pm)   # cascades material_data; applied rows wait for sync
+    grp.updated_at = _now()
+    db.commit()
+
+    out = {"success": True, "group_id": group_id, "material_type_id": material_type_id}
+    if scn is not None:
+        out["sync"] = _sync_block(scn, _eager_reconcile(db, session_id, scn, grp.id))
     db.refresh(grp)
     out["group"] = serialize_group(db, grp)
     return out

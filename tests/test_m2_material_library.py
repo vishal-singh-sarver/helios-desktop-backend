@@ -338,3 +338,100 @@ def test_file_upload_by_group_and_type(client):
     r = client.post(url, files={"file": ("x.gif", io.BytesIO(b"z"), "image/gif")}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
+
+
+# ── Radiation bands (migration 023) ──────────────────────────────────────────
+
+_BANDS = ("PAR", "NIR", "LW")
+_BAND_KINDS = ("reflectivity", "transmissivity", "emissivity")
+
+
+def test_radiation_bands_in_catalog(client):
+    """The 9 per-band optical props + the use_radiation_bands flag are exposed on
+    the Radiation material type (float 0-1 / boolean), grouped as model props."""
+    r = client.get("/api/catalog/material-types")
+    rad = next(mt for mt in r.json()["material_types"] if mt["materialtype"] == "Radiation")
+    props = {p["property"]: p for p in rad["properties"]}
+    for band in _BANDS:
+        for kind in _BAND_KINDS:
+            p = props[f"{kind}_{band}"]
+            assert p["datatype"] == "float"
+            assert p["min"] == 0 and p["max"] == 1
+            assert p["group"] == "model"
+    assert props["use_radiation_bands"]["datatype"] == "boolean"
+
+
+def test_create_radiation_material_with_bands(client):
+    """A Radiation member persists the band values + the mode flag and round-trips;
+    an unset band stays null (materials have no required props)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    grp = _mk_group(client, h, [
+        {"material_type_id": rad, "properties": {
+            "use_radiation_bands": True,
+            "reflectivity_PAR": 0.15, "transmissivity_PAR": 0.05, "emissivity_PAR": 0.9,
+            "reflectivity_NIR": 0.4, "reflectivity_LW": 0.02,
+        }},
+    ])
+    props = _member(grp, "Radiation")["properties"]
+    assert props["use_radiation_bands"] is True
+    assert props["reflectivity_PAR"] == 0.15
+    assert props["emissivity_PAR"] == 0.9
+    assert props["reflectivity_NIR"] == 0.4
+    assert props["emissivity_LW"] is None   # unset band → null, not an error
+
+
+def test_radiation_band_out_of_range_rejected(client):
+    """Band fractions share the 0-1 range; 1.5 is rejected like any other float."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    r = client.post(BASE + "/groups", json={
+        "materials": [{"material_type_id": rad, "properties": {"reflectivity_PAR": 1.5}}],
+    }, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+
+
+def test_material_create_unexpected_failure_message(client, monkeypatch):
+    """An UNEXPECTED failure mid-create surfaces the friendly message, not a raw
+    500 (deliberate validation errors keep their own codes — covered above)."""
+    import app.services.material_library_service as svc
+
+    def _boom(*a, **k):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(svc, "_upsert_values", _boom)
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    r = client.post(BASE + "/groups", json={
+        "materials": [{"material_type_id": rad, "properties": {"reflectivity": 0.3}}],
+    }, headers=h)
+    assert r.status_code == 500
+    assert r.json()["detail"] == {
+        "error": "Unable to create material. Please try again",
+        "code": "MATERIAL_CREATE_FAILED",
+    }
+
+
+def test_spectral_data_upload_requires_xml(client):
+    """spectral_data accepts only .xml; a non-.xml file (fine for texture_file)
+    is rejected with INVALID_FILE_FORMAT."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    grp = _mk_group(client, h, [{"material_type_id": rad, "properties": {}}])
+    url = BASE + f"/groups/{grp['id']}/materials/{rad}/files/spectral_data"
+
+    # .xml is accepted and stored
+    r = client.post(url, files={"file": ("spectrum.xml", io.BytesIO(b"<xml/>"), "text/xml")}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["success"] is True
+    assert r.json()["property"] == "spectral_data"
+
+    # a .png (allowed for texture_file) is rejected for spectral_data
+    r = client.post(url, files={"file": ("spectrum.png", io.BytesIO(b"z"), "image/png")}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"

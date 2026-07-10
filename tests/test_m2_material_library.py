@@ -81,10 +81,10 @@ def test_create_group_validation_errors(client):
     rad = _mt_id(client, "Radiation")
     blc = _mt_id(client, "Boundary Layer Conductance")
 
-    # At least one material type is required
+    # An EMPTY group is legal — created with zero members.
     r = client.post(BASE + "/groups", json={"materials": []}, headers=h)
-    assert r.status_code == 400
-    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_EMPTY"
+    assert r.status_code == 201, r.text
+    assert r.json()["group"]["materials"] == []
 
     # No duplicate material type within one group
     r = client.post(BASE + "/groups", json={"materials": [
@@ -240,10 +240,15 @@ def test_put_group_diff_semantics(client):
     g2 = r.json()["group"]
     assert _member(g2, "Radiation")["material_id"] == rad_member_id
 
-    # PUT must keep >= 1 member; duplicate types rejected; rename collision 409.
+    # PUT with an empty member set removes every member — the group survives.
     r = client.put(url, json={"materials": []}, headers=h)
-    assert r.status_code == 400
-    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_EMPTY"
+    assert r.status_code == 200, r.text
+    assert r.json()["group"]["materials"] == []
+    # restore a member so the rename-collision check below still exercises PUT
+    r = client.put(url, json={"materials": [
+        {"material_type_id": rad, "properties": {"reflectivity": 0.4}}]}, headers=h)
+    assert r.status_code == 200
+    # Duplicate types in one payload rejected; rename collision 409.
     r = client.put(url, json={"materials": [
         {"material_type_id": rad}, {"material_type_id": rad}]}, headers=h)
     assert r.status_code == 400
@@ -338,3 +343,144 @@ def test_file_upload_by_group_and_type(client):
     r = client.post(url, files={"file": ("x.gif", io.BytesIO(b"z"), "image/gif")}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
+
+def test_member_crud_one_by_one(client):
+    """Granular member management: start EMPTY, add types one at a time, patch
+    one standalone, remove one — the group may end (and stay) empty."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    eb = _mt_id(client, "Energy Balance")
+
+    grp = _mk_group(client, h, [], name="Built Up")   # empty create
+    assert grp["materials"] == []
+    url = BASE + f"/groups/{grp['id']}"
+
+    # Add two members one-by-one.
+    r = client.post(url + "/materials", json={
+        "material_type_id": rad, "properties": {"reflectivity": 0.2, "color_r": 90}},
+        headers=h)
+    assert r.status_code == 201, r.text
+    assert r.json()["success"] is True
+    assert [m["material_type"] for m in r.json()["group"]["materials"]] == ["Radiation"]
+    r = client.post(url + "/materials", json={
+        "material_type_id": eb, "properties": {"wind_speed": 3.5}}, headers=h)
+    assert r.status_code == 201, r.text
+    assert len(r.json()["group"]["materials"]) == 2
+
+    # Adding a type that is already in the group → 409.
+    r = client.post(url + "/materials", json={"material_type_id": rad}, headers=h)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "DUPLICATE_MATERIAL_TYPE_IN_GROUP"
+
+    # Unknown type / unknown group / eav validation on add.
+    r = client.post(url + "/materials", json={"material_type_id": 99999}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_FOUND"
+    r = client.post(BASE + "/groups/999999/materials",
+                    json={"material_type_id": rad}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NOT_FOUND"
+    sp = _mt_id(client, "Solar Position")
+    r = client.post(url + "/materials", json={
+        "material_type_id": sp, "properties": {"reflectivity": 0.1}}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_MISMATCH"
+
+    # PATCH one member standalone: merge-upsert + explicit-null clear.
+    r = client.patch(url + f"/materials/{rad}", json={
+        "properties": {"reflectivity": 0.5, "color_r": None}}, headers=h)
+    assert r.status_code == 200, r.text
+    m = _member(r.json()["group"], "Radiation")
+    assert m["properties"]["reflectivity"] == 0.5
+    assert m["properties"]["color_r"] is None            # explicit null cleared
+    # eav validation + non-member type on PATCH.
+    r = client.patch(url + f"/materials/{rad}",
+                     json={"properties": {"reflectivity": 2}}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+    r = client.patch(url + f"/materials/{sp}",
+                     json={"properties": {"latitude": 10}}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
+
+    # DELETE one member; repeat → 404; removing the LAST member is legal.
+    r = client.delete(url + f"/materials/{eb}", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["material_type_id"] == eb
+    assert [m["material_type"] for m in r.json()["group"]["materials"]] == ["Radiation"]
+    r = client.delete(url + f"/materials/{eb}", headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
+    r = client.delete(url + f"/materials/{rad}", headers=h)
+    assert r.status_code == 200
+    assert r.json()["group"]["materials"] == []          # empty group survives
+    assert client.get(url, headers=h).status_code == 200
+
+
+def test_member_crud_eager_scenario(client):
+    """The member endpoints run the same eager reconcile as PUT: add
+    materializes onto the active scenario's geometries (with the advisory
+    conflict pre-check), patch refreshes sync=1 snapshots, remove cleans the
+    applied rows."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    eb = _mt_id(client, "Energy Balance")
+
+    # A geometry with the group assigned (synced).
+    r = client.get("/api/catalog/object-types")
+    ot = next(o["id"] for o in r.json()["object_types"] if o["object"] == "Ground")
+    obj = client.post(f"/api/geometry/project/{pid}/scenario/{sid}/objects", json={
+        "object_type_id": ot,
+        "properties": {"length": 10, "breadth": 10, "resolution_x": 1, "resolution_y": 1,
+                       "position_x": 0, "position_y": 0, "position_z": 0, "rotation_z": 0,
+                       "texture_x": 1, "texture_y": 1},
+    }, headers=h).json()["object"]
+    grp = _mk_group(client, h, [{"material_type_id": rad,
+                                 "properties": {"reflectivity": 0.2}}], name="Eager Grp")
+    obj_url = f"/api/geometry/project/{pid}/scenario/{sid}/objects/{obj['id']}"
+    r = client.post(obj_url + "/material-groups", json={"group_id": grp["id"]}, headers=h)
+    assert r.status_code == 201, r.text
+    url = BASE + f"/groups/{grp['id']}"
+
+    # Eager ADD: the new member is materialized + snapshotted immediately.
+    r = client.post(url + f"/materials?scenario_id={sid}", json={
+        "material_type_id": eb, "properties": {"wind_speed": 3.5}}, headers=h)
+    assert r.status_code == 201, r.text
+    assert r.json()["sync"]["applied"]["added_members"] == 1
+    r = client.get(obj_url + "/material-groups", headers=h)
+    assert len(r.json()["material_groups"][0]["materials"]) == 2
+
+    # Eager ADD conflict pre-check: another assigned group owns the type → 409
+    # with conflicts, nothing written to the library.
+    blocker = _mk_group(client, h, [{"material_type_id": _mt_id(client, "Photosynthesis")}],
+                        name="Blocker Grp")
+    client.post(obj_url + "/material-groups", json={"group_id": blocker["id"]}, headers=h)
+    r = client.post(url + f"/materials?scenario_id={sid}", json={
+        "material_type_id": _mt_id(client, "Photosynthesis")}, headers=h)
+    assert r.status_code == 409
+    d = r.json()["detail"]
+    assert d["code"] == "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT"
+    assert d["conflicts"][0]["group_id"] == blocker["id"]
+    r = client.get(url, headers=h)
+    assert len(r.json()["group"]["materials"]) == 2      # library unchanged
+
+    # Eager PATCH: sync=1 snapshot refreshed.
+    r = client.patch(url + f"/materials/{rad}?scenario_id={sid}", json={
+        "properties": {"reflectivity": 0.9}}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["sync"]["applied"]["refreshed_values"] == 1
+
+    # Eager REMOVE: applied row + snapshots cleaned on the active scenario.
+    r = client.delete(url + f"/materials/{eb}?scenario_id={sid}", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["sync"]["applied"]["removed_members"] == 1
+    r = client.get(obj_url + "/material-groups", headers=h)
+    assert [m["material_type"] for m in r.json()["material_groups"][0]["materials"]] == ["Radiation"]
+
+    # Bad scenario id fails fast with nothing written.
+    r = client.post(url + "/materials?scenario_id=nope",
+                    json={"material_type_id": eb}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "SCENARIO_NOT_FOUND"

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -50,7 +51,11 @@ from app.services.eav_validation import (
 )
 
 _NAME_PREFIX = "Material"
-_TEXTURE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+# Allowed upload extensions per file-typed material property.
+_FILE_PROPERTY_EXTENSIONS = {
+    "texture_file": {".png", ".jpg", ".jpeg"},
+    "spectral_data": {".xml"},
+}
 _PRECEDENCE_TYPE = "Radiation"   # list preview mirrors the viewport winner
 
 
@@ -295,37 +300,44 @@ def _assigned_object_ids(db: Session, group_id: int, scenario_id: str) -> list[i
 
 
 def create_group(db: Session, session_id: str, body) -> dict:
-    project_id, scenario_id = _resolve_provenance(
-        db, session_id, body.project_id, body.scenario_id)
-    members = _validate_members_payload(db, body.materials)
+    try:
+        project_id, scenario_id = _resolve_provenance(
+            db, session_id, body.project_id, body.scenario_id)
+        members = _validate_members_payload(db, body.materials)
 
-    taken = _group_names_lower(db)   # GLOBAL namespace
-    if body.name is None:
-        name = next_default_name(taken, _NAME_PREFIX)
-    else:
-        name = validate_name(body.name)
-        if name.lower() in taken:
+        taken = _group_names_lower(db)   # GLOBAL namespace
+        if body.name is None:
+            name = next_default_name(taken, _NAME_PREFIX)
+        else:
+            name = validate_name(body.name)
+            if name.lower() in taken:
+                raise api_error(409, "MATERIAL_GROUP_NAME_EXISTS",
+                                "Material group name already exists")
+
+        grp = MaterialGroup(project_id=project_id, scenario_id=scenario_id, name=name)
+        db.add(grp)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
             raise api_error(409, "MATERIAL_GROUP_NAME_EXISTS",
                             "Material group name already exists")
+        for mt, defs, canonical in members:
+            pm = ProjectMaterial(material_group_id=grp.id, material_type_id=mt.id)
+            db.add(pm)
+            db.flush()
+            _upsert_values(db, pm.id, canonical, defs)
+        db.commit()
+        db.refresh(grp)
 
-    grp = MaterialGroup(project_id=project_id, scenario_id=scenario_id, name=name)
-    db.add(grp)
-    try:
-        db.flush()
-    except IntegrityError:
+        # A new group is assigned nowhere — no reconcile/repaint to do.
+        return {"success": True, "group": serialize_group(db, grp)}
+    except HTTPException:
+        raise   # deliberate validation errors keep their specific message/code
+    except Exception:
         db.rollback()
-        raise api_error(409, "MATERIAL_GROUP_NAME_EXISTS",
-                        "Material group name already exists")
-    for mt, defs, canonical in members:
-        pm = ProjectMaterial(material_group_id=grp.id, material_type_id=mt.id)
-        db.add(pm)
-        db.flush()
-        _upsert_values(db, pm.id, canonical, defs)
-    db.commit()
-    db.refresh(grp)
-
-    # A new group is assigned nowhere — no reconcile/repaint to do.
-    return {"success": True, "group": serialize_group(db, grp)}
+        raise api_error(500, "MATERIAL_CREATE_FAILED",
+                        "Unable to create material. Please try again")
 
 
 def list_groups(db: Session, session_id: str,
@@ -577,7 +589,8 @@ async def upload_file_property(db: Session, session_id: str, group_id: int,
     filename = Path(file.filename or "").name
     if not filename:
         raise api_error(400, "INVALID_FILE_FORMAT", "File format not supported")
-    if property_name == "texture_file" and Path(filename).suffix.lower() not in _TEXTURE_EXTENSIONS:
+    allowed = _FILE_PROPERTY_EXTENSIONS.get(property_name)
+    if allowed is not None and Path(filename).suffix.lower() not in allowed:
         raise api_error(400, "INVALID_FILE_FORMAT", "File format not supported")
 
     # Groups are global — uploads live under a project-free path. Values stored

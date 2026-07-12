@@ -316,3 +316,38 @@ def test_rerun_does_not_rebuild_projects_when_010_unrecorded(temp_engine):
         ).scalar()
     assert offset == "+05:30"          # offset preserved, not mangled to +05:00
     assert 10 in _versions(temp_engine)  # and stamped applied
+
+
+def test_023_seeds_radiation_bands(temp_engine):
+    """023 adds 9 per-band radiation floats (PAR/NIR/LW) + the use_radiation_bands
+    boolean, all mapped to the Radiation material type (band fractions 0-1)."""
+    database.run_migrations()
+    assert 23 in _versions(temp_engine)
+
+    band_floats = {
+        f"{kind}_{band}"
+        for band in ("PAR", "NIR", "LW")
+        for kind in ("reflectivity", "transmissivity", "emissivity")
+    }
+    all_new = band_floats | {"use_radiation_bands"}
+
+    with temp_engine.begin() as c:
+        dtypes = dict(c.execute(text(
+            "SELECT pt.property, d.name FROM property_type pt "
+            "JOIN datatype d ON d.id = pt.datatype_id"
+        )).fetchall())
+        ranges = {r[0]: (r[1], r[2]) for r in c.execute(text(
+            "SELECT property, min, max FROM property_type"
+        )).fetchall()}
+        radiation = {r[0] for r in c.execute(text(
+            "SELECT pt.property FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE mt.materialtype = 'Radiation'"
+        ))}
+
+    assert all_new <= set(dtypes), all_new - set(dtypes)
+    assert all(dtypes[p] == "float" for p in band_floats)
+    assert dtypes["use_radiation_bands"] == "boolean"
+    assert all(ranges[p] == (0.0, 1.0) for p in band_floats)
+    assert all_new <= radiation, all_new - radiation

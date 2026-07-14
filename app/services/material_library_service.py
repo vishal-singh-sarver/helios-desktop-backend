@@ -16,6 +16,10 @@ endpoint (PUT/DELETE group, member add/update/remove, file-upload) accepts
 plus repaint. Every other scenario keeps its last-applied snapshot state (the
 migration-022 break point) and reports/settles the drift through the GET/PUT
 material-sync APIs.
+
+PATCH /groups/{id}/rename is the one exception — it takes no ?scenario_id=.
+A rename changes no library VALUE and no membership, and applied state keys off
+material_group_id (never the name), so there is nothing to reconcile.
 """
 from __future__ import annotations
 
@@ -452,6 +456,43 @@ def update_group(db: Session, session_id: str, group_id: int, body,
     db.refresh(grp)
     out["group"] = serialize_group(db, grp)
     return out
+
+
+def rename_group(db: Session, session_id: str, group_id: int, name: str) -> dict:
+    """PATCH the group's NAME only — members and their values are untouched.
+
+    No eager `scenario_id` hook and no repaint: a rename changes no library
+    value and no membership, and the applied state (object_material_group /
+    object_material) references material_group_id, never the name — so the
+    reconcile engine would produce an empty diff.
+
+    Returns the FULL group, exactly like GET/PUT on this resource. A slim body
+    under the same "group" key would be a trap: a client that swaps its
+    `PUT /groups/{id}` refresh for this endpoint would drop `materials` from its
+    local state — the very member-loss this endpoint exists to avoid.
+    """
+    grp = _group_or_404(db, group_id)
+    new_name = validate_name(name)
+    # Skip the collision check against the group's OWN name so a case-only
+    # rename ("Grass Set" -> "grass set") is allowed.
+    if new_name.lower() != grp.name.lower() and new_name.lower() in _group_names_lower(db):
+        raise api_error(409, "MATERIAL_GROUP_NAME_EXISTS",
+                        "Material group name already exists")
+    grp.name = new_name
+    # Explicit: SQLAlchemy emits no UPDATE when the name is byte-identical, so
+    # `onupdate` would never fire and updated_at would go stale.
+    grp.updated_at = _now()
+    try:
+        db.commit()
+    except IntegrityError:
+        # validate_name already rules out the only other constraint on the row
+        # (CHECK length 1..20), so a survivor here is the NOCASE unique index —
+        # i.e. we lost the race between the pre-check above and this commit.
+        db.rollback()
+        raise api_error(409, "MATERIAL_GROUP_NAME_EXISTS",
+                        "Material group name already exists")
+    db.refresh(grp)
+    return {"success": True, "group": serialize_group(db, grp)}
 
 
 def add_group_material(db: Session, session_id: str, group_id: int, body,

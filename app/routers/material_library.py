@@ -15,6 +15,10 @@ the legacy single-segment routes (e.g. DELETE /{label}).
 PUT / DELETE / file-upload accept ?scenario_id= — the ACTIVE scenario, which
 is reconciled + repainted inline (full-cascade semantics). Other scenarios
 keep their applied state and settle drift via the material-sync APIs.
+
+PATCH /groups/{id}/rename takes NO ?scenario_id= — a name change cannot drift
+applied state (which keys off material_group_id), so there is nothing to
+reconcile.
 """
 from typing import Optional
 
@@ -28,6 +32,7 @@ from app.schemas.material_library import (
     GroupMaterialPatchRequest,
     MaterialGroupCreateRequest,
     MaterialGroupPutRequest,
+    MaterialGroupRenameRequest,
 )
 from app.services import material_library_service as svc
 
@@ -83,6 +88,18 @@ def update_group(
     db: Session = Depends(get_db),
 ):
     return svc.update_group(db, session_id, group_id, body, scenario_id)
+
+
+@router.patch(_BASE + "/groups/{group_id}/rename")
+def rename_group(
+    group_id: int,
+    body: MaterialGroupRenameRequest,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Rename the group only — members untouched (PUT would replace them).
+    No ?scenario_id=: a name change cannot drift applied state."""
+    return svc.rename_group(db, session_id, group_id, body.name)
 
 
 @router.delete(_BASE + "/groups/{group_id}")

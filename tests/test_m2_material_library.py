@@ -484,3 +484,265 @@ def test_member_crud_eager_scenario(client):
                     json={"material_type_id": eb}, headers=h)
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "SCENARIO_NOT_FOUND"
+
+
+# ── Group rename: PATCH /groups/{id}/rename ──────────────────────────────────
+# Name-only; members untouched (which the full-replacement PUT cannot promise).
+
+
+def _rename(client, h, gid, name):
+    return client.patch(BASE + f"/groups/{gid}/rename", json={"name": name}, headers=h)
+
+
+def test_rename_group_happy_path_members_untouched(client):
+    """Renames ONLY the name: id, provenance and created_at survive, and every
+    member keeps its material_id and values — the promise PUT cannot make."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    eb = _mt_id(client, "Energy Balance")
+    grp = _mk_group(client, h, [
+        {"material_type_id": rad, "properties": {"reflectivity": 0.2, "color_r": 90}},
+        {"material_type_id": eb, "properties": {"wind_speed": 3.5}},
+    ], name="Grass Set", scenario_id=sid)
+    before = client.get(BASE + f"/groups/{grp['id']}", headers=h).json()["group"]
+
+    r = _rename(client, h, grp["id"], "Meadow Set")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["group"]["id"] == grp["id"]
+    assert body["group"]["name"] == "Meadow Set"
+    assert body["group"]["updated_at"] != before["updated_at"]
+
+    after = client.get(BASE + f"/groups/{grp['id']}", headers=h).json()["group"]
+    assert after["name"] == "Meadow Set"
+    assert after["created_at"] == before["created_at"]     # renamed, not re-created
+    assert after["project_id"] == before["project_id"]     # provenance intact
+    assert after["scenario_id"] == before["scenario_id"]
+    assert after["materials"] == before["materials"]       # members byte-identical
+    assert _member(after, "Radiation")["properties"]["reflectivity"] == 0.2
+    assert _member(after, "Energy Balance")["properties"]["wind_speed"] == 3.5
+
+    # The PATCH body is the FULL group — byte-identical to GET on this resource.
+    # Pinned deliberately: a slim body under the same "group" key would let a
+    # client that swaps its PUT refresh for rename silently drop `materials`.
+    assert body["group"] == after
+
+
+def test_rename_group_duplicate_name_global_and_case_insensitive(client):
+    """The namespace is GLOBAL: colliding with another SESSION's group — or with
+    a seeded mig-019 default — is 409 in any casing, and writes nothing."""
+    s1, p1, _ = _setup(client)
+    s2, p2, _ = _setup(client)
+    rad = _mt_id(client, "Radiation")
+    _mk_group(client, {"session-id": s1}, [{"material_type_id": rad}], name="Grass Set")
+    mine = _mk_group(client, {"session-id": s2}, [{"material_type_id": rad}], name="Soil Set")
+    h2 = {"session-id": s2}
+
+    for taken in ("Grass Set", "GRASS set", "grass set", "default radiation"):
+        r = _rename(client, h2, mine["id"], taken)
+        assert r.status_code == 409, taken
+        assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NAME_EXISTS"
+
+    # A rejected rename writes nothing.
+    assert client.get(BASE + f"/groups/{mine['id']}",
+                      headers=h2).json()["group"]["name"] == "Soil Set"
+
+
+def test_rename_group_to_own_name_is_allowed(client):
+    """A group never collides with itself: its exact name is accepted, and a
+    case-only rename is applied (the `!= grp.name.lower()` guard)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    grp = _mk_group(client, h, [{"material_type_id": rad}], name="Grass Set")
+
+    r = _rename(client, h, grp["id"], "Grass Set")        # identical
+    assert r.status_code == 200, r.text
+    assert r.json()["group"]["name"] == "Grass Set"
+
+    r = _rename(client, h, grp["id"], "grass set")        # own name, new casing
+    assert r.status_code == 200, r.text
+    assert r.json()["group"]["name"] == "grass set"
+    assert client.get(BASE + f"/groups/{grp['id']}",
+                      headers=h).json()["group"]["name"] == "grass set"
+
+
+def test_rename_group_name_validation(client):
+    """validate_name: stripped, non-empty, <=20 chars (internal spaces count)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    gid = _mk_group(client, h, [{"material_type_id": rad}], name="Grass Set")["id"]
+
+    for bad in ("x" * 21, "a" * 10 + " " + "b" * 10):     # 21, incl. one with a space
+        r = _rename(client, h, gid, bad)
+        assert r.status_code == 400, bad
+        assert r.json()["detail"]["code"] == "NAME_TOO_LONG"
+        assert r.json()["detail"]["error"] == "Character limit exceeded"
+
+    for bad in ("", "   "):
+        r = _rename(client, h, gid, bad)
+        assert r.status_code == 400, repr(bad)
+        assert r.json()["detail"]["code"] == "NAME_REQUIRED"
+
+    # Control characters must die HERE. Python len() counts a NUL but SQLite's
+    # length() stops at it, so "\x00abc" would pass validation and then trip
+    # CHECK(length(name) BETWEEN 1 AND 20) at commit — surfacing to the user as a
+    # bogus "name already exists" that no other name could fix.
+    for bad in ("\x00abc", "ab\tcd", "ab\ncd"):
+        r = _rename(client, h, gid, bad)
+        assert r.status_code == 400, repr(bad)
+        assert r.json()["detail"]["code"] == "NAME_INVALID"
+
+    assert _rename(client, h, gid, "y" * 20).status_code == 200      # exactly 20
+    r = _rename(client, h, gid, "  Padded Name  ")                   # stored stripped
+    assert r.status_code == 200
+    assert r.json()["group"]["name"] == "Padded Name"
+    r = _rename(client, h, gid, "z" * 20 + "  ")   # 22 raw, 20 post-strip → allowed
+    assert r.status_code == 200
+    assert r.json()["group"]["name"] == "z" * 20
+
+    # Structurally-wrong bodies are pydantic 422s, not our {error, code} 400s.
+    assert client.patch(BASE + f"/groups/{gid}/rename",
+                        json={"name": 123}, headers=h).status_code == 422
+    assert client.patch(BASE + f"/groups/{gid}/rename",
+                        json={}, headers=h).status_code == 422
+
+    # Only the last successful rename stands.
+    assert client.get(BASE + f"/groups/{gid}",
+                      headers=h).json()["group"]["name"] == "z" * 20
+
+
+def test_rename_group_unknown_group(client):
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    r = _rename(client, h, 999999, "Nope")
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NOT_FOUND"
+    # Non-int group_id → pydantic path-param 422.
+    assert client.patch(BASE + "/groups/abc/rename",
+                        json={"name": "x"}, headers=h).status_code == 422
+
+
+def test_rename_group_visible_in_get_and_list(client):
+    """New name shows in GET / list / search; ordering (created_at) and the
+    neighbouring group are untouched."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    eb = _mt_id(client, "Energy Balance")
+    grass = _mk_group(client, h, [{"material_type_id": rad},
+                                  {"material_type_id": eb}], name="Grass Set")
+    _mk_group(client, h, [{"material_type_id": eb}], name="Soil EB")
+
+    assert _rename(client, h, grass["id"], "Meadow Set").status_code == 200
+
+    rows = client.get(BASE + "/groups", headers=h).json()["groups"]
+    assert len(rows) == 2 + DEFAULT_GROUP_COUNT           # renamed, not created
+    # Newest-first is by created_at, which a rename does not touch.
+    assert [g["name"] for g in rows[:2]] == ["Soil EB", "Meadow Set"]
+    assert set(rows[1]["material_type_ids"]) == {rad, eb}  # membership intact
+
+    hits = client.get(BASE + "/groups?search=Meadow", headers=h).json()["groups"]
+    assert [g["name"] for g in hits] == ["Meadow Set"]
+    assert client.get(BASE + "/groups?search=Grass", headers=h).json()["groups"] == []
+
+
+def test_rename_assigned_group_keeps_applied_state(client):
+    """LOAD-BEARING: a group assigned to a geometry survives a rename intact —
+    the assignment keys off material_group_id and the name is resolved LIVE. This
+    is the proof that rename needs no ?scenario_id= reconcile; it would fail if
+    an eager reconcile were ever added."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+
+    ot = next(o["id"] for o in client.get("/api/catalog/object-types").json()["object_types"]
+              if o["object"] == "Ground")
+    obj = client.post(f"/api/geometry/project/{pid}/scenario/{sid}/objects", json={
+        "object_type_id": ot,
+        "properties": {"length": 10, "breadth": 10, "resolution_x": 1, "resolution_y": 1,
+                       "position_x": 0, "position_y": 0, "position_z": 0, "rotation_z": 0,
+                       "texture_x": 1, "texture_y": 1},
+    }, headers=h).json()["object"]
+    grp = _mk_group(client, h, [{"material_type_id": rad,
+                                 "properties": {"reflectivity": 0.2}}], name="Grass Set")
+    obj_url = f"/api/geometry/project/{pid}/scenario/{sid}/objects/{obj['id']}"
+    assert client.post(obj_url + "/material-groups",
+                       json={"group_id": grp["id"]}, headers=h).status_code == 201
+
+    before = client.get(obj_url + "/material-groups", headers=h).json()["material_groups"][0]
+    assert before["name"] == "Grass Set"
+    sync_url = f"/api/geometry/project/{pid}/scenario/{sid}/material-sync"
+    before_sync = client.get(sync_url, headers=h).json()
+    assert before_sync["in_sync"] is True
+
+    assert _rename(client, h, grp["id"], "Meadow Set").status_code == 200
+
+    after = client.get(obj_url + "/material-groups", headers=h).json()["material_groups"][0]
+    assert after["group_id"] == before["group_id"]     # same soft reference
+    assert after["name"] == "Meadow Set"               # resolved live from the library
+    assert after["sync"] == before["sync"]
+    assert after["materials"] == before["materials"]   # applied members/values untouched
+    assert _member(after, "Radiation")["properties"]["reflectivity"] == 0.2
+
+    # THE proof that skipping the eager ?scenario_id= hook is correct: the sync
+    # engine's dry-run report is byte-identical after the rename — zero drift, so
+    # a reconcile would have had nothing to do. Regression guard: this breaks the
+    # moment anyone bolts an eager reconcile onto rename.
+    assert client.get(sync_url, headers=h).json() == before_sync
+
+
+def test_rename_frees_the_old_name(client):
+    """next_default_name gap-fills from the LIVE name set (no stored counter), so
+    renaming away from 'Material.001' frees it for reuse."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    grp = _mk_group(client, h, [{"material_type_id": rad}])       # auto-named
+    assert grp["name"] == "Material.001"
+    assert client.get(BASE + "/groups/next-name", headers=h).json()["name"] == "Material.002"
+
+    assert _rename(client, h, grp["id"], "Grass Set").status_code == 200
+    assert client.get(BASE + "/groups/next-name", headers=h).json()["name"] == "Material.001"
+    reused = _mk_group(client, h, [{"material_type_id": rad}])
+    assert reused["name"] == "Material.001"
+
+    # ...and the renamed group's new name is now taken (case-insensitively).
+    r = _rename(client, h, reused["id"], "grass SET")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NAME_EXISTS"
+
+
+def test_rename_empty_group(client):
+    """A group may legally hold zero members (module docstring) — renaming one
+    still works and still returns the full (empty) member list."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    grp = _mk_group(client, h, [], name="Empty Set")
+    assert grp["materials"] == []
+
+    r = _rename(client, h, grp["id"], "Still Empty")
+    assert r.status_code == 200, r.text
+    assert r.json()["group"]["name"] == "Still Empty"
+    assert r.json()["group"]["materials"] == []
+
+
+def test_rename_seeded_default_group(client):
+    """The 6 mig-019 defaults are ordinary global groups — nothing protects them,
+    and renaming one is not a create/delete."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rows = client.get(BASE + "/groups", headers=h).json()["groups"]
+    default = next(g for g in rows if g["name"] == "Default Radiation")
+    before = client.get(BASE + f"/groups/{default['id']}", headers=h).json()["group"]
+
+    assert _rename(client, h, default["id"], "House Radiation").status_code == 200
+
+    after = client.get(BASE + f"/groups/{default['id']}", headers=h).json()["group"]
+    assert after["name"] == "House Radiation"
+    assert after["materials"] == before["materials"]
+    assert len(client.get(BASE + "/groups",
+                          headers=h).json()["groups"]) == DEFAULT_GROUP_COUNT

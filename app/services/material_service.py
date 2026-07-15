@@ -1,4 +1,6 @@
 from pathlib import Path
+
+from app.core.config import settings
 from app.helios.context import get_context
 from app.helios import registry as reg
 
@@ -181,3 +183,54 @@ def get_texture_library() -> dict:
         if files:
             categories[name] = sorted(files)
     return {"categories": categories}
+
+
+# ── Default-texture picker (data/assets) ─────────────────────────────────────
+# App-owned folder of default textures the user can choose from. Kept separate
+# from the ground default's own resolution (material_apply) and from user
+# uploads (data/uploads) — this is purely the pickable default set.
+
+
+def default_textures_dir() -> Path:
+    """Folder (under data_dir) that holds the default textures for the picker.
+    data/ is gitignored, so it's populated at startup by seed_default_textures."""
+    return settings.data_dir / "assets"
+
+
+def seed_default_textures() -> None:
+    """Copy the bundled default texture(s) into data/assets/ so the picker has
+    them. Idempotent (skips files already present) and best-effort — it never
+    raises and never changes where the ground default itself resolves from."""
+    import shutil
+    from app.services import material_apply
+
+    src = material_apply._DEFAULT_GROUND_TEXTURE   # the dirt.jpg the ground uses
+    if not src:
+        return
+    src_path = Path(src)
+    if not src_path.is_file():
+        return
+    try:
+        dest_dir = default_textures_dir()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src_path.name
+        if not dest.exists():
+            shutil.copy2(src_path, dest)
+    except OSError:
+        pass   # the picker just won't have this default — not worth failing startup
+
+
+def list_default_textures() -> list[dict]:
+    """The default textures available in data/assets/ — image files only, with
+    the same watermark/logo exclusions as the plugin library. Each entry is
+    {name, path (absolute)}."""
+    d = default_textures_dir()
+    if not d.is_dir():
+        return []
+    return [
+        {"name": f.name, "path": str(f.resolve())}
+        for f in sorted(d.iterdir())
+        if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg")
+        and f.name not in _TEXTURE_EXCLUDE
+        and not any(f.name.startswith(p) for p in _TEXTURE_EXCLUDE_PREFIXES)
+    ]

@@ -329,10 +329,17 @@ _NAME_MAX = 20
 
 
 def validate_name(name: str) -> str:
-    """≤20 chars including spaces, non-empty after strip."""
+    """≤20 chars including spaces, non-empty after strip, no control characters."""
     if not isinstance(name, str) or not name.strip():
         raise api_error(400, "NAME_REQUIRED", "Name is required")
     name = name.strip()
+    # Control chars (NUL especially) must be rejected HERE: str.strip() leaves NUL
+    # in place and Python counts it, but SQLite's length() stops at the first NUL —
+    # so a name like "\x00abc" would sail past this check and then die on the
+    # CHECK(length(name) BETWEEN 1 AND 20) constraint at commit, surfacing as a
+    # bogus "name already exists" from the callers' IntegrityError handlers.
+    if any(ch < " " for ch in name):
+        raise api_error(400, "NAME_INVALID", "Name contains invalid characters")
     if len(name) > _NAME_MAX:
         raise api_error(400, "NAME_TOO_LONG", "Character limit exceeded")
     return name

@@ -362,7 +362,7 @@ def test_024_visualiser_material_type(temp_engine):
     database.run_migrations()
     assert 24 in _versions(temp_engine)
 
-    VIZ = {"color_r", "color_g", "color_b", "opacity", "texture_file"}
+    VIZ = {"color_r", "color_g", "color_b", "opacity", "texture_file", "texture_toggle"}
     with temp_engine.begin() as c:
         # The Visualiser type exists and owns EXACTLY the 5 visualisation props.
         assert c.execute(text(
@@ -410,10 +410,42 @@ def test_024_visualiser_material_type(temp_engine):
             "JOIN property_type pt ON pt.id = md.property_type_id "
             "WHERE md.project_material_id = :m"
         ), {"m": members[0][0]}).fetchall())
-        assert vals == {"color_r": "128", "color_g": "128",
-                        "color_b": "128", "opacity": "100"}
+        # opacity 100 + colour 128 + texture_toggle '0' (colour mode; migration
+        # 025 seeds the toggle onto this same default member).
+        assert vals == {"color_r": "128", "color_g": "128", "color_b": "128",
+                        "opacity": "100", "texture_toggle": "0"}
 
         # NULL-project group count is now 7 (6 wrapped mig-019 defaults + this).
         assert c.execute(text(
             "SELECT count(*) FROM material_group WHERE project_id IS NULL"
         )).scalar() == 7
+
+
+def test_025_visualiser_texture_toggle(temp_engine):
+    """025 adds the boolean `texture_toggle` mode selector to Visualiser (only)
+    and seeds the Default Visualiser member to colour mode (toggle = false)."""
+    database.run_migrations()
+    assert 25 in _versions(temp_engine)
+
+    with temp_engine.begin() as c:
+        # texture_toggle is a boolean property...
+        assert c.execute(text(
+            "SELECT d.name FROM property_type pt JOIN datatype d ON d.id = pt.datatype_id "
+            "WHERE pt.property = 'texture_toggle'"
+        )).scalar() == "boolean"
+        # ...mapped to ONLY the Visualiser type.
+        owners = {r[0] for r in c.execute(text(
+            "SELECT mt.materialtype FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE pt.property = 'texture_toggle'"
+        ))}
+        assert owners == {"Visualiser"}
+        # The Default Visualiser member is seeded to colour mode (toggle = '0').
+        assert c.execute(text(
+            "SELECT md.value FROM material_data md "
+            "JOIN property_type pt ON pt.id = md.property_type_id "
+            "JOIN project_material pm ON pm.id = md.project_material_id "
+            "JOIN material_group mg ON mg.id = pm.material_group_id "
+            "WHERE pt.property = 'texture_toggle' AND mg.name = 'Default Visualiser'"
+        )).scalar() == "0"

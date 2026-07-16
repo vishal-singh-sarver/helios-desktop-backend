@@ -163,7 +163,9 @@ def test_list_groups_preview_filter_search(client):
     eb = _mt_id(client, "Energy Balance")
 
     _mk_group(client, h, [
-        {"material_type_id": vis, "properties": {"color_r": 90, "color_g": 200, "color_b": 90}},
+        {"material_type_id": vis, "properties": {
+            "texture_toggle": False, "color_r": 90, "color_g": 200,
+            "color_b": 90, "opacity": 100}},
         {"material_type_id": eb, "properties": {"wind_speed": 3.5}},
     ], name="Grass Set")
     _mk_group(client, h, [{"material_type_id": eb}], name="Soil EB")
@@ -178,7 +180,8 @@ def test_list_groups_preview_filter_search(client):
     assert set(grass["material_types"]) == {"Visualiser", "Energy Balance"}
     # Preview mirrors viewport precedence: the Visualiser member wins.
     assert grass["preview"]["color_r"] == 90
-    assert set(grass["preview"].keys()) == {"color_r", "color_g", "color_b", "opacity", "texture_file"}
+    assert set(grass["preview"].keys()) == {"color_r", "color_g", "color_b",
+                                             "opacity", "texture_file", "texture_toggle"}
 
     # Filter: groups containing the type
     r = client.get(BASE + f"/groups?material_type_id={vis}", headers=h)
@@ -206,16 +209,18 @@ def test_put_group_diff_semantics(client):
     rad_member_id = _member(grp, "Radiation")["material_id"]
     url = BASE + f"/groups/{grp['id']}"
 
-    # Rename-only PUT: same membership, empty per-member properties → nothing lost.
+    # PUT is now FULL-REPLACEMENT per member: to preserve a member's properties
+    # across a rename you must re-send them (empty props would clear them).
     r = client.put(url, json={"name": "Dry Grass", "materials": [
-        {"material_type_id": rad}, {"material_type_id": eb},
+        {"material_type_id": rad, "properties": {"reflectivity": 0.2, "transmissivity": 0.5}},
+        {"material_type_id": eb, "properties": {"wind_speed": 3.5}},
     ]}, headers=h)
     assert r.status_code == 200, r.text
     g = r.json()["group"]
     assert g["name"] == "Dry Grass"
     m = _member(g, "Radiation")
     assert m["material_id"] == rad_member_id           # updated in place
-    assert m["properties"]["reflectivity"] == 0.2      # absent keys untouched
+    assert m["properties"]["reflectivity"] == 0.2      # re-sent, so preserved
 
     # Update + remove + add in one PUT: keep Radiation (new value, explicit null
     # clears transmissivity), drop Energy Balance, add Solar Position.
@@ -316,7 +321,11 @@ def test_file_upload_by_group_and_type(client):
     h = {"session-id": session_id}
     vis = _mt_id(client, "Visualiser")
     eb = _mt_id(client, "Energy Balance")
-    grp = _mk_group(client, h, [{"material_type_id": vis}], name="Textured")
+    # Start the Visualiser member in colour mode (a member is always a complete
+    # mode); uploading a texture then switches it into texture mode.
+    grp = _mk_group(client, h, [{"material_type_id": vis, "properties": {
+        "texture_toggle": False, "color_r": 128, "color_g": 128,
+        "color_b": 128, "opacity": 100}}], name="Textured")
     member_id = grp["materials"][0]["material_id"]
 
     url = BASE + f"/groups/{grp['id']}/materials/{vis}/files/texture_file"
@@ -327,7 +336,12 @@ def test_file_upload_by_group_and_type(client):
     assert body["success"] is True and body["property"] == "texture_file"
     # Project-free storage path (groups are global).
     assert body["value"] == f"uploads/materials/{member_id}/grass.png"
-    assert _member(body["group"], "Visualiser")["properties"]["texture_file"] == body["value"]
+    vis_member = _member(body["group"], "Visualiser")
+    assert vis_member["properties"]["texture_file"] == body["value"]
+    # Uploading a texture switches the member INTO texture mode: toggle on,
+    # colour cleared (the atomic mode switch — a member is exactly one mode).
+    assert vis_member["properties"]["texture_toggle"] is True
+    assert vis_member["properties"]["color_r"] is None
 
     # A type that is not in the group → 404 MATERIAL_TYPE_NOT_IN_GROUP.
     r = client.post(BASE + f"/groups/{grp['id']}/materials/{eb}/files/texture_file",
@@ -388,20 +402,20 @@ def test_member_crud_one_by_one(client):
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "MATERIAL_TYPE_MISMATCH"
 
-    # PATCH one member standalone: merge-upsert + explicit-null clear.
-    r = client.patch(url + f"/materials/{rad}", json={
-        "properties": {"reflectivity": 0.5, "transmissivity": None}}, headers=h)
+    # PUT one member standalone: FULL REPLACEMENT (omitted props are cleared).
+    r = client.put(url + f"/materials/{rad}", json={
+        "properties": {"reflectivity": 0.5}}, headers=h)
     assert r.status_code == 200, r.text
     m = _member(r.json()["group"], "Radiation")
     assert m["properties"]["reflectivity"] == 0.5
-    assert m["properties"]["transmissivity"] is None     # explicit null cleared
-    # eav validation + non-member type on PATCH.
-    r = client.patch(url + f"/materials/{rad}",
-                     json={"properties": {"reflectivity": 2}}, headers=h)
+    assert m["properties"]["transmissivity"] is None     # not re-sent -> cleared
+    # eav validation + non-member type on PUT.
+    r = client.put(url + f"/materials/{rad}",
+                   json={"properties": {"reflectivity": 2}}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
-    r = client.patch(url + f"/materials/{sp}",
-                     json={"properties": {"latitude": 10}}, headers=h)
+    r = client.put(url + f"/materials/{sp}",
+                   json={"properties": {"latitude": 10}}, headers=h)
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
 
@@ -467,8 +481,8 @@ def test_member_crud_eager_scenario(client):
     r = client.get(url, headers=h)
     assert len(r.json()["group"]["materials"]) == 2      # library unchanged
 
-    # Eager PATCH: sync=1 snapshot refreshed.
-    r = client.patch(url + f"/materials/{rad}?scenario_id={sid}", json={
+    # Eager PUT: sync=1 snapshot refreshed.
+    r = client.put(url + f"/materials/{rad}?scenario_id={sid}", json={
         "properties": {"reflectivity": 0.9}}, headers=h)
     assert r.status_code == 200, r.text
     assert r.json()["sync"]["applied"]["refreshed_values"] == 1
@@ -487,9 +501,10 @@ def test_member_crud_eager_scenario(client):
     assert r.json()["detail"]["code"] == "SCENARIO_NOT_FOUND"
 
 
-def test_visualiser_owns_viz_props(client):
-    """Plan B: colour/opacity/texture are valid ONLY on a Visualiser member; the
-    same props on any model type are rejected. opacity is a 0..100 percent."""
+def test_visualiser_required_by_mode(client):
+    """Visualiser is required-by-mode (migration 025): texture_toggle picks
+    colour|texture, that mode's fields are required and the other's forbidden.
+    Viz props on a model type are still rejected."""
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     rad = _mt_id(client, "Radiation")
@@ -498,30 +513,62 @@ def test_visualiser_owns_viz_props(client):
     grp = _mk_group(client, h, [], name="Viz Rules")
     add = BASE + f"/groups/{grp['id']}/materials"
 
-    # color_r on a Radiation member -> 400 MATERIAL_TYPE_MISMATCH (viz is
-    # Visualiser-only now).
+    # color_r on a Radiation member -> MATERIAL_TYPE_MISMATCH (viz is Visualiser-only).
     r = client.post(add, json={"material_type_id": rad,
                                "properties": {"color_r": 90}}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "MATERIAL_TYPE_MISMATCH"
 
-    # The same viz props + opacity ARE accepted on a Visualiser member.
+    # A Visualiser member with no texture_toggle -> MISSING_REQUIRED_PROPERTY.
+    r = client.post(add, json={"material_type_id": vis,
+                               "properties": {"color_r": 90}}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
+
+    # Colour mode requires ALL of color_r/g/b + opacity (no partial).
     r = client.post(add, json={"material_type_id": vis, "properties": {
-        "color_r": 90, "color_g": 200, "color_b": 90, "opacity": 40,
-    }}, headers=h)
+        "texture_toggle": False, "color_r": 90, "color_g": 200}}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
+
+    # A stray texture_file in colour mode is a mode conflict.
+    r = client.post(add, json={"material_type_id": vis, "properties": {
+        "texture_toggle": False, "color_r": 90, "color_g": 200, "color_b": 90,
+        "opacity": 40, "texture_file": "x.png"}}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "VISUALISER_MODE_CONFLICT"
+
+    # A complete colour-mode member is accepted.
+    r = client.post(add, json={"material_type_id": vis, "properties": {
+        "texture_toggle": False, "color_r": 90, "color_g": 200, "color_b": 90,
+        "opacity": 40}}, headers=h)
     assert r.status_code == 201, r.text
     m = _member(r.json()["group"], "Visualiser")
     assert m["properties"]["color_r"] == 90 and m["properties"]["opacity"] == 40
+    assert m["properties"]["texture_toggle"] is False
+    assert m["properties"]["texture_file"] is None
 
-    # opacity is a 0..100 percent: out of range is rejected.
-    r = client.patch(add + f"/{vis}", json={"properties": {"opacity": 150}}, headers=h)
+    # opacity is a 0..100 percent: out of range rejected (full colour-mode PUT).
+    r = client.put(add + f"/{vis}", json={"properties": {
+        "texture_toggle": False, "color_r": 1, "color_g": 2, "color_b": 3,
+        "opacity": 150}}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
 
-    # Explicit null clears a viz prop on the Visualiser member.
-    r = client.patch(add + f"/{vis}", json={"properties": {"color_r": None}}, headers=h)
+    # PUT into texture mode requires a texture_file.
+    r = client.put(add + f"/{vis}", json={
+        "properties": {"texture_toggle": True}}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "MISSING_REQUIRED_PROPERTY"
+
+    # PUT full-replacement into texture mode (path supplied) clears the colour.
+    r = client.put(add + f"/{vis}", json={"properties": {
+        "texture_toggle": True, "texture_file": "uploads/materials/x/t.png"}}, headers=h)
     assert r.status_code == 200, r.text
-    assert _member(r.json()["group"], "Visualiser")["properties"]["color_r"] is None
+    m = _member(r.json()["group"], "Visualiser")
+    assert m["properties"]["texture_toggle"] is True
+    assert m["properties"]["texture_file"] == "uploads/materials/x/t.png"
+    assert m["properties"]["color_r"] is None and m["properties"]["opacity"] is None
 
 
 def test_preview_winner_visualiser_and_none_fallback(client):
@@ -534,7 +581,9 @@ def test_preview_winner_visualiser_and_none_fallback(client):
     eb = _mt_id(client, "Energy Balance")
 
     _mk_group(client, h, [
-        {"material_type_id": vis, "properties": {"color_r": 10, "color_g": 20, "color_b": 30}},
+        {"material_type_id": vis, "properties": {
+            "texture_toggle": False, "color_r": 10, "color_g": 20,
+            "color_b": 30, "opacity": 100}},
         {"material_type_id": eb, "properties": {"wind_speed": 2.0}},
     ], name="Has Viz")
     _mk_group(client, h, [{"material_type_id": eb, "properties": {"wind_speed": 2.0}}],

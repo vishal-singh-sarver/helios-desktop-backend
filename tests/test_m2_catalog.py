@@ -50,7 +50,7 @@ def test_material_types_seven_types_viz_on_visualiser_only(client):
     # SOLELY by the new "Visualiser" type; the six model types no longer carry
     # them. Properties are also NO LONGER tagged with a model/visualisation
     # `group` — the response is a flat property list.
-    VIZ = {"color_r", "color_g", "color_b", "opacity", "texture_file"}
+    VIZ = {"color_r", "color_g", "color_b", "opacity", "texture_file", "texture_toggle"}
     for name, mt in by_name.items():
         names = {p["property"] for p in mt["properties"]}
         if name == "Visualiser":

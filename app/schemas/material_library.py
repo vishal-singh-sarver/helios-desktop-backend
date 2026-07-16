@@ -16,10 +16,10 @@ class GroupMaterialIn(BaseModel):
     properties: dict[str, Any] = Field(default_factory=dict)
 
 
-class GroupMaterialPatchRequest(BaseModel):
-    """Standalone update of one member's properties (merge-upsert: provided
-    keys written, explicit null clears, absent keys untouched). The member is
-    addressed by material_type_id in the URL."""
+class GroupMaterialPutRequest(BaseModel):
+    """Standalone FULL-REPLACEMENT of one member's properties (the stored set
+    becomes exactly `properties`; omitted keys are cleared). Visualiser members
+    are required-by-mode. The member is addressed by material_type_id in the URL."""
     properties: dict[str, Any] = Field(default_factory=dict)
 
 

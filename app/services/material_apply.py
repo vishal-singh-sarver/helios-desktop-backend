@@ -201,17 +201,29 @@ def _winner_color(db: Session, so_id: int, winner) -> tuple[float, float, float,
     return reg.DEFAULT_MATERIAL_COLOR
 
 
+def _is_texture_mode(values: dict) -> bool:
+    """Whether a Visualiser winner's snapshot is in TEXTURE mode (vs colour).
+    Honors the explicit `texture_toggle` (migration 025); for a legacy member
+    with no toggle, falls back to 'has a resolvable texture_file'."""
+    toggle = values.get("texture_toggle")
+    if toggle is not None:
+        return bool(toggle)
+    return bool(resolve_texture_path(values.get("texture_file")))
+
+
 def _winner_texture(db: Session, so_id: int, winner) -> str:
     """Texture string for the object's material, decided by the precedence winner:
-        no material        -> the default soil (an unstyled ground reads as soil)
-        texture winner     -> that texture's resolved path
-        color-only winner  -> "" (cleared, so the winner's solid colour shows)
+        no material          -> the default soil (an unstyled ground reads as soil)
+        texture-mode winner  -> that texture's resolved path (soil if missing)
+        colour-mode winner   -> "" (cleared, so the winner's solid colour shows)
     Fed to setMaterialTexture: a path renders the image, "" renders the colour
     (geometry_pack keys off getPrimitiveTextureFile being non-empty vs empty)."""
     if winner is None:
         return _DEFAULT_GROUND_TEXTURE
     values = _assignment_snapshot_native(db, so_id, winner.project_material_id)
-    return resolve_texture_path(values.get("texture_file")) or ""
+    if _is_texture_mode(values):
+        return resolve_texture_path(values.get("texture_file")) or _DEFAULT_GROUND_TEXTURE
+    return ""
 
 
 def _apply_model_data(ctx, uuids: list[int], defs: dict, values: dict) -> None:

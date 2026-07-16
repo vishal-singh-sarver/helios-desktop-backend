@@ -57,10 +57,40 @@ REQUIRED_OBJECT_PROPERTIES = {
 }
 
 # Visualisation properties — owned SOLELY by the "Visualiser" material type
-# (migration 024), rendered on the Visualisation surface; everything else is a
-# model parameter. `opacity` is the RGBA alpha channel expressed as a 0..100
-# percent (material_apply divides by 100 for the 0..1 alpha).
-VISUALISATION_PROPERTIES = {"color_r", "color_g", "color_b", "texture_file", "opacity"}
+# (migrations 024/025), rendered on the Visualisation surface; everything else
+# is a model parameter. `opacity` is the RGBA alpha channel as a 0..100 percent
+# (material_apply divides by 100 for the 0..1 alpha). `texture_toggle` is the
+# mode selector (true = texture, false = solid colour).
+VISUALISATION_PROPERTIES = {"color_r", "color_g", "color_b", "texture_file",
+                            "opacity", "texture_toggle"}
+
+# The two mutually-exclusive Visualiser modes (migration 025). texture_toggle
+# picks one; that mode's fields are required and the other's must be absent.
+VISUALISER_TEXTURE_FIELDS = {"texture_file"}
+VISUALISER_COLOUR_FIELDS = {"color_r", "color_g", "color_b", "opacity"}
+
+
+def visualiser_mode_required(properties: dict) -> set[str]:
+    """Required-by-mode rule for a Visualiser member on a FULL-REPLACEMENT write.
+
+    `texture_toggle` selects the mode; that mode's fields are required and the
+    OTHER mode's fields must be absent (a Visualiser member is always exactly one
+    complete mode — never empty, never both). Returns the set of property names
+    to require; raises 400 on a missing/invalid toggle or a cross-mode field.
+    """
+    toggle = properties.get("texture_toggle")
+    if toggle is None:
+        raise api_error(400, "MISSING_REQUIRED_PROPERTY", "texture_toggle is required")
+    if not isinstance(toggle, bool):
+        raise api_error(400, "DATATYPE_MISMATCH", "texture_toggle must be a boolean")
+    active, forbidden = ((VISUALISER_TEXTURE_FIELDS, VISUALISER_COLOUR_FIELDS) if toggle
+                         else (VISUALISER_COLOUR_FIELDS, VISUALISER_TEXTURE_FIELDS))
+    present = sorted(f for f in forbidden if properties.get(f) is not None)
+    if present:
+        mode = "texture" if toggle else "colour"
+        raise api_error(400, "VISUALISER_MODE_CONFLICT",
+                        f"{', '.join(present)} not allowed in {mode} mode")
+    return {"texture_toggle"} | active
 
 _MAX_DECIMALS = 7
 

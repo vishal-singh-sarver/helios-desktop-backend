@@ -339,7 +339,11 @@ def test_upload_file_eager_refreshes_active_scenario(client):
     import io
     h, pid, sid_a, sid_b, obj_a, obj_b = _setup(client)
     vis = _mt_id(client, "Visualiser")
-    grp = _mk_group(client, h, [("Visualiser", None)], name="Tex Set")
+    # Start in colour mode (a Visualiser member is always a complete mode); the
+    # texture upload below switches it into texture mode.
+    grp = _mk_group(client, h, [("Visualiser", {
+        "texture_toggle": False, "color_r": 128, "color_g": 128,
+        "color_b": 128, "opacity": 100})], name="Tex Set")
     _assign(client, h, pid, sid_a, obj_a, grp)
     _assign(client, h, pid, sid_b, obj_b, grp)
 

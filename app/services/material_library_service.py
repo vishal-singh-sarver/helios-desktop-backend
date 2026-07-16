@@ -48,6 +48,7 @@ from app.services.eav_validation import (
     project_or_404,
     validate_name,
     validate_properties,
+    visualiser_mode_required,
 )
 
 _NAME_PREFIX = "Material"
@@ -97,19 +98,31 @@ def _values_native(db: Session, material_id: int) -> dict:
 
 
 def _upsert_values(db: Session, material_id: int, canonical: dict[str, str | None],
-                   defs: dict) -> None:
-    """Write canonical values into material_data (None deletes the row)."""
-    by_pt = {defs[name].property_type_id: (name, value) for name, value in canonical.items()}
+                   defs: dict, *, replace: bool = False) -> None:
+    """Write canonical values into material_data (None deletes the row).
+
+    replace=False (merge): only properties present in `canonical` are touched;
+    absent ones are left as they were.
+    replace=True (full replacement): the member's stored properties become
+    EXACTLY `canonical` — every other property of the type is cleared. Used by
+    the PUT paths (per-member and group-level) so a member's persisted state is
+    precisely what the client sent."""
+    value_by_pt = {defs[name].property_type_id: value for name, value in canonical.items()}
+    # Under replace, the scope is every property of the type (so omitted ones get
+    # cleared); under merge, only the properties in the request.
+    scope = ({d.property_type_id for d in defs.values()} if replace
+             else set(value_by_pt.keys()))
     existing = {
         row.property_type_id: row
         for row in db.query(MaterialData)
         .filter(
             MaterialData.project_material_id == material_id,
-            MaterialData.property_type_id.in_(by_pt.keys()),
+            MaterialData.property_type_id.in_(scope),
         )
         .all()
     }
-    for pt_id, (_name, value) in by_pt.items():
+    for pt_id in scope:
+        value = value_by_pt.get(pt_id)   # absent under replace -> None -> cleared
         row = existing.get(pt_id)
         if value is None:
             if row is not None:
@@ -156,8 +169,13 @@ def _validate_member_entry(db: Session, material_type_id: int, properties: dict)
         raise api_error(404, "MATERIAL_TYPE_NOT_FOUND",
                         f"material_type_id {material_type_id} not found")
     defs = load_type_properties(db, material_type_id=mt.id)
+    # Visualiser members are full-replacement + required-by-mode (migration 025):
+    # texture_toggle picks colour|texture and that mode's fields become required.
+    required = (visualiser_mode_required(properties)
+                if mt.materialtype == "Visualiser" else None)
     canonical = validate_properties(
-        properties, defs, type_label=mt.materialtype, type_kind="material type"
+        properties, defs, type_label=mt.materialtype, type_kind="material type",
+        required=required,
     )
     return mt, defs, canonical
 
@@ -326,7 +344,7 @@ def create_group(db: Session, session_id: str, body) -> dict:
             pm = ProjectMaterial(material_group_id=grp.id, material_type_id=mt.id)
             db.add(pm)
             db.flush()
-            _upsert_values(db, pm.id, canonical, defs)
+            _upsert_values(db, pm.id, canonical, defs, replace=True)
         db.commit()
         db.refresh(grp)
 
@@ -432,9 +450,9 @@ def update_group(db: Session, session_id: str, group_id: int, body,
         pm = ProjectMaterial(material_group_id=grp.id, material_type_id=mt.id)
         db.add(pm)
         db.flush()
-        _upsert_values(db, pm.id, canonical, defs)
+        _upsert_values(db, pm.id, canonical, defs, replace=True)
     for pm, (mt, defs, canonical) in to_update:
-        _upsert_values(db, pm.id, canonical, defs)
+        _upsert_values(db, pm.id, canonical, defs, replace=True)   # group PUT = full replace
         pm.updated_at = _now()
     if new_name is not None:
         grp.name = new_name
@@ -480,7 +498,7 @@ def add_group_material(db: Session, session_id: str, group_id: int, body,
     db.add(pm)
     try:
         db.flush()
-        _upsert_values(db, pm.id, canonical, defs)
+        _upsert_values(db, pm.id, canonical, defs, replace=True)
         grp.updated_at = _now()
         db.commit()
     except IntegrityError:
@@ -500,20 +518,25 @@ def add_group_material(db: Session, session_id: str, group_id: int, body,
 def update_group_material(db: Session, session_id: str, group_id: int,
                           material_type_id: int, body,
                           scenario_id: str | None) -> dict:
-    """PATCH one member's properties standalone (merge-upsert: provided keys
-    written, explicit null clears, absent keys untouched). The eager
-    `scenario_id` hook refreshes that scenario's sync=1 snapshots + repaints."""
+    """PUT one member's properties standalone — FULL REPLACEMENT: the member's
+    stored properties become exactly `body.properties` (any omitted property is
+    cleared). Visualiser members are required-by-mode (texture_toggle picks
+    colour|texture). The eager `scenario_id` hook refreshes that scenario's
+    sync=1 snapshots + repaints."""
     grp = _group_or_404(db, group_id)
     scn = _scenario_scope_or_404(db, session_id, scenario_id) if scenario_id else None
     pm = _member_or_404(db, grp.id, material_type_id)
 
     mt = db.get(MaterialType, pm.material_type_id)
     defs = load_type_properties(db, material_type_id=pm.material_type_id)
+    required = (visualiser_mode_required(body.properties)
+                if mt and mt.materialtype == "Visualiser" else None)
     canonical = validate_properties(
         body.properties, defs,
-        type_label=mt.materialtype if mt else "material", type_kind="material type"
+        type_label=mt.materialtype if mt else "material", type_kind="material type",
+        required=required,
     )
-    _upsert_values(db, pm.id, canonical, defs)
+    _upsert_values(db, pm.id, canonical, defs, replace=True)
     pm.updated_at = _now()
     grp.updated_at = _now()
     db.commit()
@@ -603,7 +626,17 @@ async def upload_file_property(db: Session, session_id: str, group_id: int,
     dest.write_bytes(await file.read())
 
     value = str(rel).replace("\\", "/")
-    _upsert_values(db, pm.id, {property_name: value}, defs)
+    if property_name == "texture_file" and "texture_toggle" in defs:
+        # Uploading a texture to a Visualiser member switches it INTO texture mode
+        # atomically: set the file, turn texture_toggle on, and clear the colour
+        # fields (a Visualiser member is always exactly one complete mode, and
+        # texture mode can only be entered by supplying a file — no chicken/egg).
+        _upsert_values(db, pm.id, {
+            "texture_file": value, "texture_toggle": "1",
+            "color_r": None, "color_g": None, "color_b": None, "opacity": None,
+        }, defs, replace=True)
+    else:
+        _upsert_values(db, pm.id, {property_name: value}, defs)
     pm.updated_at = _now()
     grp.updated_at = _now()
     db.commit()

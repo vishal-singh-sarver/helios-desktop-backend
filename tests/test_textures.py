@@ -5,7 +5,7 @@ from app.services import material_apply
 
 
 def test_serve_default_ground_texture(client):
-    """The bundled default soil (app/assets) is served as an image."""
+    """The bundled default soil (pyhelios plugin dir) is served as an image."""
     r = client.get("/api/textures/serve",
                    params={"path": material_apply._DEFAULT_GROUND_TEXTURE})
     assert r.status_code == 200, r.text
@@ -19,8 +19,8 @@ def test_serve_rejects_non_image(client):
 
 
 def test_serve_rejects_path_outside_allowlist(client):
-    """An image path outside app/assets / uploads / plugin dirs is forbidden
-    (path-traversal safety) — even before checking existence."""
+    """An image path outside backend-api/assets / uploads / plugin dirs is
+    forbidden (path-traversal safety) — even before checking existence."""
     r = client.get("/api/textures/serve", params={"path": "/tmp/evil.png"})
     assert r.status_code == 403
 
@@ -34,8 +34,8 @@ def test_serve_404_for_missing_file_in_allowed_dir(client):
 # ── Default-texture picker: GET /api/textures/defaults ───────────────────────
 
 
-def test_defaults_lists_seeded_dirt(client):
-    """Startup seeds data/assets with the ground default; /defaults lists it
+def test_defaults_lists_committed_dirt(client):
+    """The committed default (backend-api/assets/dirt.jpg) is listed by /defaults
     with a name and a /serve URL."""
     r = client.get("/api/textures/defaults")
     assert r.status_code == 200, r.text
@@ -46,8 +46,8 @@ def test_defaults_lists_seeded_dirt(client):
 
 
 def test_defaults_url_serves_the_image(client):
-    """A /defaults entry's URL is directly servable (proves data/assets is on
-    the serve allowlist)."""
+    """A /defaults entry's URL is directly servable (proves backend-api/assets is
+    on the serve allowlist)."""
     entries = client.get("/api/textures/defaults").json()["textures"]
     entry = next(t for t in entries if t["name"] == "dirt.jpg")   # not [0] — order-independent
     r = client.get(entry["url"])
@@ -79,21 +79,19 @@ def test_list_default_textures_filters_and_empty(tmp_path, monkeypatch):
     assert [t["name"] for t in material_service.list_default_textures()] == ["grass.png"]
 
 
-def test_defaults_seeded_into_data_assets_and_idempotent(client):
-    """The default lands physically in data/assets, and re-seeding is a no-op
-    (skips the already-present file rather than re-copying or raising)."""
+def test_default_texture_committed_in_assets(client):
+    """The default texture ships as a committed file in backend-api/assets —
+    no runtime hydration, no copy on startup."""
     from app.services import material_service
     dirt = material_service.default_textures_dir() / "dirt.jpg"
     assert dirt.is_file()
-    mtime = dirt.stat().st_mtime
-    material_service.seed_default_textures()          # run again
-    assert dirt.stat().st_mtime == mtime              # untouched — existing file kept
 
 
 def test_ground_default_unchanged_still_from_submodule(client):
     """Existing functionality untouched: the ground default still resolves from
-    the pyhelios submodule, NOT the new data/assets picker folder — we only
-    copied a second instance for the picker."""
+    the pyhelios submodule, NOT the picker's backend-api/assets folder — the
+    picker keeps its own committed copy."""
     src = material_apply._DEFAULT_GROUND_TEXTURE
     assert src and "pyhelios" in src                  # still the submodule copy
-    assert str(settings.data_dir) not in src          # not repointed to data/assets
+    from app.services.material_service import default_textures_dir
+    assert str(default_textures_dir()) not in src     # not repointed to the picker dir

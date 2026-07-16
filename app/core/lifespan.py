@@ -91,7 +91,6 @@ async def lifespan(app: FastAPI):
       2. Ensure data directories exist
       3. Database — run migrations
       4. PyHelios — validate library availability
-      5. Seed the default-texture picker folder (best-effort, never fatal)
 
     Steps 2 and 3 are the ones that can fail on a real user's machine (bad
     permissions, a locked/corrupt DB, an incomplete bundle). Each is wrapped
@@ -128,11 +127,6 @@ async def lifespan(app: FastAPI):
     # 4. PyHelios availability check
     from app.helios.context import init_pyhelios
     init_pyhelios()
-
-    # 5. Seed the default-texture picker folder (data/assets). Best-effort —
-    #    the helper swallows its own errors, so it never blocks startup.
-    from app.services.material_service import seed_default_textures
-    seed_default_textures()
 
     yield
 

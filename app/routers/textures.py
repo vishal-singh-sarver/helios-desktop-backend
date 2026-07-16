@@ -5,12 +5,13 @@ absolute path; the renderer fetches the actual image via
 `GET /api/textures/serve?path=<path>` (3DWindow/api/endpoints.ts in the frontend).
 
 We serve the file ONLY when its resolved path falls inside an allowlist of texture
-directories — the default-texture picker set (`data_dir/assets`), user uploads
-(`data_dir/uploads`), and the PyHelios plugin texture libraries — so an arbitrary
-file on disk can never be read through this endpoint (path-traversal safety).
+directories — the committed default-texture picker set (`backend-api/assets`),
+user uploads (`data_dir/uploads`), and the PyHelios plugin texture libraries — so
+an arbitrary file on disk can never be read through this endpoint (path-traversal
+safety).
 
 GET /defaults lists the default textures the user can pick from (the images
-seeded into `data_dir/assets`).
+committed in `backend-api/assets`).
 """
 from pathlib import Path
 from urllib.parse import quote
@@ -19,7 +20,11 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from app.core.config import settings
-from app.services.material_service import get_texture_dirs, list_default_textures
+from app.services.material_service import (
+    default_textures_dir,
+    get_texture_dirs,
+    list_default_textures,
+)
 
 router = APIRouter()
 
@@ -28,12 +33,13 @@ _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 
 
 def _allowed_texture_dirs() -> list[Path]:
-    """Directories a texture may legitimately live in: user-uploaded textures
-    (`data_dir/uploads`) and the PyHelios plugin texture libraries — the latter
-    also covers the default ground soil (plugins/visualizer/textures/dirt.jpg)."""
+    """Directories a texture may legitimately live in: the committed default
+    textures (`backend-api/assets`), user-uploaded textures (`data_dir/uploads`)
+    and the PyHelios plugin texture libraries — the latter also covers the
+    default ground soil (plugins/visualizer/textures/dirt.jpg)."""
     dirs: list[Path] = [
         settings.data_dir / "uploads",                        # user-uploaded textures
-        settings.data_dir / "assets",                         # default textures (the picker set)
+        default_textures_dir(),                               # committed default textures (picker set)
     ]
     try:
         dirs.extend(tex_dir for _, tex_dir in get_texture_dirs())   # plugin libs incl. default soil
@@ -75,9 +81,7 @@ async def serve_texture(path: str) -> FileResponse:
 @router.get("/defaults")
 async def list_defaults() -> dict:
     """List the built-in default textures the user can pick from — the images
-    seeded into `data/assets/`. Each entry has a `name` and a ready `/serve`
-    URL to display the thumbnail. Listing only: serving the bytes is `/serve`,
-    uploading is the material file-upload endpoint."""
+    committed in `backend-api/assets/`."""
     return {"textures": [
         {"name": t["name"],
          "url": f"/api/textures/serve?path={quote(t['path'])}"}

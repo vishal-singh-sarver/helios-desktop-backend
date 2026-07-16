@@ -359,6 +359,38 @@ def test_file_upload_by_group_and_type(client):
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
 
+
+def test_texture_upload_autocreates_visualiser(client):
+    """Uploading a texture to a group with NO Visualiser member creates it on the
+    spot, born directly in texture mode (no colour version -> no grey flash)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    vis = _mt_id(client, "Visualiser")
+    eb = _mt_id(client, "Energy Balance")
+
+    grp = _mk_group(client, h, [], name="Auto Tex")   # empty group, no members
+    url = BASE + f"/groups/{grp['id']}/materials/{vis}/files/texture_file"
+    r = client.post(url, files={"file": ("dirt.png", io.BytesIO(b"png-bytes"), "image/png")},
+                    headers=h)
+    assert r.status_code == 200, r.text
+    m = _member(r.json()["group"], "Visualiser")      # the member now exists
+    assert m["properties"]["texture_toggle"] is True
+    assert m["properties"]["texture_file"] == r.json()["value"]
+    assert m["properties"]["color_r"] is None         # born as texture, never colour
+
+    # A missing NON-Visualiser member is NOT auto-created -> still 404.
+    r = client.post(BASE + f"/groups/{grp['id']}/materials/{eb}/files/texture_file",
+                    files={"file": ("x.png", io.BytesIO(b"z"), "image/png")}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
+
+    # A bogus material type id -> 404 MATERIAL_TYPE_NOT_FOUND.
+    r = client.post(BASE + f"/groups/{grp['id']}/materials/99999/files/texture_file",
+                    files={"file": ("x.png", io.BytesIO(b"z"), "image/png")}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_FOUND"
+
+
 def test_member_crud_one_by_one(client):
     """Granular member management: start EMPTY, add types one at a time, patch
     one standalone, remove one — the group may end (and stay) empty."""

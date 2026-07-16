@@ -601,10 +601,26 @@ async def upload_file_property(db: Session, session_id: str, group_id: int,
                 ProjectMaterial.material_type_id == material_type_id)
         .first()
     )
-    if pm is None:
-        raise api_error(404, "MATERIAL_TYPE_NOT_IN_GROUP",
-                        f"material_type_id {material_type_id} is not in this group")
-    defs = load_type_properties(db, material_type_id=pm.material_type_id)
+    if pm is not None:
+        defs = load_type_properties(db, material_type_id=pm.material_type_id)
+    else:
+        # The member isn't in the group yet. Auto-create it ONLY for a Visualiser
+        # texture upload: the material is born directly in texture mode, so no
+        # colour version is ever created and the ground can't flash grey. Any
+        # other missing member stays a 404 (it must be added explicitly first).
+        mt = db.get(MaterialType, material_type_id)
+        if mt is None:
+            raise api_error(404, "MATERIAL_TYPE_NOT_FOUND",
+                            f"material_type_id {material_type_id} not found")
+        defs = load_type_properties(db, material_type_id=mt.id)
+        if not (property_name == "texture_file" and "texture_toggle" in defs):
+            raise api_error(404, "MATERIAL_TYPE_NOT_IN_GROUP",
+                            f"material_type_id {material_type_id} is not in this group")
+        if scn is not None:
+            _precheck_add_conflicts(db, grp, scn.id, [mt.id])
+        pm = ProjectMaterial(material_group_id=grp.id, material_type_id=mt.id)
+        db.add(pm)
+        db.flush()   # assign pm.id for the upload path + the value rows below
     prop = defs.get(property_name)
     if prop is None or prop.datatype != "file":
         raise api_error(400, "UNKNOWN_PROPERTY",

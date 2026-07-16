@@ -56,7 +56,7 @@ _FILE_PROPERTY_EXTENSIONS = {
     "texture_file": {".png", ".jpg", ".jpeg"},
     "spectral_data": {".xml"},
 }
-_PRECEDENCE_TYPE = "Radiation"   # list preview mirrors the viewport winner
+_PRECEDENCE_TYPE = "Visualiser"   # list preview mirrors the viewport winner
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -364,11 +364,12 @@ def list_groups(db: Session, session_id: str,
     out = []
     for grp in groups:
         pms = members_by_group.get(grp.id, [])
-        # Preview mirrors viewport precedence: the Radiation member owns the
-        # color/texture channel, else the most recently added member.
+        # Preview mirrors viewport precedence (Plan B): the Visualiser member is
+        # the sole owner of the colour/texture/opacity channel; with none there is
+        # no winner and the preview is empty (soil + default colour in the viewport).
         winner = next(
             (pm for pm in pms if type_names.get(pm.material_type_id) == _PRECEDENCE_TYPE),
-            max(pms, key=lambda pm: (pm.created_at or "", pm.id), default=None),
+            None,
         )
         preview_values = _values_native(db, winner.id) if winner else {}
         out.append({

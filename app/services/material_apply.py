@@ -27,8 +27,9 @@ so hydration and in-place regeneration repaint without re-reading the
 was deleted: they keep painting until the scenario is synced (migration 022).
 
 The single-valued color channel is owned by the precedence-winning assignment
-(Radiation wins, else most-recently created). Model-data labels are additive —
-each assigned material contributes its own labels.
+(the Visualiser member; with no Visualiser member there is no winner, so the
+object falls back to the soil texture + the default colour). Model-data labels
+are additive — each assigned material contributes its own labels.
 
 All PyHelios access degrades to a no-op when the native library is unavailable
 (headless / CI) or when the object was not built in THIS session.
@@ -56,10 +57,11 @@ from app.services.eav_validation import (
     load_type_properties,
 )
 
-# Viewport precedence among a geometry's assigned materials (spec §12.2 / open
-# question #6): the Radiation-type material owns the single-valued color/texture
-# channel; otherwise the most recently assigned one does.
-_PRECEDENCE_TYPE = "Radiation"
+# Viewport precedence among a geometry's assigned materials (Plan B): the
+# Visualiser-type material is the SOLE owner of the single-valued colour/texture/
+# opacity channel; with no Visualiser member there is no winner, and the object
+# falls back to the default soil texture + default colour.
+_PRECEDENCE_TYPE = "Visualiser"
 
 def _resolve_default_ground_texture() -> str:
     """Absolute path to the bundled PyHelios soil texture
@@ -157,7 +159,7 @@ def _winning_assignment(db: Session, assignments: list[ObjectMaterial]) -> Objec
     for a in assignments:
         if type_names.get(a.material_type_id) == _PRECEDENCE_TYPE:
             return a
-    return max(assignments, key=lambda a: a.created_at or "")
+    return None   # Plan B: no Visualiser member -> no winner (soil + default colour)
 
 
 # ── Per-primitive writers ────────────────────────────────────────────────────
@@ -171,27 +173,32 @@ def _color_label(so) -> str:
 
 
 def _set_color_label(ctx, uuids: list[int], label: str,
-                     rgb: tuple[float, float, float], tex: str) -> None:
+                     rgba: tuple[float, float, float, float], tex: str) -> None:
     """Point the object's primitives at the per-object Helios material, carrying
-    its colour (`rgb`, 0..1) AND its texture (`tex`: a file path to show that
-    image, or "" to show the solid colour). Created on first use, updated after.
-    The texture image lives on this material; the UVs were baked at build time."""
+    its colour (`rgba`, 0..1 incl. the alpha/opacity channel) AND its texture
+    (`tex`: a file path to show that image, or "" to show the solid colour).
+    Created on first use, updated after. The texture image lives on this
+    material; the UVs were baked at build time."""
     from pyhelios.types import RGBAcolor
     if not ctx.doesMaterialExist(label):
         ctx.addMaterial(label)
-    ctx.setMaterialColor(label, RGBAcolor(rgb[0], rgb[1], rgb[2], 1.0))
+    ctx.setMaterialColor(label, RGBAcolor(rgba[0], rgba[1], rgba[2], rgba[3]))
     ctx.setMaterialTexture(label, tex)
     ctx.assignMaterialToPrimitive(uuids, label)
 
 
-def _winner_color(db: Session, so_id: int, winner) -> tuple[float, float, float]:
-    """Color (0..1) of the precedence-winning assignment, else the default."""
+def _winner_color(db: Session, so_id: int, winner) -> tuple[float, float, float, float]:
+    """RGBA (0..1) of the precedence-winning assignment, else the default. The
+    alpha channel comes from the winner's `opacity` (a 0..100 percent); an absent
+    opacity is treated as fully opaque (1.0), matching the pre-Plan-B default."""
     if winner is not None:
         values = _assignment_snapshot_native(db, so_id, winner.project_material_id)
         r, g, b = values.get("color_r"), values.get("color_g"), values.get("color_b")
-        if r is not None or g is not None or b is not None:
-            return ((r or 0) / 255.0, (g or 0) / 255.0, (b or 0) / 255.0)
-    return reg.DEFAULT_MATERIAL_COLOR[:3]
+        o = values.get("opacity")
+        if r is not None or g is not None or b is not None or o is not None:
+            alpha = 1.0 if o is None else max(0.0, min(1.0, o / 100.0))
+            return ((r or 0) / 255.0, (g or 0) / 255.0, (b or 0) / 255.0, alpha)
+    return reg.DEFAULT_MATERIAL_COLOR
 
 
 def _winner_texture(db: Session, so_id: int, winner) -> str:

@@ -629,7 +629,7 @@ def test_group_assignment_sync_freeze_lifecycle(client):
         "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
     }, headers=h).json()["object"]
     grass = _mk_group(client, h, [
-        ("Radiation", {"color_r": 90, "color_g": 200, "color_b": 90, "reflectivity": 0.2}),
+        ("Radiation", {"reflectivity": 0.2}),
     ], name="Grass Set")
     soil = _mk_group(client, h, [
         ("Energy Balance", {"wind_speed": 3.5, "air_temperature": 298}),
@@ -800,7 +800,8 @@ def test_group_assignment_in_create_call(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     grass = _mk_group(client, h, [
-        ("Radiation", {"color_r": 90, "color_g": 200, "color_b": 90}),
+        ("Radiation", None),
+        ("Visualiser", {"color_r": 90, "color_g": 200, "color_b": 90}),
     ], name="Grass Set")
     r = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
@@ -810,7 +811,7 @@ def test_group_assignment_in_create_call(client):
     assert r.status_code == 201, r.text
     groups = r.json()["object"]["material_groups"]
     assert len(groups) == 1 and groups[0]["group_id"] == grass["id"]
-    assert _grp_member(groups[0], "Radiation")["properties"]["color_r"] == 90
+    assert _grp_member(groups[0], "Visualiser")["properties"]["color_r"] == 90
 
     # Duplicate TYPE across the requested groups → 409, nothing created.
     rad_two = _mk_group(client, h, [("Radiation", None)], name="Rad Two")
@@ -962,7 +963,7 @@ def test_color_survives_reload_via_material_label(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     grp = _mk_group(client, h, [
-        ("Radiation", {"color_r": 200, "color_g": 50, "color_b": 50}),
+        ("Visualiser", {"color_r": 200, "color_g": 50, "color_b": 50}),
     ], name="Reload Color")
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
@@ -989,7 +990,7 @@ def test_group_delete_does_not_repaint_live_geometry(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     grp = _mk_group(client, h, [
-        ("Radiation", {"color_r": 10, "color_g": 250, "color_b": 10}),
+        ("Visualiser", {"color_r": 10, "color_g": 250, "color_b": 10}),
     ], name="ToDelete")
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client), "properties": GROUND_PROPS,

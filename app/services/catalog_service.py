@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 from app.db.models import Datatype, MaterialType, ModelType, ObjectType
 from app.services.eav_validation import (
     REQUIRED_OBJECT_PROPERTIES,
-    VISUALISATION_PROPERTIES,
     load_type_properties,
 )
 
@@ -61,7 +60,6 @@ def _material_type_payload(db: Session, mt: MaterialType) -> dict:
                 "min": p.min,
                 "max": p.max,
                 **({"enum_values": p.enum_values} if p.enum_values else {}),
-                "group": "visualisation" if p.property in VISUALISATION_PROPERTIES else "model",
                 "display_order": p.display_order,
             }
             for p in props.values()

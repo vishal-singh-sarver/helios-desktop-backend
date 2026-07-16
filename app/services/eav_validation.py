@@ -56,9 +56,11 @@ REQUIRED_OBJECT_PROPERTIES = {
                "texture_x", "texture_y"},
 }
 
-# Visualisation properties — shared by every material type, rendered on
-# the Visualisation tab (everything else is `group: "model"`).
-VISUALISATION_PROPERTIES = {"color_r", "color_g", "color_b", "texture_file"}
+# Visualisation properties — owned SOLELY by the "Visualiser" material type
+# (migration 024), rendered on the Visualisation surface; everything else is a
+# model parameter. `opacity` is the RGBA alpha channel expressed as a 0..100
+# percent (material_apply divides by 100 for the 0..1 alpha).
+VISUALISATION_PROPERTIES = {"color_r", "color_g", "color_b", "texture_file", "opacity"}
 
 _MAX_DECIMALS = 7
 

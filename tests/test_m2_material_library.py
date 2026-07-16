@@ -5,8 +5,9 @@ from uuid import uuid4
 
 BASE = "/api/materials/library"
 
-# Every fresh DB carries the 6 wrapped mig-019 defaults as global groups.
-DEFAULT_GROUP_COUNT = 6
+# Every fresh DB carries 7 default groups: the 6 wrapped mig-019 defaults plus
+# the mig-024 "Default Visualiser" group.
+DEFAULT_GROUP_COUNT = 7
 
 
 def _setup(client):
@@ -51,7 +52,6 @@ def test_create_group_with_values_and_auto_name(client):
         "scenario_id": sid,
         "materials": [
             {"material_type_id": rad, "properties": {
-                "color_r": 90, "color_g": 200, "color_b": 90,
                 "surface_temperature": 300, "reflectivity": 0.2,
                 "two_sided_heat_transfer": False,
             }},
@@ -159,29 +159,29 @@ def test_group_names_globally_unique_case_insensitive(client):
 def test_list_groups_preview_filter_search(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    rad = _mt_id(client, "Radiation")
+    vis = _mt_id(client, "Visualiser")
     eb = _mt_id(client, "Energy Balance")
 
     _mk_group(client, h, [
-        {"material_type_id": rad, "properties": {"color_r": 90, "color_g": 200, "color_b": 90}},
+        {"material_type_id": vis, "properties": {"color_r": 90, "color_g": 200, "color_b": 90}},
         {"material_type_id": eb, "properties": {"wind_speed": 3.5}},
     ], name="Grass Set")
     _mk_group(client, h, [{"material_type_id": eb}], name="Soil EB")
 
     r = client.get(BASE + "/groups", headers=h)
     rows = r.json()["groups"]
-    # Newest first; the 6 wrapped defaults trail the created groups.
+    # Newest first; the default groups trail the created groups.
     assert [g["name"] for g in rows[:2]] == ["Soil EB", "Grass Set"]
     assert len(rows) == 2 + DEFAULT_GROUP_COUNT
     grass = rows[1]
-    assert set(grass["material_type_ids"]) == {rad, eb}
-    assert set(grass["material_types"]) == {"Radiation", "Energy Balance"}
-    # Preview mirrors viewport precedence: the Radiation member wins.
+    assert set(grass["material_type_ids"]) == {vis, eb}
+    assert set(grass["material_types"]) == {"Visualiser", "Energy Balance"}
+    # Preview mirrors viewport precedence: the Visualiser member wins.
     assert grass["preview"]["color_r"] == 90
-    assert set(grass["preview"].keys()) == {"color_r", "color_g", "color_b", "texture_file"}
+    assert set(grass["preview"].keys()) == {"color_r", "color_g", "color_b", "opacity", "texture_file"}
 
     # Filter: groups containing the type
-    r = client.get(BASE + f"/groups?material_type_id={rad}", headers=h)
+    r = client.get(BASE + f"/groups?material_type_id={vis}", headers=h)
     names = [g["name"] for g in r.json()["groups"]]
     assert "Grass Set" in names and "Soil EB" not in names
 
@@ -200,7 +200,7 @@ def test_put_group_diff_semantics(client):
     sp = _mt_id(client, "Solar Position")
 
     grp = _mk_group(client, h, [
-        {"material_type_id": rad, "properties": {"reflectivity": 0.2, "color_r": 90}},
+        {"material_type_id": rad, "properties": {"reflectivity": 0.2, "transmissivity": 0.5}},
         {"material_type_id": eb, "properties": {"wind_speed": 3.5}},
     ], name="Grass Set")
     rad_member_id = _member(grp, "Radiation")["material_id"]
@@ -218,9 +218,9 @@ def test_put_group_diff_semantics(client):
     assert m["properties"]["reflectivity"] == 0.2      # absent keys untouched
 
     # Update + remove + add in one PUT: keep Radiation (new value, explicit null
-    # clears color_r), drop Energy Balance, add Solar Position.
+    # clears transmissivity), drop Energy Balance, add Solar Position.
     r = client.put(url, json={"materials": [
-        {"material_type_id": rad, "properties": {"reflectivity": 0.4, "color_r": None}},
+        {"material_type_id": rad, "properties": {"reflectivity": 0.4, "transmissivity": None}},
         {"material_type_id": sp, "properties": {"atmospheric_pressure": 101325}},
     ]}, headers=h)
     assert r.status_code == 200, r.text
@@ -229,7 +229,7 @@ def test_put_group_diff_semantics(client):
     m = _member(g, "Radiation")
     assert m["material_id"] == rad_member_id
     assert m["properties"]["reflectivity"] == 0.4
-    assert m["properties"]["color_r"] is None          # explicit null cleared it
+    assert m["properties"]["transmissivity"] is None    # explicit null cleared it
 
     # Idempotent: the same PUT again changes nothing.
     r = client.put(url, json={"materials": [
@@ -314,12 +314,12 @@ def test_group_survives_project_deletion(client):
 def test_file_upload_by_group_and_type(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    rad = _mt_id(client, "Radiation")
+    vis = _mt_id(client, "Visualiser")
     eb = _mt_id(client, "Energy Balance")
-    grp = _mk_group(client, h, [{"material_type_id": rad}], name="Textured")
+    grp = _mk_group(client, h, [{"material_type_id": vis}], name="Textured")
     member_id = grp["materials"][0]["material_id"]
 
-    url = BASE + f"/groups/{grp['id']}/materials/{rad}/files/texture_file"
+    url = BASE + f"/groups/{grp['id']}/materials/{vis}/files/texture_file"
     r = client.post(url, files={"file": ("grass.png", io.BytesIO(b"png-bytes"), "image/png")},
                     headers=h)
     assert r.status_code == 200, r.text
@@ -327,7 +327,7 @@ def test_file_upload_by_group_and_type(client):
     assert body["success"] is True and body["property"] == "texture_file"
     # Project-free storage path (groups are global).
     assert body["value"] == f"uploads/materials/{member_id}/grass.png"
-    assert _member(body["group"], "Radiation")["properties"]["texture_file"] == body["value"]
+    assert _member(body["group"], "Visualiser")["properties"]["texture_file"] == body["value"]
 
     # A type that is not in the group → 404 MATERIAL_TYPE_NOT_IN_GROUP.
     r = client.post(BASE + f"/groups/{grp['id']}/materials/{eb}/files/texture_file",
@@ -335,8 +335,9 @@ def test_file_upload_by_group_and_type(client):
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
 
-    # Not a file property / unsupported texture extension.
-    r = client.post(BASE + f"/groups/{grp['id']}/materials/{rad}/files/reflectivity",
+    # Not a file property / unsupported texture extension. color_r IS on the
+    # Visualiser member but is not a file property -> UNKNOWN_PROPERTY.
+    r = client.post(BASE + f"/groups/{grp['id']}/materials/{vis}/files/color_r",
                     files={"file": ("x.png", io.BytesIO(b"z"), "image/png")}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "UNKNOWN_PROPERTY"
@@ -358,7 +359,7 @@ def test_member_crud_one_by_one(client):
 
     # Add two members one-by-one.
     r = client.post(url + "/materials", json={
-        "material_type_id": rad, "properties": {"reflectivity": 0.2, "color_r": 90}},
+        "material_type_id": rad, "properties": {"reflectivity": 0.2, "transmissivity": 0.5}},
         headers=h)
     assert r.status_code == 201, r.text
     assert r.json()["success"] is True
@@ -389,11 +390,11 @@ def test_member_crud_one_by_one(client):
 
     # PATCH one member standalone: merge-upsert + explicit-null clear.
     r = client.patch(url + f"/materials/{rad}", json={
-        "properties": {"reflectivity": 0.5, "color_r": None}}, headers=h)
+        "properties": {"reflectivity": 0.5, "transmissivity": None}}, headers=h)
     assert r.status_code == 200, r.text
     m = _member(r.json()["group"], "Radiation")
     assert m["properties"]["reflectivity"] == 0.5
-    assert m["properties"]["color_r"] is None            # explicit null cleared
+    assert m["properties"]["transmissivity"] is None     # explicit null cleared
     # eav validation + non-member type on PATCH.
     r = client.patch(url + f"/materials/{rad}",
                      json={"properties": {"reflectivity": 2}}, headers=h)
@@ -484,3 +485,71 @@ def test_member_crud_eager_scenario(client):
                     json={"material_type_id": eb}, headers=h)
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "SCENARIO_NOT_FOUND"
+
+
+def test_visualiser_owns_viz_props(client):
+    """Plan B: colour/opacity/texture are valid ONLY on a Visualiser member; the
+    same props on any model type are rejected. opacity is a 0..100 percent."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    vis = _mt_id(client, "Visualiser")
+
+    grp = _mk_group(client, h, [], name="Viz Rules")
+    add = BASE + f"/groups/{grp['id']}/materials"
+
+    # color_r on a Radiation member -> 400 MATERIAL_TYPE_MISMATCH (viz is
+    # Visualiser-only now).
+    r = client.post(add, json={"material_type_id": rad,
+                               "properties": {"color_r": 90}}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_MISMATCH"
+
+    # The same viz props + opacity ARE accepted on a Visualiser member.
+    r = client.post(add, json={"material_type_id": vis, "properties": {
+        "color_r": 90, "color_g": 200, "color_b": 90, "opacity": 40,
+    }}, headers=h)
+    assert r.status_code == 201, r.text
+    m = _member(r.json()["group"], "Visualiser")
+    assert m["properties"]["color_r"] == 90 and m["properties"]["opacity"] == 40
+
+    # opacity is a 0..100 percent: out of range is rejected.
+    r = client.patch(add + f"/{vis}", json={"properties": {"opacity": 150}}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "VALUE_OUT_OF_RANGE"
+
+    # Explicit null clears a viz prop on the Visualiser member.
+    r = client.patch(add + f"/{vis}", json={"properties": {"color_r": None}}, headers=h)
+    assert r.status_code == 200, r.text
+    assert _member(r.json()["group"], "Visualiser")["properties"]["color_r"] is None
+
+
+def test_preview_winner_visualiser_and_none_fallback(client):
+    """List-preview swatch mirrors the viewport precedence flip: the Visualiser
+    member owns the colour; a group with no Visualiser member previews empty
+    (winner None -> soil/default, not an arbitrary member)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    vis = _mt_id(client, "Visualiser")
+    eb = _mt_id(client, "Energy Balance")
+
+    _mk_group(client, h, [
+        {"material_type_id": vis, "properties": {"color_r": 10, "color_g": 20, "color_b": 30}},
+        {"material_type_id": eb, "properties": {"wind_speed": 2.0}},
+    ], name="Has Viz")
+    _mk_group(client, h, [{"material_type_id": eb, "properties": {"wind_speed": 2.0}}],
+              name="No Viz")
+
+    rows = {g["name"]: g for g in client.get(BASE + "/groups", headers=h).json()["groups"]}
+
+    # Visualiser member wins the preview colour.
+    assert rows["Has Viz"]["preview"]["color_r"] == 10
+    # No Visualiser member -> empty preview (all viz keys null).
+    assert all(v is None for v in rows["No Viz"]["preview"].values())
+
+    # Seeded defaults: Default Visualiser carries grey 128 + opacity 100; the
+    # model defaults preview empty — their orphaned mig-019 colour is NOT
+    # surfaced because colour is owned solely by Visualiser.
+    assert rows["Default Visualiser"]["preview"]["color_r"] == 128
+    assert rows["Default Visualiser"]["preview"]["opacity"] == 100
+    assert all(v is None for v in rows["Default Radiation"]["preview"].values())

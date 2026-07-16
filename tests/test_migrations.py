@@ -212,10 +212,11 @@ def test_022_wraps_materials_into_groups(temp_engine):
             "SELECT project_id, scenario_id, name FROM material_group WHERE id=100"
         )).fetchone()
         assert grp == ("p1", "sc1", "KeepMe")
-        # The six mig-019 defaults are wrapped too (NULL-project global groups).
+        # The six mig-019 defaults are wrapped, plus mig-024 seeds a 7th global
+        # "Default Visualiser" group (all NULL-project).
         assert c.execute(text(
             "SELECT count(*) FROM material_group WHERE project_id IS NULL"
-        )).scalar() == 6
+        )).scalar() == 7
         # Member reshaped, values preserved.
         assert c.execute(text(
             "SELECT material_group_id FROM project_material WHERE id=100")).scalar() == 100
@@ -351,3 +352,68 @@ def test_023_seeds_radiation_bands(temp_engine):
     assert dtypes["use_radiation_bands"] == "boolean"
     assert all(ranges[p] == (0.0, 1.0) for p in band_floats)
     assert all_new <= radiation, all_new - radiation
+
+
+def test_024_visualiser_material_type(temp_engine):
+    """024 adds the 7th material type 'Visualiser' as the SOLE owner of the
+    visualisation props (color_r/g/b, opacity, texture_file), removes them from
+    the other 6 types, adds NO model_type row, and seeds a global Default
+    Visualiser group (grey-128 colour + opacity 100)."""
+    database.run_migrations()
+    assert 24 in _versions(temp_engine)
+
+    VIZ = {"color_r", "color_g", "color_b", "opacity", "texture_file"}
+    with temp_engine.begin() as c:
+        # The Visualiser type exists and owns EXACTLY the 5 visualisation props.
+        assert c.execute(text(
+            "SELECT count(*) FROM material_type WHERE materialtype = 'Visualiser'"
+        )).scalar() == 1
+        vis_props = {r[0] for r in c.execute(text(
+            "SELECT pt.property FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE mt.materialtype = 'Visualiser'"
+        ))}
+        assert vis_props == VIZ, vis_props ^ VIZ
+
+        # The four original viz props are mapped to ZERO of the other 6 types.
+        assert c.execute(text(
+            "SELECT count(*) FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE mt.materialtype <> 'Visualiser' "
+            "AND pt.property IN ('color_r','color_g','color_b','texture_file')"
+        )).scalar() == 0
+
+        # opacity is an integer percent 0..100.
+        assert c.execute(text(
+            "SELECT min, max FROM property_type WHERE property = 'opacity'"
+        )).fetchone() == (0, 100)
+
+        # Visualiser is a rendering type: NO model_type row (mig 018 untouched).
+        assert c.execute(text(
+            "SELECT count(*) FROM model_type WHERE model = 'Visualiser'"
+        )).scalar() == 0
+
+        # A global Default Visualiser group with one Visualiser member carrying
+        # grey-128 colour + opacity 100.
+        members = c.execute(text(
+            "SELECT pm.id FROM project_material pm "
+            "JOIN material_group mg ON mg.id = pm.material_group_id "
+            "JOIN material_type mt ON mt.id = pm.material_type_id "
+            "WHERE mg.name = 'Default Visualiser' AND mg.project_id IS NULL "
+            "AND mt.materialtype = 'Visualiser'"
+        )).fetchall()
+        assert len(members) == 1
+        vals = dict(c.execute(text(
+            "SELECT pt.property, md.value FROM material_data md "
+            "JOIN property_type pt ON pt.id = md.property_type_id "
+            "WHERE md.project_material_id = :m"
+        ), {"m": members[0][0]}).fetchall())
+        assert vals == {"color_r": "128", "color_g": "128",
+                        "color_b": "128", "opacity": "100"}
+
+        # NULL-project group count is now 7 (6 wrapped mig-019 defaults + this).
+        assert c.execute(text(
+            "SELECT count(*) FROM material_group WHERE project_id IS NULL"
+        )).scalar() == 7

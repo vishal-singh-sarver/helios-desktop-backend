@@ -37,3 +37,10 @@ class MaterialGroupPutRequest(BaseModel):
     keys written, explicit null clears, absent keys untouched)."""
     name: Optional[str] = None          # omitted → keep current name
     materials: list[GroupMaterialIn] = Field(default_factory=list)
+
+
+class MaterialGroupRenameRequest(BaseModel):
+    """Rename only — members untouched. (PUT can rename too, but it is a
+    full-replacement member set, so renaming through it means resending every
+    member or losing them.)"""
+    name: str

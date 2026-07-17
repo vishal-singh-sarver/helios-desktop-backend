@@ -964,6 +964,13 @@ def update_object(db: Session, session_id: str, project_id: str,
 
     if intrinsic_change is not None:
         _apply_intrinsic_change(db, sctx, so, *intrinsic_change)
+
+    # Assign the material groups listed in the body (one or many). Reuses the
+    # POST endpoint's path, so the same 404 / already-assigned / duplicate-type
+    # rules apply to each.
+    for entry in body.materials:
+        assign_material_group(db, session_id, project_id, scenario_id, object_id, entry)
+
     return {"success": True, "object": serialize_object(db, sctx, so)}
 
 

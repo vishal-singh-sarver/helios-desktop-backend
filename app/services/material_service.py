@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from app.helios.context import get_context
 from app.helios import registry as reg
 
@@ -181,3 +182,33 @@ def get_texture_library() -> dict:
         if files:
             categories[name] = sorted(files)
     return {"categories": categories}
+
+
+# ── Default-texture picker (backend-api/assets) ──────────────────────────────
+# App-owned folder of default textures the user can choose from. 
+# Kept separate from the ground default's own resolution (material_apply) and
+# from user uploads (data/uploads) — this is purely the pickable default set.
+
+
+def default_textures_dir() -> Path:
+    """The committed folder of default textures shipped with the app
+    (backend-api/assets). Version-controlled and pushed with the repo, so the
+    picker never depends on runtime hydration. Drop a .png/.jpg/.jpeg here and
+    commit it to add a new default."""
+    return Path(__file__).resolve().parents[2] / "assets"
+
+
+def list_default_textures() -> list[dict]:
+    """The default textures available in backend-api/assets/ — image files only,
+    with the same watermark/logo exclusions as the plugin library. Each entry is
+    {name, path (absolute)}."""
+    d = default_textures_dir()
+    if not d.is_dir():
+        return []
+    return [
+        {"name": f.name, "path": str(f.resolve())}
+        for f in sorted(d.iterdir())
+        if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg")
+        and f.name not in _TEXTURE_EXCLUDE
+        and not any(f.name.startswith(p) for p in _TEXTURE_EXCLUDE_PREFIXES)
+    ]

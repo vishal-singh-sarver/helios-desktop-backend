@@ -629,7 +629,7 @@ def test_group_assignment_sync_freeze_lifecycle(client):
         "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
     }, headers=h).json()["object"]
     grass = _mk_group(client, h, [
-        ("Radiation", {"color_r": 90, "color_g": 200, "color_b": 90, "reflectivity": 0.2}),
+        ("Radiation", {"reflectivity": 0.2}),
     ], name="Grass Set")
     soil = _mk_group(client, h, [
         ("Energy Balance", {"wind_speed": 3.5, "air_temperature": 298}),
@@ -800,7 +800,9 @@ def test_group_assignment_in_create_call(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     grass = _mk_group(client, h, [
-        ("Radiation", {"color_r": 90, "color_g": 200, "color_b": 90}),
+        ("Radiation", None),
+        ("Visualiser", {"texture_toggle": False, "color_r": 90, "color_g": 200,
+                        "color_b": 90, "opacity": 100}),
     ], name="Grass Set")
     r = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
@@ -810,7 +812,7 @@ def test_group_assignment_in_create_call(client):
     assert r.status_code == 201, r.text
     groups = r.json()["object"]["material_groups"]
     assert len(groups) == 1 and groups[0]["group_id"] == grass["id"]
-    assert _grp_member(groups[0], "Radiation")["properties"]["color_r"] == 90
+    assert _grp_member(groups[0], "Visualiser")["properties"]["color_r"] == 90
 
     # Duplicate TYPE across the requested groups → 409, nothing created.
     rad_two = _mk_group(client, h, [("Radiation", None)], name="Rad Two")
@@ -962,7 +964,8 @@ def test_color_survives_reload_via_material_label(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     grp = _mk_group(client, h, [
-        ("Radiation", {"color_r": 200, "color_g": 50, "color_b": 50}),
+        ("Visualiser", {"texture_toggle": False, "color_r": 200, "color_g": 50,
+                        "color_b": 50, "opacity": 100}),
     ], name="Reload Color")
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
@@ -989,7 +992,8 @@ def test_group_delete_does_not_repaint_live_geometry(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     grp = _mk_group(client, h, [
-        ("Radiation", {"color_r": 10, "color_g": 250, "color_b": 10}),
+        ("Visualiser", {"texture_toggle": False, "color_r": 10, "color_g": 250,
+                        "color_b": 10, "opacity": 100}),
     ], name="ToDelete")
     obj = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
@@ -1028,3 +1032,35 @@ def test_assign_empty_group(client):
 
     r = client.delete(obj_url + f"/material-groups/{grp['id']}", headers=h)
     assert r.status_code == 200
+
+
+def test_colour_mode_escapes_resolution_cap(client):
+    """Edge #3: a colour-mode Visualiser ground builds an UNTEXTURED tile, so it
+    has no texture-pixel cap — a resolution that a textured/soil ground rejects
+    with RESOLUTION_TOO_HIGH is accepted here."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    url = _base(pid, sid) + "/objects"
+    low = {**GROUND_PROPS, "resolution_x": 2, "resolution_y": 2,
+           "texture_x": 1, "texture_y": 1}
+    high = {"properties": {"resolution_x": 1000, "resolution_y": 1000}}
+
+    # Unstyled ground = soil texture (dirt.jpg, 512px) -> resolution is capped.
+    soil = client.post(url, json={"object_type_id": _ot_id(client),
+                                  "properties": low}, headers=h).json()["object"]
+    r = client.patch(f"{url}/{soil['id']}", json=high, headers=h)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "RESOLUTION_TOO_HIGH"
+
+    # Colour-mode Visualiser ground = untextured -> the same resolution is fine.
+    grp = _mk_group(client, h, [("Visualiser", {
+        "texture_toggle": False, "color_r": 100, "color_g": 100,
+        "color_b": 100, "opacity": 100})], name="Plain Colour")
+    colour = client.post(url, json={
+        "object_type_id": _ot_id(client), "properties": low,
+        "materials": [{"group_id": grp["id"], "sync": True}]}, headers=h).json()["object"]
+    r = client.patch(f"{url}/{colour['id']}", json=high, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["object"]["properties"]["resolution_x"] == 1000

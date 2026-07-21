@@ -37,19 +37,27 @@ def test_object_types_ground_properties(client):
     assert by_name["Crop"]["properties"] == []
 
 
-def test_material_types_six_groups_with_vis_props(client):
+def test_material_types_seven_types_viz_on_visualiser_only(client):
     r = client.get("/api/catalog/material-types")
     assert r.status_code == 200
     by_name = {mt["materialtype"]: mt for mt in r.json()["material_types"]}
     assert set(by_name) == {
-        "Radiation", "Energy Balance", "Solar Position",
-        "Photosynthesis", "Boundary Layer Conductance", "Stomatal Conductance",
+        "Radiation", "Energy Balance", "Solar Position", "Photosynthesis",
+        "Boundary Layer Conductance", "Stomatal Conductance", "Visualiser",
     }
 
-    # Visualisation props on every type
-    for mt in by_name.values():
-        vis = {p["property"] for p in mt["properties"] if p["group"] == "visualisation"}
-        assert vis == {"color_r", "color_g", "color_b", "texture_file"}, mt["materialtype"]
+    # Plan B: the visualisation props (colour + opacity + texture) are owned
+    # SOLELY by the new "Visualiser" type; the six model types no longer carry
+    # them. Properties are also NO LONGER tagged with a model/visualisation
+    # `group` — the response is a flat property list.
+    VIZ = {"color_r", "color_g", "color_b", "opacity", "texture_file", "texture_toggle"}
+    for name, mt in by_name.items():
+        names = {p["property"] for p in mt["properties"]}
+        if name == "Visualiser":
+            assert names == VIZ, mt["materialtype"]
+        else:
+            assert not (VIZ & names), mt["materialtype"]
+        assert all("group" not in p for p in mt["properties"]), mt["materialtype"]
 
     rad = {p["property"]: p for p in by_name["Radiation"]["properties"]}
     assert rad["surface_temperature"]["min"] == 223

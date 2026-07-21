@@ -219,10 +219,15 @@ def _upsert_intrinsic(db: Session, so_id: int, canonical: dict[str, str | None],
 # ── Viewport build (spec §12.1) ──────────────────────────────────────────────
 
 
-def _winner_texture_path(db: Session, so: ScenarioObject) -> str | None:
-    """Resolved texture file of the precedence-winning assignment, or None.
-    Texture is baked into the TileObject at build time (PyHelios has no in-place
-    texture/repeat setter), so this drives the rebuild-vs-reapply decision."""
+def _winner_surface(db: Session, so: ScenarioObject) -> tuple[str, str | None]:
+    """Decide the object's BUILD surface from the precedence-winning assignment:
+        ('soil', None)    -> no Visualiser member: an unstyled ground reads as soil
+        ('texture', path) -> texture mode: bake this texture (UVs)
+        ('colour', None)  -> colour mode: an UNTEXTURED tile (solid colour painted
+                             via the per-object material label). No texture means
+                             no texture-pixel cap, so resolution is unbounded.
+    Baked at build time (PyHelios has no in-place texture setter), so this drives
+    the rebuild-vs-reapply decision (compared via _surface_signature)."""
     assignments = (
         db.query(ObjectMaterial)
         .filter(ObjectMaterial.scenario_object_id == so.id)
@@ -230,9 +235,20 @@ def _winner_texture_path(db: Session, so: ScenarioObject) -> str | None:
     )
     winner = material_apply._winning_assignment(db, assignments)
     if winner is None:
-        return None
+        return ("soil", None)
     values = material_apply._assignment_snapshot_native(db, so.id, winner.project_material_id)
-    return material_apply.resolve_texture_path(values.get("texture_file"))
+    if material_apply._is_texture_mode(values):
+        path = material_apply.resolve_texture_path(values.get("texture_file"))
+        return ("texture", path) if path else ("soil", None)   # defensive: missing file -> soil
+    return ("colour", material_apply._winner_color(db, so.id, winner))
+
+
+def _surface_signature(surface: tuple[str, str | None]) -> str:
+    """Stable string identifying what a build baked, for the rebuild check:
+    'soil', 'colour', or 'texture:<path>'. A change here means a geometry rebuild
+    (colour<->texture<->soil each bake a different tile)."""
+    kind, path = surface
+    return f"texture:{path}" if kind == "texture" else kind
 
 
 @_with_scenario_lock
@@ -279,11 +295,12 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
         return []
 
     props = _intrinsic_native(db, so.id)
-    texture_path = _winner_texture_path(db, so)
+    surface = _winner_surface(db, so)
+    surface_kind, texture_path = surface
 
     try:
         ctx = helios_ctx.get_context(sctx)
-        from pyhelios.types import RGBcolor, SphericalCoord, int2, vec2, vec3
+        from pyhelios.types import SphericalCoord, int2, vec2, vec3
 
         center = vec3(props.get("position_x") or 0,
                       props.get("position_y") or 0,
@@ -294,12 +311,19 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
         rotation = SphericalCoord(1, 0, math.radians(float(props.get("rotation_z") or 0)))
         repeat = int2(int(props.get("texture_x") or 1), int(props.get("texture_y") or 1))
 
-        if texture_path:
+        if surface_kind == "texture":
             ctx_object_id = ctx.addTileObject(
                 center=center, size=size, rotation=rotation, subdiv=subdiv,
                 texturefile=texture_path, texture_repeat=repeat,
             )
-        else:
+        elif surface_kind == "colour":
+            # Colour mode: an UNTEXTURED tile (addTileObject_basic). No texture =>
+            # no texture-pixel cap, so resolution is unbounded; the solid colour
+            # is painted afterward via the per-object material label.
+            ctx_object_id = ctx.addTileObject(
+                center=center, size=size, rotation=rotation, subdiv=subdiv,
+            )
+        else:   # soil — an unstyled ground
             ctx_object_id = ctx.addTileObject(
                 center=center, size=size, rotation=rotation, subdiv=subdiv,
                 texturefile=material_apply._DEFAULT_GROUND_TEXTURE, texture_repeat=repeat,
@@ -321,8 +345,8 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
         sctx, so.name, "ground", uuids,
         scenario_object_id=so.id,
         ctx_object_id=ctx_object_id,
-        # The texture baked into THIS build — the rebuild-vs-reapply check.
-        built_texture=texture_path,
+        # The surface baked into THIS build — the rebuild-vs-reapply check.
+        built_texture=_surface_signature(surface),
     )
     sctx.persisted_objects[so.id] = obj_id
     sctx.ctx_objects[so.id] = ctx_object_id
@@ -361,10 +385,10 @@ def _apply_assignment_change(db: Session, sctx, so: ScenarioObject,
         return
     if so.id not in sctx.persisted_objects:
         return    # hydration will paint it correctly later
-    desired = _winner_texture_path(db, so)
+    desired = _surface_signature(_winner_surface(db, so))
     obj_id = sctx.persisted_objects.get(so.id)
     built = sctx.registry.get(obj_id, {}).get("built_texture") if obj_id is not None else None
-    if (desired or None) != (built or None):
+    if desired != built:
         _rebuild(db, sctx, so)    # fresh primitives; _build re-applies everything
         return
     for type_id in cleared_type_ids or []:
@@ -513,7 +537,7 @@ def ensure_hydrated(db: Session, sctx, scenario_id: str) -> None:
         reg_id = reg.register_object(
             sctx, so.name, "ground", uuids,
             scenario_object_id=so.id, ctx_object_id=obj_id,
-            built_texture=_winner_texture_path(db, so),
+            built_texture=_surface_signature(_winner_surface(db, so)),
         )
         sctx.persisted_objects[so.id] = reg_id
         sctx.ctx_objects[so.id] = obj_id

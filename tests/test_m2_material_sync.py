@@ -338,13 +338,17 @@ def _valid_png(size=256):
 def test_upload_file_eager_refreshes_active_scenario(client):
     import io
     h, pid, sid_a, sid_b, obj_a, obj_b = _setup(client)
-    rad = _mt_id(client, "Radiation")
-    grp = _mk_group(client, h, [("Radiation", None)], name="Tex Set")
+    vis = _mt_id(client, "Visualiser")
+    # Start in colour mode (a Visualiser member is always a complete mode); the
+    # texture upload below switches it into texture mode.
+    grp = _mk_group(client, h, [("Visualiser", {
+        "texture_toggle": False, "color_r": 128, "color_g": 128,
+        "color_b": 128, "opacity": 100})], name="Tex Set")
     _assign(client, h, pid, sid_a, obj_a, grp)
     _assign(client, h, pid, sid_b, obj_b, grp)
 
     r = client.post(
-        LIB + f"/groups/{grp['id']}/materials/{rad}/files/texture_file?scenario_id={sid_a}",
+        LIB + f"/groups/{grp['id']}/materials/{vis}/files/texture_file?scenario_id={sid_a}",
         files={"file": ("dirt.png", io.BytesIO(_valid_png()), "image/png")}, headers=h)
     assert r.status_code == 200, r.text
     assert r.json()["sync"]["applied"]["refreshed_values"] == 1   # A refreshed eagerly

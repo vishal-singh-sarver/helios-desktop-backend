@@ -29,7 +29,7 @@ from app.core.dependencies import get_session_id
 from app.db.database import get_db
 from app.schemas.material_library import (
     GroupMaterialIn,
-    GroupMaterialPatchRequest,
+    GroupMaterialPutRequest,
     MaterialGroupCreateRequest,
     MaterialGroupPutRequest,
     MaterialGroupRenameRequest,
@@ -126,11 +126,11 @@ def add_group_material(
     return svc.add_group_material(db, session_id, group_id, body, scenario_id)
 
 
-@router.patch(_BASE + "/groups/{group_id}/materials/{material_type_id}")
+@router.put(_BASE + "/groups/{group_id}/materials/{material_type_id}")
 def update_group_material(
     group_id: int,
     material_type_id: int,
-    body: GroupMaterialPatchRequest,
+    body: GroupMaterialPutRequest,
     scenario_id: Optional[str] = Query(default=None),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),

@@ -240,7 +240,7 @@ def _winner_surface(db: Session, so: ScenarioObject) -> tuple[str, str | None]:
     if material_apply._is_texture_mode(values):
         path = material_apply.resolve_texture_path(values.get("texture_file"))
         return ("texture", path) if path else ("soil", None)   # defensive: missing file -> soil
-    return ("colour", None)
+    return ("colour", material_apply._winner_color(db, so.id, winner))
 
 
 def _surface_signature(surface: tuple[str, str | None]) -> str:

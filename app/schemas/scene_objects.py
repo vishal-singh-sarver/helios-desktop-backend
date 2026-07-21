@@ -24,6 +24,8 @@ class SceneObjectUpdateRequest(BaseModel):
     properties: Optional[dict[str, Any]] = None
     visibility: Optional[dict[str, Any]] = None
     group_id: Optional[int] = None          # null = ungroup; check fields_set
+    # Material-GROUP assignments to ADD (same shape as create). One or many.
+    materials: list[GroupAssignmentIn] = Field(default_factory=list)
 
 
 class SceneObjectRenameRequest(BaseModel):

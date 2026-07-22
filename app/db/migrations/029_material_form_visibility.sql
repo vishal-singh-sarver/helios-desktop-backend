@@ -1,7 +1,7 @@
--- Migration 029 — MATERIAL FORM VISIBILITY: catalog returns only the light-green
+-- Migration 029 — MATERIAL FORM VISIBILITY: catalog returns only the specific
 -- (editable) parameters/sub-parameters from the spec sheet.
 --
--- Story: the material form shows ONLY the light-green rows. The sheet's white
+-- Story: the material form shows ONLY the specific rows. The sheet's white
 -- rows are of TWO kinds, so a boolean won't do:
 --   external  – Weather Data / Global params, set elsewhere (Weather panel /
 --               project header) — never in the material form.

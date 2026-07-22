@@ -53,7 +53,7 @@ def test_create_group_with_values_and_auto_name(client):
         "materials": [
             {"material_type_id": rad, "properties": {
                 "surface_temperature": 300, "reflectivity": 0.2,
-                "two_sided_heat_transfer": False,
+                "two_sided_heat_transfer": "One Sided",
             }},
             {"material_type_id": eb, "properties": {"wind_speed": 3.5}},
         ],
@@ -66,7 +66,7 @@ def test_create_group_with_values_and_auto_name(client):
     assert len(grp["materials"]) == 2
     m = _member(grp, "Radiation")
     assert m["properties"]["reflectivity"] == 0.2
-    assert m["properties"]["two_sided_heat_transfer"] is False
+    assert m["properties"]["two_sided_heat_transfer"] == "One Sided"
     assert m["properties"]["spectral_data"] is None   # untouched prop present as null
     assert "name" not in m                            # members are nameless
     assert _member(grp, "Energy Balance")["properties"]["wind_speed"] == 3.5

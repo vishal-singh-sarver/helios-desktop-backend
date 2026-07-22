@@ -63,18 +63,74 @@ def test_material_types_seven_types_viz_on_visualiser_only(client):
     assert rad["surface_temperature"]["min"] == 223
     assert rad["surface_temperature"]["max"] == 5000
     assert rad["reflectivity"]["max"] == 1
-    assert rad["two_sided_heat_transfer"]["datatype"] == "boolean"
+    # Heat-transfer flag is a two-option enum dropdown (migration 028), not a bool.
+    assert rad["two_sided_heat_transfer"]["datatype"] == "enum"
+    assert rad["two_sided_heat_transfer"]["enum_values"] == ["One Sided", "Two Sided"]
+    assert rad["two_sided_heat_transfer"]["label"] == "Heat Transfer Flag"
 
-    # Shared property narrowed per type via overrides
-    photo = {p["property"]: p for p in by_name["Photosynthesis"]["properties"]}
-    assert photo["radiation_flux"]["max"] == 1500
-    eb = {p["property"]: p for p in by_name["Energy Balance"]["properties"]}
-    assert eb["radiation_flux"]["max"] == 10000000
+    # Only light-green (editable) params are returned (migration 029): the
+    # "computed" flux/conductance inputs and weather/global params are withheld.
+    eb_props = {p["property"] for p in by_name["Energy Balance"]["properties"]}
+    assert eb_props == {
+        "two_sided_heat_transfer", "stomatal_sidedness", "object_length", "heat_capacity"}
+    assert "radiation_flux" not in eb_props            # computed, withheld
+    assert "wind_speed" not in eb_props                # weather/global, withheld
+    assert "radiation_flux" not in {p["property"] for p in by_name["Photosynthesis"]["properties"]}
+    # Solar Position is entirely weather/global -> nothing editable to show.
+    assert by_name["Solar Position"]["properties"] == []
+    assert by_name["Solar Position"]["groups"] == []
 
     blc = {p["property"]: p for p in by_name["Boundary Layer Conductance"]["properties"]}
     assert blc["boundary_layer_model"]["datatype"] == "enum"
     assert blc["boundary_layer_model"]["enum_values"] == [
         "Pohlhausen", "InclinedPlate", "Sphere", "Ground"]
+
+
+def test_material_types_parameter_groups(client):
+    """Migration 027: params nest into `groups` (Farquhar collapsible + stomatal
+    selector sub-models); grouped props leave the flat `properties` list and
+    carry display labels."""
+    r = client.get("/api/catalog/material-types")
+    assert r.status_code == 200
+    by_name = {mt["materialtype"]: mt for mt in r.json()["material_types"]}
+
+    # Photosynthesis: one plain collapsible group (no selector).
+    photo = by_name["Photosynthesis"]
+    top = {p["property"] for p in photo["properties"]}
+    assert "vcmax25" not in top  # moved into the Farquhar group
+    assert {"two_sided_heat_transfer", "stomatal_sidedness"} <= top
+    assert "radiation_flux" not in top  # computed input, withheld (migration 029)
+    pgroups = {g["name"]: g for g in photo["groups"]}
+    assert set(pgroups) == {"Farquhar model"}
+    farq = pgroups["Farquhar model"]
+    assert farq["selector_property"] is None and farq["selector_value"] is None
+    assert [p["property"] for p in farq["properties"]] == [
+        "vcmax25", "jmax25", "tpu25", "rd25", "alpha", "theta",
+        "dha_vcmax", "topt_vcmax", "dha_jmax", "topt_jmax", "dhd_jmax",
+        "dha_tpu", "topt_tpu", "dhd_tpu"]
+    assert farq["properties"][0]["label"] == "V cmax25"
+
+    # Stomatal Conductance: four mutually-exclusive selector-gated sub-models.
+    stom = by_name["Stomatal Conductance"]
+    stop = {p["property"] for p in stom["properties"]}
+    assert "bwb_gs0" not in stop
+    assert {"gamma_co2", "stomatal_model"} <= stop  # selector itself stays top-level
+    sgroups = {g["name"]: g for g in stom["groups"]}
+    assert set(sgroups) == {"Ball-woodrow-berry", "Ball-berry-leuning",
+                            "Medlyn Optimality", "Buckley-mott-farquhar"}
+    assert all(g["selector_property"] == "stomatal_model" for g in sgroups.values())
+    assert {g["name"]: g["selector_value"] for g in sgroups.values()} == {
+        "Ball-woodrow-berry": "BWB", "Ball-berry-leuning": "BBL",
+        "Medlyn Optimality": "Medlyn", "Buckley-mott-farquhar": "BMF"}
+    bbl = sgroups["Ball-berry-leuning"]
+    assert [p["property"] for p in bbl["properties"]] == ["bbl_gs0", "bbl_a1", "bbl_d0"]
+    # Same label ("gs, o") across sub-models; unique keys keep saves unambiguous.
+    assert {p["property"]: p["label"] for p in bbl["properties"]} == {
+        "bbl_gs0": "gs, o", "bbl_a1": "a1", "bbl_d0": "Do"}
+    assert sgroups["Ball-woodrow-berry"]["properties"][0]["label"] == "gs, o"
+
+    # A material type with no sub-groups reports an empty list.
+    assert by_name["Radiation"]["groups"] == []
 
 
 def test_model_types_hierarchy(client):

@@ -336,6 +336,18 @@ class MaterialPropertyType(Base):
     min_override     = Column(Float, nullable=True)
     max_override     = Column(Float, nullable=True)
     display_order    = Column(Integer, nullable=False, default=0)
+    # Parameter grouping for the material form (migration 027). group_name marks a
+    # named sub-group ("Farquhar model"); selector_property/selector_value gate a
+    # mutually-exclusive sub-model (Stomatal Conductance's `stomatal_model` enum).
+    # label is the display name; NULL = frontend humanizes `property`.
+    group_name        = Column(Text, nullable=True)
+    selector_property = Column(Text, nullable=True)
+    selector_value    = Column(Text, nullable=True)
+    label             = Column(Text, nullable=True)
+    # Material-form visibility (migration 029). 'editable' (light green) is the
+    # only value returned by the catalog endpoint; 'external' (weather/global) and
+    # 'computed' (shown only when the owning model is disabled) are withheld.
+    visibility        = Column(Text, nullable=False, default="editable")
 
 
 class MaterialGroup(Base):

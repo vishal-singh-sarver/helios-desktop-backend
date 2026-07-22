@@ -130,6 +130,14 @@ class PropDef:
     max: float | None
     enum_values: list | None
     display_order: int
+    # Material-only grouping metadata (migration 027); None for object types
+    # (object_property_type has no such columns — see the getattr in the loader).
+    group_name: str | None = None
+    selector_property: str | None = None
+    selector_value: str | None = None
+    label: str | None = None
+    # 'editable' | 'external' | 'computed' (migration 029); None for object types.
+    visibility: str | None = None
 
 
 def load_type_properties(db: Session, *, object_type_id: int | None = None,
@@ -160,6 +168,12 @@ def load_type_properties(db: Session, *, object_type_id: int | None = None,
             max=link_row.max_override if link_row.max_override is not None else pt.max,
             enum_values=json.loads(pt.enum_values) if pt.enum_values else None,
             display_order=link_row.display_order,
+            # getattr: object_property_type has no grouping columns → None.
+            group_name=getattr(link_row, "group_name", None),
+            selector_property=getattr(link_row, "selector_property", None),
+            selector_value=getattr(link_row, "selector_value", None),
+            label=getattr(link_row, "label", None),
+            visibility=getattr(link_row, "visibility", None),
         )
     return defs
 

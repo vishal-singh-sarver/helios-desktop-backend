@@ -754,6 +754,17 @@ def _group_assignment_payload(db: Session, so: ScenarioObject,
     return payload
 
 
+def _object_material_groups(db: Session, so: ScenarioObject) -> list[dict]:
+    """The object's assigned material-group payloads, oldest-assigned first."""
+    assignments = (
+        db.query(ObjectMaterialGroup)
+        .filter(ObjectMaterialGroup.scenario_object_id == so.id)
+        .order_by(ObjectMaterialGroup.created_at)
+        .all()
+    )
+    return [_group_assignment_payload(db, so, omg) for omg in assignments]
+
+
 def serialize_object(db: Session, sctx, so: ScenarioObject,
                      include_materials: bool = True) -> dict:
     ot = db.get(ObjectType, so.object_type_id)
@@ -778,14 +789,7 @@ def serialize_object(db: Session, sctx, so: ScenarioObject,
         "viewport": {"object_id": obj_id, "ctx_object_id": ctx_object_id},
     }
     if include_materials:
-        assignments = (
-            db.query(ObjectMaterialGroup)
-            .filter(ObjectMaterialGroup.scenario_object_id == so.id)
-            .order_by(ObjectMaterialGroup.created_at)
-            .all()
-        )
-        out["material_groups"] = [_group_assignment_payload(db, so, omg)
-                                  for omg in assignments]
+        out["material_groups"] = _object_material_groups(db, so)
     return out
 
 
@@ -924,6 +928,7 @@ def list_objects(db: Session, session_id: str, project_id: str,
             "visibility": _visibility_of(db, so),
             "viewport": {"object_id": sctx.persisted_objects.get(so.id)},
             "material_count": material_counts.get(so.id, 0),
+            "material_groups": _object_material_groups(db, so),
             "created_at": so.created_at,
             "updated_at": so.updated_at,
         }

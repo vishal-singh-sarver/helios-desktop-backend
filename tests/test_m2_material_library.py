@@ -360,6 +360,48 @@ def test_file_upload_by_group_and_type(client):
     assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
 
 
+def test_spectral_upload_returns_path(client):
+    """The dedicated spectral endpoint accepts only .xml, writes the file, records
+    the path on the Radiation material, and returns just that path. Spectral has
+    no auto-create — the member must already be in the group."""
+    from app.core.config import settings
+
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    rad = _mt_id(client, "Radiation")
+    grp = _mk_group(client, h, [{"material_type_id": rad, "properties": {}}], name="Spec")
+    member_id = grp["materials"][0]["material_id"]
+    url = BASE + f"/groups/{grp['id']}/materials/{rad}/spectral"
+
+    # Happy path: .xml accepted, response is exactly the stored path.
+    xml = b"<helios>\n  <globaldata_vec2 label='leaf_reflectivity'>400 0.1</globaldata_vec2>\n</helios>"
+    r = client.post(url, files={"file": ("leaf.xml", io.BytesIO(xml), "application/xml")}, headers=h)
+    assert r.status_code == 200, r.text
+    path = f"uploads/materials/{member_id}/leaf.xml"
+    assert r.json() == {"success": True, "path": path}
+
+    # The bytes actually landed on disk under data_dir, unchanged.
+    on_disk = settings.data_dir / path
+    assert on_disk.is_file()
+    assert on_disk.read_bytes() == xml
+
+    # And the path is persisted on the Radiation material.
+    g = client.get(BASE + f"/groups/{grp['id']}", headers=h).json()["group"]
+    assert _member(g, "Radiation")["properties"]["spectral_data"] == path
+
+    # Only .xml is accepted.
+    r = client.post(url, files={"file": ("leaf.png", io.BytesIO(b"z"), "image/png")}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
+
+    # No auto-create: Radiation must already be a member (unlike texture uploads).
+    empty = _mk_group(client, h, [], name="Empty")
+    r = client.post(BASE + f"/groups/{empty['id']}/materials/{rad}/spectral",
+                    files={"file": ("leaf.xml", io.BytesIO(xml), "application/xml")}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
+
+
 def test_texture_upload_autocreates_visualiser(client):
     """Uploading a texture to a group with NO Visualiser member creates it on the
     spot, born directly in texture mode (no colour version -> no grey flash)."""

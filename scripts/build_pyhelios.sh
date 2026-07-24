@@ -82,4 +82,4 @@ fi
 
 echo ""
 echo "PyHelios is ready. Start the backend with:"
-echo "  ./backend-api/run.sh --source"
+echo "  ./helios-desktop-backend/run.sh --source"

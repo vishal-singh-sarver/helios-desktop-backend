@@ -48,7 +48,7 @@ See [.env.example](.env.example) for the full list. Key variables:
 ## Project Structure
 
 ```
-backend-api/
+helios-desktop-backend/
 ├── app/
 │   ├── core/           # Config, logging, lifespan, dependencies, project/scenario context, session store, timezone
 │   ├── db/

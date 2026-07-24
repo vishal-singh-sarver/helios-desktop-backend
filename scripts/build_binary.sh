@@ -20,7 +20,7 @@
 
 set -eu
 
-# Change to backend-api directory
+# Change to helios-desktop-backend directory
 cd "$(dirname "$0")/.."
 BACKEND_DIR="$(pwd)"
 

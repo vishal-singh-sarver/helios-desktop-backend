@@ -286,6 +286,30 @@ def test_list_get_update_rename_delete(client):
     assert client.get(_base(pid, sid) + f"/objects/{o1['id']}", headers=h).status_code == 404
 
 
+def test_list_objects_carries_assigned_group_ids(client):
+    """The objects list must surface each object's assigned material-group ids:
+    the frontend gates its live geometry refetch on obj.material_groups[].group_id,
+    so a dropped field silently kills live material updates. An object with no
+    assignment reports []."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    ot = _ot_id(client)
+
+    assigned = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
+    bare = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
+
+    grp = _mk_group(client, h, [("Radiation", None)], name="Rad")
+    client.post(_base(pid, sid) + f"/objects/{assigned['id']}/material-groups",
+                json={"group_id": grp["id"]}, headers=h)
+
+    listed = {o["id"]: o for o in
+              client.get(_base(pid, sid) + "/objects", headers=h).json()["objects"]}
+    assert [g["group_id"] for g in listed[assigned["id"]]["material_groups"]] == [grp["id"]]
+    assert listed[bare["id"]]["material_groups"] == []
+
+
 def test_get_object_geometry_binary(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}

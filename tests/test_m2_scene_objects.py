@@ -855,6 +855,30 @@ def test_create_materials_field_takes_group_assignments(client):
     assert r.status_code == 422
 
 
+def test_assigned_member_gates_selector_submodel(client):
+    """The object's material_groups member view gates sub-model params by the
+    selector, same as the library: a Medlyn Stomatal material assigned to a
+    ground shows only the Medlyn params, not BWB/BBL/BMF."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+    }, headers=h).json()["object"]
+
+    grp = _mk_group(client, h, [("Stomatal Conductance",
+                                 {"stomatal_model": "Medlyn", "medlyn_gs0": 1, "medlyn_g1": 1})],
+                    name="Stom")
+    client.post(_base(pid, sid) + f"/objects/{obj['id']}/material-groups",
+                json={"group_id": grp["id"]}, headers=h)
+
+    r = client.get(_base(pid, sid) + f"/objects/{obj['id']}", headers=h)
+    props = r.json()["object"]["material_groups"][0]["materials"][0]["properties"]
+    assert {"medlyn_gs0", "medlyn_g1"} <= set(props)   # the selected sub-model
+    assert props["medlyn_gs0"] == 1
+    assert not any(k.startswith(("bwb_", "bbl_", "bmf_")) for k in props)
+    assert props["stomatal_model"] == "Medlyn"
+
+
 def test_assignment_conflict_names_stale_blocker(client):
     """A stale leftover (deleted group, not yet synced) still owns its type
     slot: assigning another group of that type 409s with stale: true, and

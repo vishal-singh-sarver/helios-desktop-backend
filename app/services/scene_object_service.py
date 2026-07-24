@@ -63,6 +63,7 @@ from app.services.eav_validation import (
     api_error,
     decode_value,
     load_type_properties,
+    member_property_values,
     next_default_name,
     project_or_404,
     validate_cross_field,
@@ -723,7 +724,7 @@ def _member_payload(db: Session, so: ScenarioObject, om: ObjectMaterial,
             payload["library_drift"] = True
     if not live:
         payload["stale"] = True
-    payload["properties"] = {name: values.get(name) for name in defs}
+    payload["properties"] = member_property_values(defs, values)
     return payload
 
 

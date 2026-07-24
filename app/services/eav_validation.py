@@ -178,6 +178,20 @@ def load_type_properties(db: Session, *, object_type_id: int | None = None,
     return defs
 
 
+def member_property_values(defs: dict, values: dict) -> dict:
+    """A member's property VALUES with mutually-exclusive sub-model params gated
+    by their selector (migration 027): a selector-gated property (e.g. bbl_gs0,
+    whose selector is stomatal_model='BBL') is included only when the member's
+    current selector value matches — so only the chosen sub-model's params are
+    returned, never the other sub-models'. Non-gated properties are unaffected."""
+    return {
+        name: values.get(name)
+        for name, p in defs.items()
+        if p.selector_property is None
+        or values.get(p.selector_property) == p.selector_value
+    }
+
+
 # ── Value validation + canonical encoding ────────────────────────────────────
 
 

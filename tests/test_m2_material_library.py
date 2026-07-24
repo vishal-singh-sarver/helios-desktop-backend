@@ -75,6 +75,24 @@ def test_create_group_with_values_and_auto_name(client):
     assert r2.json()["name"] == "Material.002"
 
 
+def test_member_returns_only_selected_submodel_params(client):
+    """Stomatal Conductance is four mutually-exclusive sub-models (migration 027).
+    A member with stomatal_model='BBL' returns only the BBL params (+ the selector
+    and the common non-gated props) — never the BWB/Medlyn/BMF params."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    stom = _mt_id(client, "Stomatal Conductance")
+    grp = _mk_group(client, h, [{"material_type_id": stom, "properties": {
+        "stomatal_model": "BBL", "bbl_gs0": 0.5}}], name="Stom")
+
+    props = _member(grp, "Stomatal Conductance")["properties"]
+    assert {"bbl_gs0", "bbl_a1", "bbl_d0"} <= set(props)   # the selected sub-model
+    assert props["bbl_gs0"] == 0.5
+    assert not any(k.startswith(("bwb_", "medlyn_", "bmf_")) for k in props)
+    assert props["stomatal_model"] == "BBL"                # selector itself stays
+    assert "gamma_co2" in props                            # common (non-gated) prop stays
+
+
 def test_create_group_validation_errors(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}

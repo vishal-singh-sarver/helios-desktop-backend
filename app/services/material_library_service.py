@@ -48,6 +48,7 @@ from app.services.eav_validation import (
     api_error,
     decode_value,
     load_type_properties,
+    member_property_values,
     next_default_name,
     project_or_404,
     validate_name,
@@ -141,22 +142,13 @@ def _upsert_values(db: Session, material_id: int, canonical: dict[str, str | Non
 def _serialize_member(db: Session, pm: ProjectMaterial, type_names: dict[int, str]) -> dict:
     defs = load_type_properties(db, material_type_id=pm.material_type_id)
     values = _values_native(db, pm.id)
-    # Mutually-exclusive sub-models (migration 027): a selector-gated property
-    # (e.g. bbl_gs0, selector stomatal_model='BBL') is returned only when the
-    # member's current selector value matches — so only the chosen sub-model's
-    # params come back, never the other sub-models'.
     return {
         "material_id": pm.id,
         "material_type_id": pm.material_type_id,
         "material_type": type_names.get(pm.material_type_id),
         "created_at": pm.created_at,
         "updated_at": pm.updated_at,
-        "properties": {
-            name: values.get(name)
-            for name, p in defs.items()
-            if p.selector_property is None
-            or values.get(p.selector_property) == p.selector_value
-        },
+        "properties": member_property_values(defs, values),
     }
 
 

@@ -707,3 +707,14 @@ async def upload_file_property(db: Session, session_id: str, group_id: int,
     db.refresh(grp)
     out["group"] = serialize_group(db, grp)
     return out
+
+
+async def upload_spectral_data(db: Session, session_id: str, group_id: int,
+                               material_type_id: int, file,
+                               scenario_id: str | None) -> dict:
+    """Dedicated spectral-file upload. Delegates to the shared file handler
+    (which enforces .xml, stores the file and records its path) and returns just
+    the stored path."""
+    out = await upload_file_property(db, session_id, group_id, material_type_id,
+                                     "spectral_data", file, scenario_id)
+    return {"success": True, "path": out["value"]}

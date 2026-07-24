@@ -164,3 +164,16 @@ async def upload_file_property(
     return await svc.upload_file_property(db, session_id, group_id,
                                           material_type_id, property_name,
                                           file, scenario_id)
+
+
+@router.post(_BASE + "/groups/{group_id}/materials/{material_type_id}/spectral")
+async def upload_spectral(
+    group_id: int,
+    material_type_id: int,
+    scenario_id: Optional[str] = Query(default=None),
+    file: UploadFile = File(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    return await svc.upload_spectral_data(db, session_id, group_id,
+                                          material_type_id, file, scenario_id)

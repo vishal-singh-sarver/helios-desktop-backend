@@ -151,16 +151,26 @@ def remove_group_material(
                                      scenario_id)
 
 
-@router.post(_BASE + "/groups/{group_id}/materials/{material_type_id}/files/{property_name}")
+@router.post(_BASE + "/groups/{group_id}/files/{property_name}")
 async def upload_file_property(
     group_id: int,
-    material_type_id: int,
     property_name: str,
-    scenario_id: Optional[str] = Query(default=None),
     file: UploadFile = File(...),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    return await svc.upload_file_property(db, session_id, group_id,
-                                          material_type_id, property_name,
-                                          file, scenario_id)
+    """Store a material file and return its path. No material member needed —
+    the save API writes the returned path into the member's property."""
+    return await svc.upload_file_property(db, group_id, property_name, file)
+
+
+@router.delete(_BASE + "/groups/{group_id}/files")
+def delete_file(
+    group_id: int,
+    path: str = Query(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Delete an uploaded file. 409 while any material or frozen per-geometry
+    snapshot still references it."""
+    return svc.delete_file(db, group_id, path)

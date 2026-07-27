@@ -316,63 +316,86 @@ def test_group_survives_project_deletion(client):
     assert g["project_id"] is None and g["scenario_id"] is None
 
 
-def test_file_upload_by_group_and_type(client):
+def test_file_upload_by_group(client):
+    """Upload stores the file and returns its path — it writes nothing to any
+    material, so no member need exist (the save API persists the path)."""
+    from app.core.config import settings
+
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    vis = _mt_id(client, "Visualiser")
-    eb = _mt_id(client, "Energy Balance")
-    # Start the Visualiser member in colour mode; uploading a texture only stores
-    # the file path (it no longer switches mode — the save API does that).
-    grp = _mk_group(client, h, [{"material_type_id": vis, "properties": {
-        "texture_toggle": False, "color_r": 128, "color_g": 128,
-        "color_b": 128, "opacity": 100}}], name="Textured")
-    member_id = grp["materials"][0]["material_id"]
 
-    url = BASE + f"/groups/{grp['id']}/materials/{vis}/files/texture_file"
+    grp = _mk_group(client, h, [], name="Textured")   # EMPTY group, no members
+    url = BASE + f"/groups/{grp['id']}/files/texture_file"
     r = client.post(url, files={"file": ("grass.png", io.BytesIO(b"png-bytes"), "image/png")},
                     headers=h)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["success"] is True and body["property"] == "texture_file"
-    # Project-free storage path (groups are global).
-    assert body["value"] == f"uploads/materials/{member_id}/grass.png"
-    vis_member = _member(body["group"], "Visualiser")
-    assert vis_member["properties"]["texture_file"] == body["value"]
-    # Upload only stores the file path — the member's mode (texture_toggle) and
-    # colour are left untouched; those are set by the separate material save API.
-    assert vis_member["properties"]["texture_toggle"] is False
-    assert vis_member["properties"]["color_r"] == 128
+    path = f"uploads/groups/{grp['id']}/grass.png"
+    assert body["path"] == path
+    assert (settings.data_dir / path).read_bytes() == b"png-bytes"
+    # Nothing was written to the group's members.
+    assert client.get(BASE + f"/groups/{grp['id']}", headers=h).json()["group"]["materials"] == []
 
-    # A type that is not in the group → 404 MATERIAL_TYPE_NOT_IN_GROUP.
-    r = client.post(BASE + f"/groups/{grp['id']}/materials/{eb}/files/texture_file",
-                    files={"file": ("x.png", io.BytesIO(b"z"), "image/png")}, headers=h)
-    assert r.status_code == 404
-    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
-
-    # Not a file property / unsupported texture extension. color_r IS on the
-    # Visualiser member but is not a file property -> UNKNOWN_PROPERTY.
-    r = client.post(BASE + f"/groups/{grp['id']}/materials/{vis}/files/color_r",
+    # Not a material file property -> UNKNOWN_PROPERTY.
+    r = client.post(BASE + f"/groups/{grp['id']}/files/color_r",
                     files={"file": ("x.png", io.BytesIO(b"z"), "image/png")}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "UNKNOWN_PROPERTY"
+
+    # Unsupported extension for the property.
     r = client.post(url, files={"file": ("x.gif", io.BytesIO(b"z"), "image/gif")}, headers=h)
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
 
+    # Unknown group -> 404.
+    r = client.post(BASE + "/groups/99999/files/texture_file",
+                    files={"file": ("x.png", io.BytesIO(b"z"), "image/png")}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NOT_FOUND"
 
-def test_texture_upload_requires_existing_member(client):
-    """Texture upload no longer auto-creates the Visualiser member: uploading to a
-    group without it returns 404 (the member is added via the save API first)."""
+
+def test_delete_uploaded_file(client):
+    """An orphan upload deletes cleanly; deletion is refused while a material
+    still references the path (frozen snapshots resolve it from disk)."""
+    from app.core.config import settings
+
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     vis = _mt_id(client, "Visualiser")
+    grp = _mk_group(client, h, [], name="Files")
+    up_url = BASE + f"/groups/{grp['id']}/files/texture_file"
+    del_url = BASE + f"/groups/{grp['id']}/files"
 
-    grp = _mk_group(client, h, [], name="No Vis")   # empty group, no members
-    url = BASE + f"/groups/{grp['id']}/materials/{vis}/files/texture_file"
-    r = client.post(url, files={"file": ("dirt.png", io.BytesIO(b"png-bytes"), "image/png")},
-                    headers=h)
+    # Nothing references this upload -> deleted.
+    path = client.post(up_url, files={"file": ("a.png", io.BytesIO(b"a"), "image/png")},
+                       headers=h).json()["path"]
+    assert (settings.data_dir / path).is_file()
+    r = client.delete(del_url, params={"path": path}, headers=h)
+    assert r.status_code == 200, r.text
+    assert not (settings.data_dir / path).exists()
+
+    # Already gone -> 404.
+    r = client.delete(del_url, params={"path": path}, headers=h)
     assert r.status_code == 404
-    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
+    assert r.json()["detail"]["code"] == "FILE_NOT_FOUND"
+
+    # Referenced by a saved material -> 409, file untouched.
+    used = client.post(up_url, files={"file": ("b.png", io.BytesIO(b"b"), "image/png")},
+                       headers=h).json()["path"]
+    r = client.post(BASE + f"/groups/{grp['id']}/materials", json={
+        "material_type_id": vis,
+        "properties": {"texture_toggle": True, "texture_file": used}}, headers=h)
+    assert r.status_code == 201, r.text
+    r = client.delete(del_url, params={"path": used}, headers=h)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "FILE_IN_USE"
+    assert (settings.data_dir / used).is_file()
+
+    # Outside this group's folder -> rejected.
+    r = client.delete(del_url, params={"path": "uploads/groups/99999/x.png"}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_PATH"
 
 
 def test_member_crud_one_by_one(client):

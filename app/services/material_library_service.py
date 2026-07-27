@@ -36,6 +36,7 @@ from app.db.models import (
     MaterialGroup,
     MaterialType,
     ObjectMaterialGroup,
+    ObjectPropertyData,
     ProjectMaterial,
     PropertyType,
     Scenario,
@@ -631,52 +632,56 @@ def delete_group(db: Session, session_id: str, group_id: int,
     return out
 
 
-async def upload_file_property(db: Session, session_id: str, group_id: int,
-                               material_type_id: int, property_name: str, file,
-                               scenario_id: str | None) -> dict:
+async def upload_file_property(db: Session, group_id: int, property_name: str,
+                               file) -> dict:
+    """Upload a material file (texture_file / spectral_data) for a GROUP.
+
+    No material member is involved: the file is stored and its path returned,
+    nothing is written to any material. The save API persists that path into the
+    member's property — so a texture can be uploaded before the member exists.
+
+    Stored group-scoped (uploads/groups/<group id>/) rather than under
+    uploads/materials/, whose folders are keyed by member id."""
     grp = _group_or_404(db, group_id)
-    scn = _scenario_scope_or_404(db, session_id, scenario_id) if scenario_id else None
-    pm = (
-        db.query(ProjectMaterial)
-        .filter(ProjectMaterial.material_group_id == grp.id,
-                ProjectMaterial.material_type_id == material_type_id)
-        .first()
-    )
-    if pm is None:
-        raise api_error(404, "MATERIAL_TYPE_NOT_IN_GROUP",
-                        f"material_type_id {material_type_id} is not in this group")
-    defs = load_type_properties(db, material_type_id=pm.material_type_id)
-    prop = defs.get(property_name)
-    if prop is None or prop.datatype != "file":
+    allowed = _FILE_PROPERTY_EXTENSIONS.get(property_name)
+    if allowed is None:
         raise api_error(400, "UNKNOWN_PROPERTY",
-                        f"'{property_name}' is not a file property of this material type")
+                        f"'{property_name}' is not a material file property")
 
     filename = Path(file.filename or "").name
-    if not filename:
-        raise api_error(400, "INVALID_FILE_FORMAT", "File format not supported")
-    allowed = _FILE_PROPERTY_EXTENSIONS.get(property_name)
-    if allowed is not None and Path(filename).suffix.lower() not in allowed:
+    if not filename or Path(filename).suffix.lower() not in allowed:
         raise api_error(400, "INVALID_FILE_FORMAT", "File format not supported")
 
-    # Groups are global — uploads live under a project-free path. Values stored
-    # before migration 022 keep their old uploads/{project_id}/... paths; both
-    # resolve through material_apply.resolve_texture_path.
-    rel = Path("uploads") / "materials" / str(pm.id) / filename
+    rel = Path("uploads") / "groups" / str(grp.id) / filename
     dest = settings.data_dir / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(await file.read())
+    return {"success": True, "property": property_name,
+            "path": str(rel).replace("\\", "/")}
 
-    value = str(rel).replace("\\", "/")
-    _upsert_values(db, pm.id, {property_name: value}, defs)
-    pm.updated_at = _now()
-    grp.updated_at = _now()
-    db.commit()
 
-    out = {"success": True, "property": property_name, "value": value}
-    if scn is not None:
-        # A file value is a library values-change like any other → same eager hook.
-        result = _eager_reconcile(db, session_id, scn, grp.id)
-        out["sync"] = _sync_block(scn, result)
-    db.refresh(grp)
-    out["group"] = serialize_group(db, grp)
-    return out
+def delete_file(db: Session, group_id: int, path: str) -> dict:
+    """Delete an uploaded file from this group's upload folder.
+
+    Refused while the path is still referenced by a library value (material_data)
+    or by a frozen per-geometry snapshot (object_property_data): those resolve the
+    file from disk until every scenario syncs, so deleting it would silently drop
+    their texture. Only files inside uploads/groups/<group id>/ are reachable."""
+    grp = _group_or_404(db, group_id)
+    base = (settings.data_dir / "uploads" / "groups" / str(grp.id)).resolve()
+    target = (settings.data_dir / path).resolve()
+    if target.parent != base:
+        raise api_error(400, "INVALID_PATH", "Path is not in this group's uploads")
+
+    in_use = (
+        db.query(MaterialData.value).filter(MaterialData.value == path).first()
+        or db.query(ObjectPropertyData.value)
+        .filter(ObjectPropertyData.value == path).first()
+    )
+    if in_use:
+        raise api_error(409, "FILE_IN_USE", "File is still used by a material")
+
+    if not target.is_file():
+        raise api_error(404, "FILE_NOT_FOUND", "File not found")
+    target.unlink()
+    return {"success": True, "path": path}

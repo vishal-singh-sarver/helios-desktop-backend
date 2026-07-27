@@ -347,9 +347,20 @@ def test_upload_file_eager_refreshes_active_scenario(client):
     _assign(client, h, pid, sid_a, obj_a, grp)
     _assign(client, h, pid, sid_b, obj_b, grp)
 
-    r = client.post(
-        LIB + f"/groups/{grp['id']}/materials/{vis}/files/texture_file?scenario_id={sid_a}",
-        files={"file": ("dirt.png", io.BytesIO(_valid_png()), "image/png")}, headers=h)
+    # Upload only stores the file and returns its path — no member write, so no
+    # scenario reconcile happens here.
+    r = client.post(LIB + f"/groups/{grp['id']}/files/texture_file",
+                    files={"file": ("dirt.png", io.BytesIO(_valid_png()), "image/png")},
+                    headers=h)
+    assert r.status_code == 200, r.text
+    path = r.json()["path"]
+    assert "sync" not in r.json()
+
+    # SAVING that path onto the member is what switches the mode and eagerly
+    # refreshes the active scenario.
+    r = client.put(LIB + f"/groups/{grp['id']}/materials/{vis}?scenario_id={sid_a}",
+                   json={"properties": {"texture_toggle": True, "texture_file": path}},
+                   headers=h)
     assert r.status_code == 200, r.text
     assert r.json()["sync"]["applied"]["refreshed_values"] == 1   # A refreshed eagerly
 

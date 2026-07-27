@@ -31,6 +31,36 @@ def test_serve_404_for_missing_file_in_allowed_dir(client):
     assert r.status_code == 404
 
 
+def test_serve_uploaded_texture_by_stored_relative_path(client):
+    """An uploaded texture is served from the RELATIVE path stored on the
+    material (`uploads/...`), which is what the material form / popup sends.
+    data_dir is relative by default, so resolving against the process CWD instead
+    lands outside the allowlist and 403s every uploaded texture."""
+    import io
+    from uuid import uuid4
+
+    h = {"session-id": f"session_{uuid4().hex[:8]}"}
+    client.post("/api/project/create", json={
+        "name": f"Tex_{uuid4().hex[:8]}", "latitude": 28.6, "longitude": 77.2,
+    }, headers=h)
+    vis = next(mt["id"] for mt in client.get("/api/catalog/material-types").json()
+               ["material_types"] if mt["materialtype"] == "Visualiser")
+    grp = client.post("/api/materials/library/groups",
+                      json={"materials": []}, headers=h).json()["group"]
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    up = client.post(
+        f"/api/materials/library/groups/{grp['id']}/materials/{vis}/files/texture_file",
+        files={"file": ("grass.png", io.BytesIO(png), "image/png")}, headers=h)
+    assert up.status_code == 200, up.text
+    stored = up.json()["value"]
+    assert not stored.startswith("/")          # the stored value IS relative
+
+    r = client.get("/api/textures/serve", params={"path": stored})
+    assert r.status_code == 200, r.text
+    assert r.content == png
+
+
 # ── Default-texture picker: GET /api/textures/defaults ───────────────────────
 
 

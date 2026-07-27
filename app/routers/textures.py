@@ -61,11 +61,18 @@ def _is_within(target: Path, directory: Path) -> bool:
 async def serve_texture(path: str) -> FileResponse:
     """Serve a texture image referenced by a primitive's texture path.
 
+    Accepts both forms the app produces: the ABSOLUTE path baked into the
+    geometry binary (viewport), and the RELATIVE `uploads/...` value stored on a
+    material by the file-upload endpoint (material form / popup). A relative path
+    is resolved against data_dir — resolving it against the process CWD instead
+    would land outside the allowlist and 403 every uploaded texture.
+
     400 for a bad / non-image path, 403 when the path is outside the allowlist,
     404 when the file is missing.
     """
     try:
-        resolved = Path(path).resolve()
+        raw = Path(path)
+        resolved = (raw if raw.is_absolute() else settings.data_dir / raw).resolve()
     except (OSError, ValueError, RuntimeError):
         raise HTTPException(400, "Invalid texture path")
 

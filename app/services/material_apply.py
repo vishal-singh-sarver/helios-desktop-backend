@@ -124,8 +124,11 @@ def resolve_texture_path(value: str | None) -> str | None:
                 return str(tex_dir / filename)
         return None
     if value.startswith("uploads/"):
-        path = settings.data_dir / value
-        return str(path) if Path(path).exists() else None
+        # .resolve() so the baked value is ABSOLUTE: data_dir defaults to the
+        # relative Path("data"), and a bare "data/uploads/..." would get the
+        # data_dir prefix applied a second time when served back.
+        path = (settings.data_dir / value).resolve()
+        return str(path) if path.exists() else None
     return value
 
 

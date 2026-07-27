@@ -1,5 +1,7 @@
 """Texture serving endpoint (GET /api/textures/serve) — the 3D viewport fetches
 each primitive's texture image through it."""
+from pathlib import Path
+
 from app.core.config import settings
 from app.services import material_apply
 
@@ -31,11 +33,17 @@ def test_serve_404_for_missing_file_in_allowed_dir(client):
     assert r.status_code == 404
 
 
-def test_serve_uploaded_texture_by_stored_relative_path(client):
-    """An uploaded texture is served from the RELATIVE path stored on the
-    material (`uploads/...`), which is what the material form / popup sends.
-    data_dir is relative by default, so resolving against the process CWD instead
-    lands outside the allowlist and 403s every uploaded texture."""
+def test_serve_uploaded_texture_both_path_forms(client):
+    """An uploaded texture must serve from BOTH forms the app produces:
+
+      * the stored value `uploads/...`  — sent by the material form / popup
+      * resolve_texture_path(value)     — baked into the geometry binary and
+                                          sent by the 3D viewport
+
+    data_dir defaults to the RELATIVE Path("data"), so these two differ: the
+    baked form must be absolute (else serve re-applies the data_dir prefix and
+    403s the viewport), and the bare stored form must resolve against data_dir
+    (else it resolves against the CWD and 403s the popup)."""
     import io
     from uuid import uuid4
 
@@ -56,9 +64,14 @@ def test_serve_uploaded_texture_by_stored_relative_path(client):
     stored = up.json()["value"]
     assert not stored.startswith("/")          # the stored value IS relative
 
-    r = client.get("/api/textures/serve", params={"path": stored})
-    assert r.status_code == 200, r.text
-    assert r.content == png
+    # The baked/viewport form is absolute, so serve never re-prefixes it.
+    baked = material_apply.resolve_texture_path(stored)
+    assert Path(baked).is_absolute(), baked
+
+    for form in (stored, baked):
+        r = client.get("/api/textures/serve", params={"path": form})
+        assert r.status_code == 200, f"{form} -> {r.status_code} {r.text}"
+        assert r.content == png
 
 
 # ── Default-texture picker: GET /api/textures/defaults ───────────────────────

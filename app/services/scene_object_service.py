@@ -754,6 +754,17 @@ def _group_assignment_payload(db: Session, so: ScenarioObject,
     return payload
 
 
+def _object_material_groups(db: Session, so: ScenarioObject) -> list[dict]:
+    """The object's assigned material-group payloads, oldest-assigned first."""
+    assignments = (
+        db.query(ObjectMaterialGroup)
+        .filter(ObjectMaterialGroup.scenario_object_id == so.id)
+        .order_by(ObjectMaterialGroup.created_at)
+        .all()
+    )
+    return [_group_assignment_payload(db, so, omg) for omg in assignments]
+
+
 def serialize_object(db: Session, sctx, so: ScenarioObject,
                      include_materials: bool = True) -> dict:
     ot = db.get(ObjectType, so.object_type_id)
@@ -778,14 +789,7 @@ def serialize_object(db: Session, sctx, so: ScenarioObject,
         "viewport": {"object_id": obj_id, "ctx_object_id": ctx_object_id},
     }
     if include_materials:
-        assignments = (
-            db.query(ObjectMaterialGroup)
-            .filter(ObjectMaterialGroup.scenario_object_id == so.id)
-            .order_by(ObjectMaterialGroup.created_at)
-            .all()
-        )
-        out["material_groups"] = [_group_assignment_payload(db, so, omg)
-                                  for omg in assignments]
+        out["material_groups"] = _object_material_groups(db, so)
     return out
 
 
@@ -908,13 +912,26 @@ def list_objects(db: Session, session_id: str, project_id: str,
         rows = [r for r in rows if needle in r.name.lower()]
     type_names = dict(db.query(ObjectType.id, ObjectType.object).all())
     material_counts: dict[int, int] = {}
+    # Assigned group ids per object — the list only needs the id (the frontend
+    # maps g.group_id), so one bulk query beats the rich per-object payload
+    # serialize_object builds (that fans out to ~15 queries per object).
+    group_ids: dict[int, list[int]] = {}
     if rows:
+        row_ids = [r.id for r in rows]
         for (so_id,) in (
             db.query(ObjectMaterial.scenario_object_id)
-            .filter(ObjectMaterial.scenario_object_id.in_([r.id for r in rows]))
+            .filter(ObjectMaterial.scenario_object_id.in_(row_ids))
             .all()
         ):
             material_counts[so_id] = material_counts.get(so_id, 0) + 1
+        for so_id, mg_id in (
+            db.query(ObjectMaterialGroup.scenario_object_id,
+                     ObjectMaterialGroup.material_group_id)
+            .filter(ObjectMaterialGroup.scenario_object_id.in_(row_ids))
+            .order_by(ObjectMaterialGroup.created_at)
+            .all()
+        ):
+            group_ids.setdefault(so_id, []).append(mg_id)
     return {"objects": [
         {
             "id": so.id,
@@ -924,6 +941,7 @@ def list_objects(db: Session, session_id: str, project_id: str,
             "visibility": _visibility_of(db, so),
             "viewport": {"object_id": sctx.persisted_objects.get(so.id)},
             "material_count": material_counts.get(so.id, 0),
+            "material_groups": [{"group_id": gid} for gid in group_ids.get(so.id, [])],
             "created_at": so.created_at,
             "updated_at": so.updated_at,
         }

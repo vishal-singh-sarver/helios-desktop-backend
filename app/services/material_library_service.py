@@ -642,26 +642,10 @@ async def upload_file_property(db: Session, session_id: str, group_id: int,
                 ProjectMaterial.material_type_id == material_type_id)
         .first()
     )
-    if pm is not None:
-        defs = load_type_properties(db, material_type_id=pm.material_type_id)
-    else:
-        # The member isn't in the group yet. Auto-create it ONLY for a Visualiser
-        # texture upload: the material is born directly in texture mode, so no
-        # colour version is ever created and the ground can't flash grey. Any
-        # other missing member stays a 404 (it must be added explicitly first).
-        mt = db.get(MaterialType, material_type_id)
-        if mt is None:
-            raise api_error(404, "MATERIAL_TYPE_NOT_FOUND",
-                            f"material_type_id {material_type_id} not found")
-        defs = load_type_properties(db, material_type_id=mt.id)
-        if not (property_name == "texture_file" and "texture_toggle" in defs):
-            raise api_error(404, "MATERIAL_TYPE_NOT_IN_GROUP",
-                            f"material_type_id {material_type_id} is not in this group")
-        if scn is not None:
-            _precheck_add_conflicts(db, grp, scn.id, [mt.id])
-        pm = ProjectMaterial(material_group_id=grp.id, material_type_id=mt.id)
-        db.add(pm)
-        db.flush()   # assign pm.id for the upload path + the value rows below
+    if pm is None:
+        raise api_error(404, "MATERIAL_TYPE_NOT_IN_GROUP",
+                        f"material_type_id {material_type_id} is not in this group")
+    defs = load_type_properties(db, material_type_id=pm.material_type_id)
     prop = defs.get(property_name)
     if prop is None or prop.datatype != "file":
         raise api_error(400, "UNKNOWN_PROPERTY",
@@ -683,17 +667,7 @@ async def upload_file_property(db: Session, session_id: str, group_id: int,
     dest.write_bytes(await file.read())
 
     value = str(rel).replace("\\", "/")
-    if property_name == "texture_file" and "texture_toggle" in defs:
-        # Uploading a texture to a Visualiser member switches it INTO texture mode
-        # atomically: set the file, turn texture_toggle on, and clear the colour
-        # fields (a Visualiser member is always exactly one complete mode, and
-        # texture mode can only be entered by supplying a file — no chicken/egg).
-        _upsert_values(db, pm.id, {
-            "texture_file": value, "texture_toggle": "1",
-            "color_r": None, "color_g": None, "color_b": None, "opacity": None,
-        }, defs, replace=True)
-    else:
-        _upsert_values(db, pm.id, {property_name: value}, defs)
+    _upsert_values(db, pm.id, {property_name: value}, defs)
     pm.updated_at = _now()
     grp.updated_at = _now()
     db.commit()

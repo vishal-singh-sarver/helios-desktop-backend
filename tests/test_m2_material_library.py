@@ -321,8 +321,8 @@ def test_file_upload_by_group_and_type(client):
     h = {"session-id": session_id}
     vis = _mt_id(client, "Visualiser")
     eb = _mt_id(client, "Energy Balance")
-    # Start the Visualiser member in colour mode (a member is always a complete
-    # mode); uploading a texture then switches it into texture mode.
+    # Start the Visualiser member in colour mode; uploading a texture only stores
+    # the file path (it no longer switches mode — the save API does that).
     grp = _mk_group(client, h, [{"material_type_id": vis, "properties": {
         "texture_toggle": False, "color_r": 128, "color_g": 128,
         "color_b": 128, "opacity": 100}}], name="Textured")
@@ -338,10 +338,10 @@ def test_file_upload_by_group_and_type(client):
     assert body["value"] == f"uploads/materials/{member_id}/grass.png"
     vis_member = _member(body["group"], "Visualiser")
     assert vis_member["properties"]["texture_file"] == body["value"]
-    # Uploading a texture switches the member INTO texture mode: toggle on,
-    # colour cleared (the atomic mode switch — a member is exactly one mode).
-    assert vis_member["properties"]["texture_toggle"] is True
-    assert vis_member["properties"]["color_r"] is None
+    # Upload only stores the file path — the member's mode (texture_toggle) and
+    # colour are left untouched; those are set by the separate material save API.
+    assert vis_member["properties"]["texture_toggle"] is False
+    assert vis_member["properties"]["color_r"] == 128
 
     # A type that is not in the group → 404 MATERIAL_TYPE_NOT_IN_GROUP.
     r = client.post(BASE + f"/groups/{grp['id']}/materials/{eb}/files/texture_file",
@@ -360,35 +360,19 @@ def test_file_upload_by_group_and_type(client):
     assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
 
 
-def test_texture_upload_autocreates_visualiser(client):
-    """Uploading a texture to a group with NO Visualiser member creates it on the
-    spot, born directly in texture mode (no colour version -> no grey flash)."""
+def test_texture_upload_requires_existing_member(client):
+    """Texture upload no longer auto-creates the Visualiser member: uploading to a
+    group without it returns 404 (the member is added via the save API first)."""
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     vis = _mt_id(client, "Visualiser")
-    eb = _mt_id(client, "Energy Balance")
 
-    grp = _mk_group(client, h, [], name="Auto Tex")   # empty group, no members
+    grp = _mk_group(client, h, [], name="No Vis")   # empty group, no members
     url = BASE + f"/groups/{grp['id']}/materials/{vis}/files/texture_file"
     r = client.post(url, files={"file": ("dirt.png", io.BytesIO(b"png-bytes"), "image/png")},
                     headers=h)
-    assert r.status_code == 200, r.text
-    m = _member(r.json()["group"], "Visualiser")      # the member now exists
-    assert m["properties"]["texture_toggle"] is True
-    assert m["properties"]["texture_file"] == r.json()["value"]
-    assert m["properties"]["color_r"] is None         # born as texture, never colour
-
-    # A missing NON-Visualiser member is NOT auto-created -> still 404.
-    r = client.post(BASE + f"/groups/{grp['id']}/materials/{eb}/files/texture_file",
-                    files={"file": ("x.png", io.BytesIO(b"z"), "image/png")}, headers=h)
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_IN_GROUP"
-
-    # A bogus material type id -> 404 MATERIAL_TYPE_NOT_FOUND.
-    r = client.post(BASE + f"/groups/{grp['id']}/materials/99999/files/texture_file",
-                    files={"file": ("x.png", io.BytesIO(b"z"), "image/png")}, headers=h)
-    assert r.status_code == 404
-    assert r.json()["detail"]["code"] == "MATERIAL_TYPE_NOT_FOUND"
 
 
 def test_member_crud_one_by_one(client):

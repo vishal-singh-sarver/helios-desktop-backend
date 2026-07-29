@@ -301,7 +301,7 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
 
     try:
         ctx = helios_ctx.get_context(sctx)
-        from pyhelios.types import SphericalCoord, int2, vec2, vec3
+        from pyhelios.types import RGBcolor, SphericalCoord, int2, vec2, vec3
 
         center = vec3(props.get("position_x") or 0,
                       props.get("position_y") or 0,
@@ -323,6 +323,7 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
             # is painted afterward via the per-object material label.
             ctx_object_id = ctx.addTileObject(
                 center=center, size=size, rotation=rotation, subdiv=subdiv,
+                color=RGBcolor(*texture_path[:3]),
             )
         else:   # soil — an unstyled ground
             ctx_object_id = ctx.addTileObject(

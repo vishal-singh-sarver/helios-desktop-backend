@@ -105,6 +105,14 @@ _DATATYPE_SETTER = {
     "file": "setPrimitiveDataString",
 }
 
+# Enum properties Helios consumes as a numeric 0/1 flag, not a string. The
+# catalog models the heat-transfer flag as an enum (One Sided / Two Sided) for a
+# clean dropdown (migration 028), but the engine keeps its twosided-flag
+# convention — map the token back to a UInt on write.
+_ENUM_UINT_FLAGS = {
+    "two_sided_heat_transfer": {"One Sided": 0, "Two Sided": 1},
+}
+
 
 def resolve_texture_path(value: str | None) -> str | None:
     """Resolve a stored texture_file value to an absolute path.
@@ -233,6 +241,11 @@ def _apply_model_data(ctx, uuids: list[int], defs: dict, values: dict) -> None:
             continue
         value = values.get(name)
         if value is None:
+            continue
+        flag_map = _ENUM_UINT_FLAGS.get(name)
+        if flag_map is not None:
+            # Enum token stored/shown, but the engine wants the 0/1 flag.
+            ctx.setPrimitiveDataUInt(uuids, name, flag_map.get(str(value), 0))
             continue
         setter_name = _DATATYPE_SETTER.get(prop.datatype)
         if setter_name is None:

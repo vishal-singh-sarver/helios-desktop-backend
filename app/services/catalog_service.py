@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Datatype, MaterialType, ModelType, ObjectType
 from app.services.eav_validation import (
+    REQUIRED_MATERIAL_PROPERTIES,
     REQUIRED_OBJECT_PROPERTIES,
     load_type_properties,
 )
@@ -45,7 +46,7 @@ def list_object_types(db: Session) -> dict:
     return {"object_types": [_object_type_payload(db, ot) for ot in rows]}
 
 
-def _property_payload(p) -> dict:
+def _property_payload(p, required: set | frozenset = frozenset()) -> dict:
     return {
         "property_type_id": p.property_type_id,
         "property": p.property,
@@ -55,6 +56,7 @@ def _property_payload(p) -> dict:
         "min": p.min,
         "max": p.max,
         **({"enum_values": p.enum_values} if p.enum_values else {}),
+        "required": p.property in required,
         "display_order": p.display_order,
     }
 
@@ -74,6 +76,7 @@ def _material_type_payload(db: Session, mt: MaterialType) -> dict:
     unfiltered load_type_properties. Skipping non-editable members before a group
     is created means an all-hidden group never appears."""
     props = load_type_properties(db, material_type_id=mt.id)
+    required = REQUIRED_MATERIAL_PROPERTIES.get(mt.materialtype, frozenset())
     top_level: list[dict] = []
     groups: list[dict] = []
     by_name: dict[str, dict] = {}
@@ -81,7 +84,7 @@ def _material_type_payload(db: Session, mt: MaterialType) -> dict:
         if p.visibility != "editable":
             continue
         if p.group_name is None:
-            top_level.append(_property_payload(p))
+            top_level.append(_property_payload(p, required))
             continue
         group = by_name.get(p.group_name)
         if group is None:
@@ -94,7 +97,7 @@ def _material_type_payload(db: Session, mt: MaterialType) -> dict:
             }
             by_name[p.group_name] = group
             groups.append(group)
-        group["properties"].append(_property_payload(p))
+        group["properties"].append(_property_payload(p, required))
     return {
         "id": mt.id,
         "materialtype": mt.materialtype,

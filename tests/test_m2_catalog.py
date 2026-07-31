@@ -59,6 +59,25 @@ def test_material_types_seven_types_viz_on_visualiser_only(client):
             assert not (VIZ & names), mt["materialtype"]
         assert all("group" not in p for p in mt["properties"]), mt["materialtype"]
 
+
+def test_visualiser_colour_fields_are_required(client):
+    """The Visualiser's RGB channels and opacity are mandatory, so the catalog
+    flags them `required` for the form (the write path already enforces it via
+    visualiser_mode_required). Every other material property is optional."""
+    r = client.get("/api/catalog/material-types")
+    by_name = {mt["materialtype"]: mt for mt in r.json()["material_types"]}
+
+    vis = {p["property"]: p for p in by_name["Visualiser"]["properties"]}
+    assert {n for n, p in vis.items() if p["required"]} == {
+        "color_r", "color_g", "color_b", "opacity"}
+
+    # Every property carries the flag, and no other material type marks any.
+    for name, mt in by_name.items():
+        props = list(mt["properties"]) + [p for g in mt["groups"] for p in g["properties"]]
+        assert all("required" in p for p in props), name
+        if name != "Visualiser":
+            assert not any(p["required"] for p in props), name
+
     rad = {p["property"]: p for p in by_name["Radiation"]["properties"]}
     assert rad["surface_temperature"]["min"] == 223
     assert rad["surface_temperature"]["max"] == 5000

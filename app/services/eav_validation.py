@@ -69,6 +69,15 @@ VISUALISATION_PROPERTIES = {"color_r", "color_g", "color_b", "texture_file",
 VISUALISER_TEXTURE_FIELDS = {"texture_file"}
 VISUALISER_COLOUR_FIELDS = {"color_r", "color_g", "color_b", "opacity"}
 
+# Required material properties per material type — materials have no `required`
+# column, so this is the single source for the catalog response (mirroring
+# REQUIRED_OBJECT_PROPERTIES). The Visualiser's colour channels and opacity are
+# all mandatory: colour mode must be complete, and visualiser_mode_required()
+# already enforces that on every write.
+REQUIRED_MATERIAL_PROPERTIES = {
+    "Visualiser": VISUALISER_COLOUR_FIELDS,
+}
+
 
 def visualiser_mode_required(properties: dict) -> set[str]:
     """Required-by-mode rule for a Visualiser member on a FULL-REPLACEMENT write.

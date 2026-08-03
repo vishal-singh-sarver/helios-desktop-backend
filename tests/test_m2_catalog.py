@@ -108,7 +108,16 @@ def test_material_types_parameter_groups(client):
         "vcmax25", "jmax25", "tpu25", "rd25", "alpha", "theta",
         "dha_vcmax", "topt_vcmax", "dha_jmax", "topt_jmax", "dhd_jmax",
         "dha_tpu", "topt_tpu", "dhd_tpu"]
-    assert farq["properties"][0]["label"] == "V cmax25"
+    # Labels are Helios' own setter-argument names (migration 030); the property
+    # NAME is the storage key and is unchanged.
+    assert farq["properties"][0]["label"] == "Vcmax_25"
+    assert {p["property"]: p["label"] for p in farq["properties"]} == {
+        "vcmax25": "Vcmax_25", "dha_vcmax": "dHa_Vcmax", "topt_vcmax": "Topt_Vcmax",
+        "jmax25": "Jmax_25", "dha_jmax": "dHa_Jmax", "topt_jmax": "Topt_Jmax",
+        "dhd_jmax": "dHd_Jmax",
+        "tpu25": "TPU_25", "dha_tpu": "dHa_TPU", "topt_tpu": "Topt_TPU",
+        "dhd_tpu": "dHd_TPU",
+        "rd25": "Rd25", "alpha": "alpha", "theta": "theta"}
 
     # Stomatal Conductance: four mutually-exclusive selector-gated sub-models.
     stom = by_name["Stomatal Conductance"]

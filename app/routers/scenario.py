@@ -11,7 +11,12 @@ Each scenario owns a folder at data/<project_id>/<scenario_id>/ and (when
 populated) a weather.csv inside it. PyHelios state for a scenario lives
 in RAM only — in a ScenarioContext held by SessionRegistry.
 """
-from fastapi import APIRouter, Depends
+import asyncio
+import json
+import queue
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_session_id
@@ -56,3 +61,61 @@ async def delete_scenario(
 ):
     """Delete a scenario: DB row, in-memory context, and on-disk folder."""
     return scenario_service.delete_scenario(session_id, project_id, scenario_id, db)
+
+
+# ─── Context lifecycle ───────────────────────────────────────────────────────
+
+
+@router.get("/{project_id}/scenarios/{scenario_id}/init")
+async def init_scenario(
+    project_id: str,
+    scenario_id: str,
+    session_id: str = Query(..., description="session id (EventSource cannot set headers)"),
+    db: Session = Depends(get_db),
+):
+    """Create + hydrate this scenario's context, streaming progress as SSE.
+
+    NOTE: this is the ONE endpoint that takes session_id as a QUERY PARAM rather
+    than the `session-id` header every other route uses — the browser's
+    EventSource API cannot set request headers. Everything else, including
+    /discard below, keeps the header convention.
+
+    Emits {"stage", "progress", "message"} events and terminates on either
+    {"stage": "done"} or {"error": ...}. `done` means hydration finished, so
+    every other scenario-scoped endpoint is safe to call.
+    """
+    if not session_id or not session_id.strip():
+        raise HTTPException(400, "session_id is required")
+
+    progress_queue: queue.Queue = queue.Queue()
+
+    def _run():
+        scenario_service.init_scenario(
+            session_id, project_id, scenario_id, db, progress_queue.put)
+
+    async def _stream():
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _run)     # PyHelios is blocking — keep it off the loop
+        while True:
+            await asyncio.sleep(0.05)
+            while not progress_queue.empty():
+                event = progress_queue.get_nowait()
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("stage") == "done" or "error" in event:
+                    return
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+@router.post("/{project_id}/scenarios/{scenario_id}/discard")
+async def discard_scenario(
+    project_id: str,
+    scenario_id: str,
+    session_id: str = Depends(get_session_id),
+):
+    """Autosave this scenario's context, then release it from memory.
+
+    Call when the user switches away. Idempotent — discarding a scenario with no
+    live context succeeds with discarded=false.
+    """
+    return scenario_service.discard_scenario(session_id, project_id, scenario_id)

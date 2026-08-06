@@ -229,3 +229,70 @@ def delete_scenario(
     shutil.rmtree(_scenario_dir(project_id, scenario_id), ignore_errors=True)
 
     return {"success": True, "scenario_id": scenario_id}
+
+
+# ─── Context lifecycle (explicit init + discard) ─────────────────────────────
+#
+# Without these, a scenario's PyHelios context is created implicitly by whichever
+# request touches it first (_resolve_scenario above, or scene_object_service.
+# _sctx), which silently absorbs the whole loadXML + rebuild cost with no
+# progress, and is never released until the scenario or project is deleted.
+
+
+def init_scenario(session_id: str, project_id: str, scenario_id: str,
+                  db: Session, emit) -> None:
+    """Create + hydrate a scenario's context, reporting progress through `emit`.
+
+    Runs the work the lazy paths would otherwise do on a random request:
+    Context() + load_scenario_snapshot (via _resolve_scenario) and then
+    ensure_hydrated, which re-maps loaded objects and builds any that are
+    missing. Once this returns, `sctx.hydrated` is True and every other
+    scenario-scoped endpoint is safe to call.
+
+    Blocking (PyHelios is synchronous) — the router runs it off the event loop.
+    `emit(dict)` is called with progress events; exceptions are reported through
+    it as {"error": ...} rather than raised, so the stream always terminates.
+    """
+    from app.services import scene_object_service as sos   # avoid import cycle
+
+    try:
+        emit({"stage": "context", "progress": 0.1,
+              "message": "Loading scenario context"})
+        sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+
+        emit({"stage": "hydrate", "progress": 0.5,
+              "message": "Preparing geometry"})
+        sos.ensure_hydrated(db, sctx, scenario_id)
+
+        objects = len(sctx.persisted_objects) if sctx.persisted_objects else 0
+        emit({"stage": "done", "progress": 1.0, "objects": objects,
+              "message": "Scenario ready"})
+    except HTTPException as exc:
+        emit({"error": exc.detail, "status": exc.status_code})
+    except Exception as exc:   # noqa: BLE001 — the stream must always end
+        emit({"error": str(exc) or exc.__class__.__name__})
+
+
+def discard_scenario(session_id: str, project_id: str, scenario_id: str) -> dict:
+    """Autosave a scenario's context to context.xml, then drop it from memory.
+
+    Called when the user switches away. The registry lock is held across save +
+    remove so a concurrent _sctx/_resolve_scenario cannot re-create the context
+    half-way through the teardown. A scenario with no live context is a no-op
+    success — discard is idempotent and safe to call blindly on navigation.
+    """
+    from app.helios.persistence import trigger_scenario_autosave
+
+    with registry._scenario_lock:
+        sctx = registry.get_scenario_context(session_id, project_id, scenario_id)
+        if sctx is None:
+            return {"success": True, "scenario_id": scenario_id, "discarded": False}
+        saved = False
+        try:
+            trigger_scenario_autosave(sctx)
+            saved = True
+        except Exception:
+            pass    # never block the release on a save failure
+        registry.remove_scenario(session_id, project_id, scenario_id)
+    return {"success": True, "scenario_id": scenario_id,
+            "discarded": True, "saved": saved}

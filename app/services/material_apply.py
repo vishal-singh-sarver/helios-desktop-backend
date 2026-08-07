@@ -334,3 +334,25 @@ def invalidate_geometry_caches(sctx) -> None:
     sctx.geometry_cache = {}
     sctx.gpu_geometry_cache = {}
     sctx.gpu_children_cache = {}
+
+
+# ── Spectral global data ─────────────────────────────────────────────────────
+#
+# A spectral .xml holds <globaldata_vec2> entries that each become a context-wide
+# global-data spectrum keyed by a label. The UI parses those labels from the
+# file, so removal is driven by the labels the caller passes in. (Where/when the
+# file is LOADED into the context is a separate decision, not wired here.)
+
+
+def remove_spectral_labels(sctx, labels: list[str]) -> int:
+    """Remove the given global-data labels from the live context; return how many
+    existed. Labels come from the caller (the UI parsed them from the .xml) —
+    used both to delete labels and when a spectral file is deleted."""
+    if not helios_ctx.PYHELIOS_AVAILABLE or sctx.context is None:
+        return 0
+    ctx, removed = sctx.context, 0
+    for label in labels:
+        if ctx.doesGlobalDataExist(label):
+            ctx.clearGlobalData(label)
+            removed += 1
+    return removed

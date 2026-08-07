@@ -33,6 +33,7 @@ from app.schemas.material_library import (
     MaterialGroupCreateRequest,
     MaterialGroupPutRequest,
     MaterialGroupRenameRequest,
+    SpectralLabelsRequest,
 )
 from app.services import material_library_service as svc
 
@@ -175,13 +176,28 @@ async def upload_spectral(
     return await svc.upload_spectral_data(db, group_id, file)
 
 
+@router.delete(_BASE + "/groups/{group_id}/spectral/labels")
+def delete_spectral_labels(
+    group_id: int,
+    body: SpectralLabelsRequest,
+    scenario_id: Optional[str] = Query(default=None),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Remove spectral global-data labels from the active scenario's context."""
+    return svc.delete_spectral_labels(db, session_id, group_id, body.labels, scenario_id)
+
+
 @router.delete(_BASE + "/groups/{group_id}/files")
 def delete_file(
     group_id: int,
     path: str = Query(...),
+    scenario_id: Optional[str] = Query(default=None),
+    labels: Optional[list[str]] = Query(default=None),
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
     """Delete an uploaded file. 409 while any material or frozen per-geometry
-    snapshot still references it."""
-    return svc.delete_file(db, group_id, path)
+    snapshot still references it. For a spectral file, pass ?labels= to also clear
+    its global data from the active scenario."""
+    return svc.delete_file(db, group_id, path, session_id, scenario_id, labels)

@@ -44,3 +44,9 @@ class MaterialGroupRenameRequest(BaseModel):
     full-replacement member set, so renaming through it means resending every
     member or losing them.)"""
     name: str
+
+
+class SpectralLabelsRequest(BaseModel):
+    """Spectral global-data labels to remove from the active scenario's context.
+    The UI parses these from the spectral .xml at upload."""
+    labels: list[str] = Field(default_factory=list)

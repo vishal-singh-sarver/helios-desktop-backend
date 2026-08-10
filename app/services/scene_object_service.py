@@ -28,6 +28,7 @@ from __future__ import annotations
 import functools
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -72,6 +73,11 @@ from app.services.eav_validation import (
 )
 
 _GROUP_PREFIX = "Group"
+
+# context.xml saves run here instead of on the request thread (see _autosave).
+# ONE worker: saves for a scenario stay ordered, so a slower earlier write can
+# never land after — and overwrite — a newer one.
+_SAVE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autosave")
 
 # Object-data key stamped on every built object so hydration can re-map a loaded
 # compound object back to its DB scenario_object.id (objIDs/UUIDs are NOT
@@ -362,13 +368,23 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
     return uuids
 
 
-@_with_scenario_lock
 def _autosave(sctx) -> None:
-    """Persist the scenario's context (geometry + weather) to context.xml after
-    a geometry change. Locked so writeXML never serializes a context mid-mutation.
-    Best-effort — `trigger_scenario_autosave` no-ops when headless and
-    swallows/logs any writeXML failure (never fails the request)."""
-    trigger_scenario_autosave(sctx)
+    """QUEUE a context.xml save — the caller does NOT wait for it.
+
+    The response never reads context.xml (serialize_object builds from the DB +
+    session state), so blocking a mutation on the write was pure latency (~75%
+    of a create request). Geometry and materials survive in the DB, so a save
+    lost to a hard crash costs at most the newest archives/ entry.
+
+    The lock is taken INSIDE the queued work, not around the submit: held here
+    it would be released before the write ran, letting writeXML serialize a
+    context mid-mutation. Best-effort as before — trigger_scenario_autosave
+    no-ops when headless and swallows/logs any writeXML failure."""
+    def _run() -> None:
+        with session_registry._scenario_lock:
+            trigger_scenario_autosave(sctx)
+
+    _SAVE_POOL.submit(_run)
 
 
 def _rebuild(db: Session, sctx, so: ScenarioObject) -> None:

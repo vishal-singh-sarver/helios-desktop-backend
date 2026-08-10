@@ -60,9 +60,14 @@ def test_material_types_seven_types_viz_on_visualiser_only(client):
         assert all("group" not in p for p in mt["properties"]), mt["materialtype"]
 
     rad = {p["property"]: p for p in by_name["Radiation"]["properties"]}
-    assert rad["surface_temperature"]["min"] == 223
-    assert rad["surface_temperature"]["max"] == 5000
-    assert rad["reflectivity"]["max"] == 1
+    # Migration 031 supplies the Radiation visibility rows 029 missed, so the
+    # read-only popup can no longer render them either.
+    assert "surface_temperature" not in rad                       # computed
+    assert not ({"reflectivity", "transmissivity", "emissivity"} & set(rad))  # superseded
+    # Which spectrum inside the uploaded spectral file this material uses
+    # (migration 031). Free-form strings — the valid labels come from the file.
+    assert rad["reflectivity_spectrum"]["datatype"] == "string"
+    assert rad["transmissivity_spectrum"]["datatype"] == "string"
     # Heat-transfer flag is a two-option enum dropdown (migration 028), not a bool.
     assert rad["two_sided_heat_transfer"]["datatype"] == "enum"
     assert rad["two_sided_heat_transfer"]["enum_values"] == ["One Sided", "Two Sided"]

@@ -84,15 +84,36 @@ SELECT p.property, p.description,
        NULL, NULL
 FROM p;
 
--- Map both onto the Radiation material type.
+-- Map both onto the Radiation material type, inside a selector-gated group so
+-- the client knows they belong with the spectral file rather than the top-level
+-- settings grid. Same mechanism 027 used for the Stomatal Conductance
+-- sub-models: the client shows the group only when the selector matches, and
+-- omits its properties from the payload otherwise — no client-side rule about
+-- these property names. use_radiation_bands = false is the state where
+-- "Apply spectral data" is ON. selector_value is TEXT ('false', lowercase)
+-- because the catalog carries selector metadata as text.
 WITH m(prop, ord) AS (VALUES
     ('reflectivity_spectrum',   19),
     ('transmissivity_spectrum', 20)
 )
 INSERT OR IGNORE INTO material_property_type
-    (material_type_id, property_type_id, min_override, max_override, display_order)
+    (material_type_id, property_type_id, min_override, max_override, display_order,
+     group_name, selector_property, selector_value)
 SELECT (SELECT id FROM material_type WHERE materialtype = 'Radiation'),
-       pt.id, NULL, NULL, m.ord
+       pt.id, NULL, NULL, m.ord,
+       'Spectrum', 'use_radiation_bands', 'false'
 FROM m JOIN property_type pt ON pt.property = m.prop;
+
+-- The INSERT above is OR IGNORE, so it does nothing on a database that already
+-- ran an earlier version of this migration — the rows exist, but without the
+-- group columns. This UPDATE carries those databases forward; on a fresh one it
+-- simply rewrites what the INSERT just set.
+UPDATE material_property_type
+SET group_name        = 'Spectrum',
+    selector_property = 'use_radiation_bands',
+    selector_value    = 'false'
+WHERE material_type_id = (SELECT id FROM material_type WHERE materialtype = 'Radiation')
+  AND property_type_id IN (SELECT id FROM property_type WHERE property IN
+      ('reflectivity_spectrum', 'transmissivity_spectrum'));
 
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (31);

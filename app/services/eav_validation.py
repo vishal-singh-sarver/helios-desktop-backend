@@ -183,12 +183,18 @@ def member_property_values(defs: dict, values: dict) -> dict:
     by their selector (migration 027): a selector-gated property (e.g. bbl_gs0,
     whose selector is stomatal_model='BBL') is included only when the member's
     current selector value matches — so only the chosen sub-model's params are
-    returned, never the other sub-models'. Non-gated properties are unaffected."""
+    returned, never the other sub-models'. Non-gated properties are unaffected.
+
+    Compared as lowercase TEXT: selector_value is a catalog TEXT column while the
+    member's value is already decoded, so a BOOLEAN selector (migration 031's
+    use_radiation_bands) arrives as Python False and `False == 'false'` would
+    never match — hiding its properties in every mode. String selectors such as
+    stomatal_model are unaffected ('BBL' -> 'bbl' == 'bbl')."""
     return {
         name: values.get(name)
         for name, p in defs.items()
         if p.selector_property is None
-        or values.get(p.selector_property) == p.selector_value
+        or str(values.get(p.selector_property)).lower() == str(p.selector_value).lower()
     }
 
 

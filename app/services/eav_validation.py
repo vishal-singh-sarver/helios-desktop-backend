@@ -189,19 +189,12 @@ def member_property_values(defs: dict, values: dict) -> dict:
     member's value is already decoded, so a BOOLEAN selector (migration 031's
     use_radiation_bands) arrives as Python False and `False == 'false'` would
     never match — hiding its properties in every mode. String selectors such as
-    stomatal_model are unaffected ('BBL' -> 'bbl' == 'bbl').
-
-    An UNSTORED selector counts as False, not as a third state: a member that
-    never saved use_radiation_bands is in its default (spectral) mode, so its
-    spectrum labels must come back as null rather than disappear from the
-    response entirely. Without this `None` stringifies to 'none' and matches
-    neither branch. String selectors keep their behaviour — an unset
-    stomatal_model matched nothing before and still matches nothing."""
+    stomatal_model are unaffected ('BBL' -> 'bbl' == 'bbl')."""
     return {
         name: values.get(name)
         for name, p in defs.items()
         if p.selector_property is None
-        or str(values.get(p.selector_property) or False).lower() == str(p.selector_value).lower()
+        or str(values.get(p.selector_property)).lower() == str(p.selector_value).lower()
     }
 
 

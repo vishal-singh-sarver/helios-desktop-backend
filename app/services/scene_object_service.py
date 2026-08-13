@@ -336,10 +336,20 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
         ctx.setObjectDataUInt(ctx_object_id, _SO_ID_TAG, so.id)
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         so.helios_uuids = "[]"
         so.ctx_object_id = None
         db.commit()
+        # helios caps subdivisions at the ground texture's pixel resolution and
+        # raises. It is the one build failure a user can act on, so it gets the
+        # same 422 the in-place resolution path already returns — otherwise a
+        # rebuilt tiled ground would answer 500 where an in-place one answered
+        # 422. Matched on the engine's message: addTileObject raises the same
+        # error type for an unreadable texture file, which is NOT user-fixable.
+        if "resolution of the texture image" in str(exc):
+            raise api_error(422, "RESOLUTION_TOO_HIGH",
+                            "Ground resolution is too high for the ground texture. "
+                            "Lower the resolution and try again.")
         raise api_error(500, "BUILD_FAILED",
                         "Unable to create geometry. Please try again")
 
@@ -426,6 +436,18 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
 
     # texture-repeat or a non-decomposable key → recreate this object only.
     if (changed & _RECREATE_KEYS) or (changed - _INPLACE_KEYS - _RECREATE_KEYS):
+        _rebuild(db, sctx, so)
+        return
+
+    # A resolution change re-cuts the tile via setTileObjectSubdivisionCount,
+    # whose signature carries no texture_repeat — the engine regenerates every
+    # sub-patch's UVs from a template built WITHOUT it (Context.cpp
+    # regenerateTileObjectSubpatches), because Tile never stored the repeat in
+    # the first place. The tiling therefore collapses to 1x1 and the ground
+    # renders as one stretched image. addTileObject is the only call that takes
+    # the repeat, so a tiled ground has to go the rebuild route.
+    if (changed & _RESOLUTION_KEYS) and (int(new_vals.get("texture_x") or 1) > 1
+                                         or int(new_vals.get("texture_y") or 1) > 1):
         _rebuild(db, sctx, so)
         return
 

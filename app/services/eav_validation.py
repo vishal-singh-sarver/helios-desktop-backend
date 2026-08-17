@@ -69,15 +69,6 @@ VISUALISATION_PROPERTIES = {"color_r", "color_g", "color_b", "texture_file",
 VISUALISER_TEXTURE_FIELDS = {"texture_file"}
 VISUALISER_COLOUR_FIELDS = {"color_r", "color_g", "color_b", "opacity"}
 
-# Returned in BOTH radiation modes even though migration 031 puts them in a group
-# gated on use_radiation_bands='false'. The group stays — the Radiation form finds
-# these two fields BY that selector and draws them under the spectral file — but
-# the VALUES must not be withheld: the form renders both dropdowns in either mode,
-# and the write path is ungated (load_type_properties is unfiltered), so a label
-# saved in per-band mode really is stored. Gating the read alone made a saved
-# value unreadable, which is worse than never accepting it.
-ALWAYS_RETURNED_PROPERTIES = {"reflectivity_spectrum", "transmissivity_spectrum"}
-
 
 def visualiser_mode_required(properties: dict) -> set[str]:
     """Required-by-mode rule for a Visualiser member on a FULL-REPLACEMENT write.
@@ -200,13 +191,24 @@ def member_property_values(defs: dict, values: dict) -> dict:
     never match — hiding its properties in every mode. String selectors such as
     stomatal_model are unaffected ('BBL' -> 'bbl' == 'bbl').
 
-    ALWAYS_RETURNED_PROPERTIES escape the gate entirely — see that constant. The
-    stomatal sub-models are untouched: only the chosen model's params come back."""
+    Only a CONTESTED selector excludes — one that several groups compete for.
+    That is the case the gate was written for: stomatal_model carries four
+    sub-models, and returning them all would return three the member never chose.
+    Radiation's Spectrum group is alone on use_radiation_bands (migration 031),
+    so there is no rival to return in its place — withholding it would only hide
+    values the member really holds, since the write path is ungated
+    (load_type_properties is unfiltered) and a label saved in either mode IS
+    stored. A saved value you cannot read back is worse than one never accepted."""
+    groups_by_selector: dict[str, set] = {}
+    for p in defs.values():
+        if p.selector_property:
+            groups_by_selector.setdefault(p.selector_property, set()).add(p.group_name)
+    contested = {sel for sel, groups in groups_by_selector.items() if len(groups) > 1}
+
     return {
         name: values.get(name)
         for name, p in defs.items()
-        if p.selector_property is None
-        or name in ALWAYS_RETURNED_PROPERTIES
+        if p.selector_property not in contested
         or str(values.get(p.selector_property)).lower() == str(p.selector_value).lower()
     }
 

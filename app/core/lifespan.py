@@ -131,14 +131,5 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown — clean up resources
-    # Drain queued context.xml saves (scene_object_service._autosave runs them
-    # off the request thread); without this the last edit before close is lost.
-    # The pool has ONE worker and a FIFO queue, so waiting on a no-op submitted
-    # now means everything queued before it has run. Deliberately NOT
-    # shutdown() — that kills the module-level pool permanently, so a second
-    # app instance in the same process (as the tests do) could never save again.
-    from app.services.scene_object_service import _SAVE_POOL
-    _SAVE_POOL.submit(lambda: None).result(timeout=15)
-
     # from app.helios.context import shutdown_pyhelios
     # shutdown_pyhelios()

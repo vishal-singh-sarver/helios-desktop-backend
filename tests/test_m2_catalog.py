@@ -60,9 +60,13 @@ def test_material_types_seven_types_viz_on_visualiser_only(client):
         assert all("group" not in p for p in mt["properties"]), mt["materialtype"]
 
     rad = {p["property"]: p for p in by_name["Radiation"]["properties"]}
-    assert rad["surface_temperature"]["min"] == 223
-    assert rad["surface_temperature"]["max"] == 5000
-    assert rad["reflectivity"]["max"] == 1
+    # Migration 031 supplies the Radiation visibility rows 029 missed, so the
+    # read-only popup can no longer render them either.
+    assert "surface_temperature" not in rad                       # computed
+    assert not ({"reflectivity", "transmissivity", "emissivity"} & set(rad))  # superseded
+    # The spectrum labels are NOT top-level — they live in the gated "Spectrum"
+    # group (migration 031), asserted in test_material_types_parameter_groups.
+    assert not ({"reflectivity_spectrum", "transmissivity_spectrum"} & set(rad))
     # Heat-transfer flag is a two-option enum dropdown (migration 028), not a bool.
     assert rad["two_sided_heat_transfer"]["datatype"] == "enum"
     assert rad["two_sided_heat_transfer"]["enum_values"] == ["One Sided", "Two Sided"]
@@ -138,8 +142,21 @@ def test_material_types_parameter_groups(client):
         "bbl_gs0": "gs, o", "bbl_a1": "a1", "bbl_d0": "Do"}
     assert sgroups["Ball-woodrow-berry"]["properties"][0]["label"] == "gs, o"
 
+    # Radiation: the spectrum labels sit in a group gated on use_radiation_bands
+    # (migration 031), so the client shows them only when "Apply spectral data"
+    # is on and omits them from the payload in manual mode. The selector is a
+    # BOOLEAN, carried as the text 'false' — unlike stomatal_model's enum.
+    rgroups = {g["name"]: g for g in by_name["Radiation"]["groups"]}
+    assert set(rgroups) == {"Spectrum"}
+    spectrum = rgroups["Spectrum"]
+    assert spectrum["selector_property"] == "use_radiation_bands"
+    assert spectrum["selector_value"] == "false"
+    assert [p["property"] for p in spectrum["properties"]] == [
+        "reflectivity_spectrum", "transmissivity_spectrum"]
+    assert all(p["datatype"] == "string" for p in spectrum["properties"])
+
     # A material type with no sub-groups reports an empty list.
-    assert by_name["Radiation"]["groups"] == []
+    assert by_name["Energy Balance"]["groups"] == []
 
 
 def test_model_types_hierarchy(client):

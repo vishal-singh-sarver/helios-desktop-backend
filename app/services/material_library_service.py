@@ -23,6 +23,7 @@ material_group_id (never the name), so there is nothing to reconcile.
 """
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -683,6 +684,49 @@ async def upload_spectral_data(db: Session, group_id: int, file) -> dict:
     (which enforces .xml and stores the file) and returns just the stored path."""
     out = await upload_file_property(db, group_id, "spectral_data", file)
     return {"success": True, "path": out["path"]}
+
+
+def spectral_labels(db: Session, group_id: int, path: str) -> dict:
+    """The labels of the spectra held in a stored spectral file.
+
+    One spectral file holds MANY spectra, each a <globaldata_vec2 label="…">
+    block; the Radiation material names the two it wants in
+    reflectivity_spectrum / transmissivity_spectrum (migration 031). Reading them
+    back is what lets the client offer pickers instead of free-text boxes — and a
+    mistyped label does not fail loudly: RadiationModel warns and falls back to a
+    reflectivity of 0 (RadiationModel.cpp:2326), silently blackening the surface
+    for the whole simulation.
+
+    DIRECT children of <helios> only — exactly what the engine reads
+    (Context::scanXMLForTag walks helios.child(tag)/next_sibling(tag),
+    Context_fileIO.cpp:2653). A label found at any deeper nesting is one the
+    engine could not resolve, so offering it would recreate the same silent
+    failure this endpoint exists to prevent.
+
+    Path handling matches delete_file: .resolve() collapses ../ AND follows
+    symlinks before the comparison, so a traversal, an absolute path, another
+    group's folder, and a symlink planted inside this one all land outside
+    `base` and are refused."""
+    grp = _group_or_404(db, group_id)
+    base = (settings.data_dir / "uploads" / "groups" / str(grp.id)).resolve()
+    target = (settings.data_dir / path).resolve()
+    if target.parent != base:
+        raise api_error(400, "INVALID_PATH", "Path is not in this group's uploads")
+    if not target.is_file():
+        raise api_error(404, "FILE_NOT_FOUND", "File not found")
+
+    # One ParseError covers every bad file: a ZIP or binary renamed .xml, an
+    # empty file, and hostile XML — expat refuses external entities (XXE) and
+    # entity amplification (billion laughs) on its own, so nothing else is needed.
+    try:
+        root = ET.parse(target).getroot()
+    except ET.ParseError:
+        root = None
+    if root is None or root.tag != "helios":
+        raise api_error(400, "INVALID_FILE_FORMAT", "File is not a valid spectral data file")
+
+    return {"labels": [label for el in root.findall("globaldata_vec2")
+                       if (label := el.get("label"))]}
 
 
 def delete_file(db: Session, group_id: int, path: str,

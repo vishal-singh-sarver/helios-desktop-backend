@@ -176,6 +176,19 @@ async def upload_spectral(
     return await svc.upload_spectral_data(db, group_id, file)
 
 
+@router.get(_BASE + "/groups/{group_id}/spectral/labels")
+def spectral_labels(
+    group_id: int,
+    path: str = Query(...),
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """The spectrum labels inside a stored spectral file, so the client can offer
+    reflectivity_spectrum / transmissivity_spectrum as pickers rather than
+    free-text. `path` is the value the upload returned."""
+    return svc.spectral_labels(db, group_id, path)
+
+
 @router.delete(_BASE + "/groups/{group_id}/spectral/labels")
 def delete_spectral_labels(
     group_id: int,

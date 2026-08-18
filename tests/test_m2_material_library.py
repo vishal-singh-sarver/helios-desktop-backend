@@ -441,6 +441,77 @@ def test_spectral_upload_returns_path(client):
     assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
 
 
+def test_spectral_labels_read_back(client):
+    """The labels inside a stored spectral file are readable, so the client can
+    offer reflectivity_spectrum / transmissivity_spectrum as pickers instead of
+    free text (a mistyped label does not fail — the engine falls back to a
+    reflectivity of 0)."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    grp = _mk_group(client, h, [], name="Spectra")
+    up_url = BASE + f"/groups/{grp['id']}/spectral"
+    url = BASE + f"/groups/{grp['id']}/spectral/labels"
+
+    xml = (b"<helios>\n"
+           b'  <globaldata_vec2 label="leaf_reflectivity">400 0.1</globaldata_vec2>\n'
+           b'  <globaldata_vec2 label="leaf_transmissivity">400 0.2</globaldata_vec2>\n'
+           b"</helios>")
+    path = client.post(up_url, files={"file": ("leaf.xml", io.BytesIO(xml), "application/xml")},
+                       headers=h).json()["path"]
+
+    r = client.get(url, params={"path": path}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"labels": ["leaf_reflectivity", "leaf_transmissivity"]}
+
+    # Only DIRECT children of <helios> count — that is all the engine reads
+    # (Context::scanXMLForTag), so a nested label would be one it cannot resolve.
+    # An unlabelled block contributes nothing rather than a null entry.
+    nested = (b"<helios>\n"
+              b'  <globaldata_vec2 label="top">400 0.1</globaldata_vec2>\n'
+              b"  <globaldata_vec2>400 0.3</globaldata_vec2>\n"
+              b'  <wrapper><globaldata_vec2 label="buried">400 0.2</globaldata_vec2></wrapper>\n'
+              b"</helios>")
+    p2 = client.post(up_url, files={"file": ("nested.xml", io.BytesIO(nested), "application/xml")},
+                     headers=h).json()["path"]
+    assert client.get(url, params={"path": p2}, headers=h).json() == {"labels": ["top"]}
+
+    # A file with no spectra is legal and simply has nothing to offer.
+    p3 = client.post(up_url, files={"file": ("bare.xml", io.BytesIO(b"<helios></helios>"),
+                                             "application/xml")}, headers=h).json()["path"]
+    assert client.get(url, params={"path": p3}, headers=h).json() == {"labels": []}
+
+    # Anything unparseable -> 400: a ZIP renamed .xml, an empty file, and
+    # well-formed XML that is not a Helios document all land here.
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("a.txt", "hello")
+    for name, content in (("zip.xml", buf.getvalue()),
+                          ("empty.xml", b""),
+                          ("other.xml", b"<nothelios><globaldata_vec2 label='x'/></nothelios>")):
+        bad = client.post(up_url, files={"file": (name, io.BytesIO(content), "application/xml")},
+                          headers=h).json()["path"]
+        r = client.get(url, params={"path": bad}, headers=h)
+        assert r.status_code == 400, f"{name}: {r.text}"
+        assert r.json()["detail"]["code"] == "INVALID_FILE_FORMAT"
+
+    # Missing file -> 404; outside this group's folder -> 400.
+    r = client.get(url, params={"path": f"uploads/groups/{grp['id']}/nope.xml"}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "FILE_NOT_FOUND"
+    r = client.get(url, params={"path": "uploads/groups/99999/x.xml"}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_PATH"
+    r = client.get(url, params={"path": "../../../../etc/passwd"}, headers=h)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "INVALID_PATH"
+
+    # Unknown group -> 404.
+    r = client.get(BASE + "/groups/99999/spectral/labels", params={"path": path}, headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NOT_FOUND"
+
+
 def test_member_crud_one_by_one(client):
     """Granular member management: start EMPTY, add types one at a time, patch
     one standalone, remove one — the group may end (and stay) empty."""

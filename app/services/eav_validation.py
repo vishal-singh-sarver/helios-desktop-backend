@@ -183,12 +183,33 @@ def member_property_values(defs: dict, values: dict) -> dict:
     by their selector (migration 027): a selector-gated property (e.g. bbl_gs0,
     whose selector is stomatal_model='BBL') is included only when the member's
     current selector value matches — so only the chosen sub-model's params are
-    returned, never the other sub-models'. Non-gated properties are unaffected."""
+    returned, never the other sub-models'. Non-gated properties are unaffected.
+
+    Compared as lowercase TEXT: selector_value is a catalog TEXT column while the
+    member's value is already decoded, so a BOOLEAN selector (migration 031's
+    use_radiation_bands) arrives as Python False and `False == 'false'` would
+    never match — hiding its properties in every mode. String selectors such as
+    stomatal_model are unaffected ('BBL' -> 'bbl' == 'bbl').
+
+    Only a CONTESTED selector excludes — one that several groups compete for.
+    That is the case the gate was written for: stomatal_model carries four
+    sub-models, and returning them all would return three the member never chose.
+    Radiation's Spectrum group is alone on use_radiation_bands (migration 031),
+    so there is no rival to return in its place — withholding it would only hide
+    values the member really holds, since the write path is ungated
+    (load_type_properties is unfiltered) and a label saved in either mode IS
+    stored. A saved value you cannot read back is worse than one never accepted."""
+    groups_by_selector: dict[str, set] = {}
+    for p in defs.values():
+        if p.selector_property:
+            groups_by_selector.setdefault(p.selector_property, set()).add(p.group_name)
+    contested = {sel for sel, groups in groups_by_selector.items() if len(groups) > 1}
+
     return {
         name: values.get(name)
         for name, p in defs.items()
-        if p.selector_property is None
-        or values.get(p.selector_property) == p.selector_value
+        if p.selector_property not in contested
+        or str(values.get(p.selector_property)).lower() == str(p.selector_value).lower()
     }
 
 

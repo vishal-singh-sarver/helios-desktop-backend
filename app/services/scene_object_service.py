@@ -272,30 +272,39 @@ def _surface_signature(surface: tuple[str, str | None]) -> str:
 
 
 @_with_scenario_lock
-def _teardown(sctx, so: ScenarioObject) -> None:
-    """Remove the compound object (and its primitives) + runtime entries from
-    the live context. ctx_object_id on the DB row is cleared (best-effort
-    session cache; never trusted without a persisted_objects membership check)."""
-    ctx_object_id = sctx.ctx_objects.pop(so.id, None)
-    obj_id = sctx.persisted_objects.pop(so.id, None)
+def _drop_live_object(sctx, ctx_object_id: int | None, obj_id: int | None,
+                      uuids: list[int]) -> None:
+    """Delete ONE live compound object (and its primitives) from the context.
+
+    Takes the ids explicitly rather than reading them off the DB row, because
+    _rebuild builds the replacement BEFORE dropping the original — by then the
+    row points at the new object and only the caller still knows the old ids."""
     if obj_id is not None and obj_id in sctx.registry:
         reg.delete_object(sctx, obj_id)
     if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is not None:
         try:
             if ctx_object_id is not None and sctx.context.doesObjectExist(ctx_object_id):
                 sctx.context.deleteObject(ctx_object_id)
-            else:
-                uuids = json.loads(so.helios_uuids or "[]")
-                if uuids:
-                    sctx.context.deletePrimitive(uuids)
+            elif uuids:
+                sctx.context.deletePrimitive(uuids)
         except Exception:
             pass    # object/primitives may already be gone (fresh context)
-    so.ctx_object_id = None
     material_apply.invalidate_geometry_caches(sctx)
 
 
 @_with_scenario_lock
-def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
+def _teardown(sctx, so: ScenarioObject) -> None:
+    """Remove the compound object (and its primitives) + runtime entries from
+    the live context. ctx_object_id on the DB row is cleared (best-effort
+    session cache; never trusted without a persisted_objects membership check)."""
+    ctx_object_id = sctx.ctx_objects.pop(so.id, None)
+    obj_id = sctx.persisted_objects.pop(so.id, None)
+    _drop_live_object(sctx, ctx_object_id, obj_id, json.loads(so.helios_uuids or "[]"))
+    so.ctx_object_id = None
+
+
+@_with_scenario_lock
+def _build(db: Session, sctx, so: ScenarioObject, *, autosave: bool = True) -> list[int]:
     """Build the ground as a TileObject from its intrinsic properties, capture
     the compound-object id, persist the primitive UUIDs, then apply materials.
 
@@ -355,10 +364,20 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
         ctx.setObjectDataUInt(ctx_object_id, _SO_ID_TAG, so.id)
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         so.helios_uuids = "[]"
         so.ctx_object_id = None
         db.commit()
+        # helios caps subdivisions at the ground texture's pixel resolution and
+        # raises. It is the one build failure a user can act on, so it gets the
+        # same 422 the in-place resolution path already returns — otherwise a
+        # rebuilt tiled ground would answer 500 where an in-place one answered
+        # 422. Matched on the engine's message: addTileObject raises the same
+        # error type for an unreadable texture file, which is NOT user-fixable.
+        if "resolution of the texture image" in str(exc):
+            raise api_error(422, "RESOLUTION_TOO_HIGH",
+                            "Ground resolution is too high for the ground texture. "
+                            "Lower the resolution and try again.")
         raise api_error(500, "BUILD_FAILED",
                         "Unable to create geometry. Please try again")
 
@@ -377,7 +396,12 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
     db.commit()
 
     material_apply.reapply_all_materials(db, sctx, so)
-    _autosave(sctx)
+    # autosave=False only from _rebuild, which still has the object being
+    # REPLACED alive at this point: writeXML mishandles that overlap (measured —
+    # with the old and new tile both present it emits only the old one), so the
+    # save has to wait until the old object is gone. _rebuild does it.
+    if autosave:
+        _autosave(sctx)
     return uuids
 
 
@@ -400,9 +424,41 @@ def _autosave(sctx) -> None:
     _SAVE_POOL.submit(_run)
 
 
+@_with_scenario_lock
 def _rebuild(db: Session, sctx, so: ScenarioObject) -> None:
-    _teardown(sctx, so)
-    _build(db, sctx, so)
+    """Replace this object's live geometry, BUILDING the replacement before
+    dropping the original.
+
+    Tearing down first meant a build that raised left nothing behind: the object
+    was gone from the context and from persisted_objects, so every later edit and
+    every material write silently no-opped (they all guard on membership) and the
+    next autosave wrote a context.xml without it. That is reachable — the engine
+    refuses a subdivision above the ground texture's pixel resolution, so a
+    rejected resolution or texture-repeat edit destroyed the ground it rejected.
+
+    Build-then-drop is what the engine itself does when it regenerates a tile
+    (Context.cpp builds the template at :1605 and only deletes the old primitives
+    at :1659), which is why the in-place path could fail harmlessly."""
+    old_ctx_id = sctx.ctx_objects.get(so.id)
+    old_obj_id = sctx.persisted_objects.get(so.id)
+    old_uuids = so.helios_uuids
+
+    try:
+        _build(db, sctx, so, autosave=False)
+    except HTTPException:
+        # The original is untouched — point the row and the session maps back at
+        # it so the caller's error leaves the scene exactly as it found it.
+        if old_ctx_id is not None:
+            sctx.ctx_objects[so.id] = old_ctx_id
+        if old_obj_id is not None:
+            sctx.persisted_objects[so.id] = old_obj_id
+        so.helios_uuids = old_uuids
+        so.ctx_object_id = old_ctx_id
+        db.commit()
+        raise
+
+    _drop_live_object(sctx, old_ctx_id, old_obj_id, json.loads(old_uuids or "[]"))
+    _autosave(sctx)   # once, with only the replacement left in the context
 
 
 @_with_scenario_lock
@@ -455,6 +511,18 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
 
     # texture-repeat or a non-decomposable key → recreate this object only.
     if (changed & _RECREATE_KEYS) or (changed - _INPLACE_KEYS - _RECREATE_KEYS):
+        _rebuild(db, sctx, so)
+        return
+
+    # A resolution change re-cuts the tile via setTileObjectSubdivisionCount,
+    # whose signature carries no texture_repeat — the engine regenerates every
+    # sub-patch's UVs from a template built WITHOUT it (Context.cpp
+    # regenerateTileObjectSubpatches), because Tile never stored the repeat in
+    # the first place. The tiling therefore collapses to 1x1 and the ground
+    # renders as one stretched image. addTileObject is the only call that takes
+    # the repeat, so a tiled ground has to go the rebuild route.
+    if (changed & _RESOLUTION_KEYS) and (int(new_vals.get("texture_x") or 1) > 1
+                                         or int(new_vals.get("texture_y") or 1) > 1):
         _rebuild(db, sctx, so)
         return
 

@@ -28,6 +28,8 @@ from __future__ import annotations
 import functools
 import json
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -72,6 +74,23 @@ from app.services.eav_validation import (
 )
 
 _GROUP_PREFIX = "Group"
+
+# context.xml saves run here instead of on the request thread (see _autosave).
+# ONE worker: saves for a scenario stay ordered, so a slower earlier write can
+# never land after — and overwrite — a newer one.
+_SAVE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autosave")
+
+# Newest-wins guard for overlapping updates to ONE object: the latest ticket
+# handed out per scenario_object.id. The client disables Save while a request is
+# in flight, but update_object is a sync def and so runs in a threadpool — a
+# retry or a second client can still overlap, and the loser would otherwise
+# write its older values over the winner's. Keyed by object id alone: that is an
+# autoincrement primary key, unique across every scenario. Per-object and NOT
+# per-scenario on purpose — two edits of one object each carry the full property
+# set (saga.ts sends the whole form), so dropping the older one loses nothing,
+# whereas edits to two different objects share nothing and must both apply.
+_UPDATE_SEQ: dict[int, int] = {}
+_UPDATE_SEQ_LOCK = threading.Lock()
 
 # Object-data key stamped on every built object so hydration can re-map a loaded
 # compound object back to its DB scenario_object.id (objIDs/UUIDs are NOT
@@ -253,30 +272,39 @@ def _surface_signature(surface: tuple[str, str | None]) -> str:
 
 
 @_with_scenario_lock
-def _teardown(sctx, so: ScenarioObject) -> None:
-    """Remove the compound object (and its primitives) + runtime entries from
-    the live context. ctx_object_id on the DB row is cleared (best-effort
-    session cache; never trusted without a persisted_objects membership check)."""
-    ctx_object_id = sctx.ctx_objects.pop(so.id, None)
-    obj_id = sctx.persisted_objects.pop(so.id, None)
+def _drop_live_object(sctx, ctx_object_id: int | None, obj_id: int | None,
+                      uuids: list[int]) -> None:
+    """Delete ONE live compound object (and its primitives) from the context.
+
+    Takes the ids explicitly rather than reading them off the DB row, because
+    _rebuild builds the replacement BEFORE dropping the original — by then the
+    row points at the new object and only the caller still knows the old ids."""
     if obj_id is not None and obj_id in sctx.registry:
         reg.delete_object(sctx, obj_id)
     if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is not None:
         try:
             if ctx_object_id is not None and sctx.context.doesObjectExist(ctx_object_id):
                 sctx.context.deleteObject(ctx_object_id)
-            else:
-                uuids = json.loads(so.helios_uuids or "[]")
-                if uuids:
-                    sctx.context.deletePrimitive(uuids)
+            elif uuids:
+                sctx.context.deletePrimitive(uuids)
         except Exception:
             pass    # object/primitives may already be gone (fresh context)
-    so.ctx_object_id = None
     material_apply.invalidate_geometry_caches(sctx)
 
 
 @_with_scenario_lock
-def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
+def _teardown(sctx, so: ScenarioObject) -> None:
+    """Remove the compound object (and its primitives) + runtime entries from
+    the live context. ctx_object_id on the DB row is cleared (best-effort
+    session cache; never trusted without a persisted_objects membership check)."""
+    ctx_object_id = sctx.ctx_objects.pop(so.id, None)
+    obj_id = sctx.persisted_objects.pop(so.id, None)
+    _drop_live_object(sctx, ctx_object_id, obj_id, json.loads(so.helios_uuids or "[]"))
+    so.ctx_object_id = None
+
+
+@_with_scenario_lock
+def _build(db: Session, sctx, so: ScenarioObject, *, autosave: bool = True) -> list[int]:
     """Build the ground as a TileObject from its intrinsic properties, capture
     the compound-object id, persist the primitive UUIDs, then apply materials.
 
@@ -336,10 +364,20 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
         ctx.setObjectDataUInt(ctx_object_id, _SO_ID_TAG, so.id)
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         so.helios_uuids = "[]"
         so.ctx_object_id = None
         db.commit()
+        # helios caps subdivisions at the ground texture's pixel resolution and
+        # raises. It is the one build failure a user can act on, so it gets the
+        # same 422 the in-place resolution path already returns — otherwise a
+        # rebuilt tiled ground would answer 500 where an in-place one answered
+        # 422. Matched on the engine's message: addTileObject raises the same
+        # error type for an unreadable texture file, which is NOT user-fixable.
+        if "resolution of the texture image" in str(exc):
+            raise api_error(422, "RESOLUTION_TOO_HIGH",
+                            "Ground resolution is too high for the ground texture. "
+                            "Lower the resolution and try again.")
         raise api_error(500, "BUILD_FAILED",
                         "Unable to create geometry. Please try again")
 
@@ -358,22 +396,69 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
     db.commit()
 
     material_apply.reapply_all_materials(db, sctx, so)
-    _autosave(sctx)
+    # autosave=False only from _rebuild, which still has the object being
+    # REPLACED alive at this point: writeXML mishandles that overlap (measured —
+    # with the old and new tile both present it emits only the old one), so the
+    # save has to wait until the old object is gone. _rebuild does it.
+    if autosave:
+        _autosave(sctx)
     return uuids
 
 
-@_with_scenario_lock
 def _autosave(sctx) -> None:
-    """Persist the scenario's context (geometry + weather) to context.xml after
-    a geometry change. Locked so writeXML never serializes a context mid-mutation.
-    Best-effort — `trigger_scenario_autosave` no-ops when headless and
-    swallows/logs any writeXML failure (never fails the request)."""
-    trigger_scenario_autosave(sctx)
+    """QUEUE a context.xml save — the caller does NOT wait for it.
+
+    The response never reads context.xml (serialize_object builds from the DB +
+    session state), so blocking a mutation on the write was pure latency (~75%
+    of a create request). Geometry and materials survive in the DB, so a save
+    lost to a hard crash costs at most the newest archives/ entry.
+
+    The lock is taken INSIDE the queued work, not around the submit: held here
+    it would be released before the write ran, letting writeXML serialize a
+    context mid-mutation. Best-effort as before — trigger_scenario_autosave
+    no-ops when headless and swallows/logs any writeXML failure."""
+    def _run() -> None:
+        with session_registry._scenario_lock:
+            trigger_scenario_autosave(sctx)
+
+    _SAVE_POOL.submit(_run)
 
 
+@_with_scenario_lock
 def _rebuild(db: Session, sctx, so: ScenarioObject) -> None:
-    _teardown(sctx, so)
-    _build(db, sctx, so)
+    """Replace this object's live geometry, BUILDING the replacement before
+    dropping the original.
+
+    Tearing down first meant a build that raised left nothing behind: the object
+    was gone from the context and from persisted_objects, so every later edit and
+    every material write silently no-opped (they all guard on membership) and the
+    next autosave wrote a context.xml without it. That is reachable — the engine
+    refuses a subdivision above the ground texture's pixel resolution, so a
+    rejected resolution or texture-repeat edit destroyed the ground it rejected.
+
+    Build-then-drop is what the engine itself does when it regenerates a tile
+    (Context.cpp builds the template at :1605 and only deletes the old primitives
+    at :1659), which is why the in-place path could fail harmlessly."""
+    old_ctx_id = sctx.ctx_objects.get(so.id)
+    old_obj_id = sctx.persisted_objects.get(so.id)
+    old_uuids = so.helios_uuids
+
+    try:
+        _build(db, sctx, so, autosave=False)
+    except HTTPException:
+        # The original is untouched — point the row and the session maps back at
+        # it so the caller's error leaves the scene exactly as it found it.
+        if old_ctx_id is not None:
+            sctx.ctx_objects[so.id] = old_ctx_id
+        if old_obj_id is not None:
+            sctx.persisted_objects[so.id] = old_obj_id
+        so.helios_uuids = old_uuids
+        so.ctx_object_id = old_ctx_id
+        db.commit()
+        raise
+
+    _drop_live_object(sctx, old_ctx_id, old_obj_id, json.loads(old_uuids or "[]"))
+    _autosave(sctx)   # once, with only the replacement left in the context
 
 
 @_with_scenario_lock
@@ -426,6 +511,18 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
 
     # texture-repeat or a non-decomposable key → recreate this object only.
     if (changed & _RECREATE_KEYS) or (changed - _INPLACE_KEYS - _RECREATE_KEYS):
+        _rebuild(db, sctx, so)
+        return
+
+    # A resolution change re-cuts the tile via setTileObjectSubdivisionCount,
+    # whose signature carries no texture_repeat — the engine regenerates every
+    # sub-patch's UVs from a template built WITHOUT it (Context.cpp
+    # regenerateTileObjectSubpatches), because Tile never stored the repeat in
+    # the first place. The tiling therefore collapses to 1x1 and the ground
+    # renders as one stretched image. addTileObject is the only call that takes
+    # the repeat, so a tiled ground has to go the rebuild route.
+    if (changed & _RESOLUTION_KEYS) and (int(new_vals.get("texture_x") or 1) > 1
+                                         or int(new_vals.get("texture_y") or 1) > 1):
         _rebuild(db, sctx, so)
         return
 
@@ -962,10 +1059,24 @@ def get_object(db: Session, session_id: str, project_id: str,
 
 def update_object(db: Session, session_id: str, project_id: str,
                   scenario_id: str, object_id: int, body) -> dict:
+    with _UPDATE_SEQ_LOCK:
+        seq = _UPDATE_SEQ[object_id] = _UPDATE_SEQ.get(object_id, 0) + 1
+
     _resolve_scope(db, session_id, project_id, scenario_id)
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
+
+    # A newer update for this object arrived while we were getting here, and it
+    # carries the same full property set — so this one is already obsolete.
+    # Checked BEFORE the write, not before the rebuild: a superseded request
+    # that had already written would put its older values over the newer ones,
+    # which is the very thing this guards against. Returns the object as it
+    # stands; the newer request applies what the caller asked for.
+    with _UPDATE_SEQ_LOCK:
+        superseded = _UPDATE_SEQ.get(object_id) != seq
+    if superseded:
+        return {"success": True, "object": serialize_object(db, sctx, so)}
 
     intrinsic_change = None
     if body.properties:

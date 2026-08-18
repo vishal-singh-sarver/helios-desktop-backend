@@ -1112,3 +1112,93 @@ def test_colour_mode_escapes_resolution_cap(client):
     r = client.patch(f"{url}/{colour['id']}", json=high, headers=h)
     assert r.status_code == 200, r.text
     assert r.json()["object"]["properties"]["resolution_x"] == 1000
+
+
+def _texture_repeat(pid, sid, session_id, object_id, subdiv):
+    """The tiling actually baked into the live tile, read back from the UVs.
+
+    Nothing stores the repeat — Tile keeps subdiv and the texture file, and
+    texture_repeat is only ever an argument to addTileObject — so it has to be
+    derived: a texture repeating R times across N sub-patches gives each patch
+    R/N of the image, hence repeat = per-patch u-span * subdiv.
+    """
+    from app.core.session_store import registry
+
+    sctx = registry.get_scenario_context(session_id, pid, sid)
+    ctx = sctx.context
+    ctx_object_id = sctx.ctx_objects[object_id]
+    uuids = list(ctx.getObjectPrimitiveUUIDs(ctx_object_id))
+    uv = ctx.getPrimitiveTextureUV(uuids[0])
+    u_span = max(p.x for p in uv) - min(p.x for p in uv)
+    return ctx_object_id, round(u_span * subdiv)
+
+
+@pytest.mark.skipif(not helios_ctx.PYHELIOS_AVAILABLE, reason="needs the engine")
+def test_resolution_change_preserves_texture_tiling(client):
+    """Changing Ground Resolution must keep the configured Number of Textures.
+
+    setTileObjectSubdivisionCount takes no texture_repeat, and the engine
+    regenerates the sub-patch UVs from a template built without one, so the
+    tiling used to collapse to 1x1 and the ground rendered as a single stretched
+    image. A tiled ground therefore takes the rebuild path, which is the only
+    one that can re-apply the repeat.
+
+    5 divides both 10 and 20 on purpose: addTileObject walks the repeat DOWN to
+    a divisor of the subdivision count (Context_object.cpp), so a non-dividing
+    pair would be adjusted by the engine and prove nothing either way.
+    """
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    url = _base(pid, sid) + "/objects"
+    props = {"length": 10, "breadth": 10, "position_x": 0, "position_y": 0,
+             "position_z": 0, "rotation_z": 0}
+
+    tiled = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
+        **props, "resolution_x": 10, "resolution_y": 10,
+        "texture_x": 5, "texture_y": 5}}, headers=h).json()["object"]
+    built_id, built_repeat = _texture_repeat(pid, sid, session_id, tiled["id"], 10)
+    assert built_repeat == 5
+
+    r = client.patch(f"{url}/{tiled['id']}",
+                     json={"properties": {"resolution_x": 20, "resolution_y": 20}}, headers=h)
+    assert r.status_code == 200, r.text
+    new_id, new_repeat = _texture_repeat(pid, sid, session_id, tiled["id"], 20)
+    assert new_repeat == 5, "resolution change dropped the texture tiling"
+    assert new_id != built_id, "a tiled ground must be rebuilt, not re-cut in place"
+
+    # A ground that does NOT tile keeps the cheap in-place path: same live
+    # object, no teardown. Guards the optimisation against a blanket rebuild.
+    plain = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
+        **props, "resolution_x": 10, "resolution_y": 10,
+        "texture_x": 1, "texture_y": 1}}, headers=h).json()["object"]
+    plain_id, _ = _texture_repeat(pid, sid, session_id, plain["id"], 10)
+    r = client.patch(f"{url}/{plain['id']}",
+                     json={"properties": {"resolution_x": 20, "resolution_y": 20}}, headers=h)
+    assert r.status_code == 200, r.text
+    same_id, plain_repeat = _texture_repeat(pid, sid, session_id, plain["id"], 20)
+    assert same_id == plain_id, "an untiled ground should not be rebuilt"
+    assert plain_repeat == 1
+
+
+@pytest.mark.skipif(not helios_ctx.PYHELIOS_AVAILABLE, reason="needs the engine")
+def test_resolution_too_high_is_422_on_both_paths(client):
+    """helios caps subdivisions at the ground texture's pixel resolution. That is
+    a user-fixable input error, so both the create and the update path answer 422
+    — create used to bury it in a generic 500 BUILD_FAILED."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    url = _base(pid, sid) + "/objects"
+    props = {"length": 10, "breadth": 10, "position_x": 0, "position_y": 0,
+             "position_z": 0, "rotation_z": 0, "texture_x": 5, "texture_y": 5}
+
+    r = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
+        **props, "resolution_x": 5000, "resolution_y": 5000}}, headers=h)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "RESOLUTION_TOO_HIGH"
+
+    obj = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
+        **props, "resolution_x": 10, "resolution_y": 10}}, headers=h).json()["object"]
+    r = client.patch(f"{url}/{obj['id']}",
+                     json={"properties": {"resolution_x": 5000, "resolution_y": 5000}}, headers=h)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "RESOLUTION_TOO_HIGH"

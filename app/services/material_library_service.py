@@ -44,6 +44,7 @@ from app.db.models import (
     ScenarioObject,
     _now,
 )
+from app.services import material_apply
 from app.services import material_sync_service as sync_svc
 from app.services.eav_validation import (
     VISUALISATION_PROPERTIES,
@@ -267,6 +268,22 @@ def _scenario_scope_or_404(db: Session, session_id: str, scenario_id: str) -> Sc
         raise api_error(404, "SCENARIO_NOT_FOUND", f"Scenario {scenario_id} not found")
     project_or_404(db, session_id, scn.project_id)
     return scn
+
+
+def _run_on_active_context(db: Session, session_id: str | None,
+                           scenario_id: str | None, fn):
+    """Run fn(sctx) against the ACTIVE scenario's live context, then autosave so
+    the change persists in context.xml. No-op (returns None) when no scenario is
+    given — spectral global data is per-scenario, so there is no context to touch."""
+    if not scenario_id:
+        return None
+    from app.services import scene_object_service as sos            # local: mls → sos
+    from app.helios.persistence import trigger_scenario_autosave
+    scn = _scenario_scope_or_404(db, session_id, scenario_id)
+    sctx = sos._sctx(session_id, scn.project_id, scn.id)
+    result = fn(sctx)
+    trigger_scenario_autosave(sctx)
+    return result
 
 
 def _eager_reconcile(db: Session, session_id: str, scn: Scenario, group_id: int) -> dict:
@@ -712,13 +729,18 @@ def spectral_labels(db: Session, group_id: int, path: str) -> dict:
                        if (label := el.get("label"))]}
 
 
-def delete_file(db: Session, group_id: int, path: str) -> dict:
+def delete_file(db: Session, group_id: int, path: str,
+                session_id: str | None = None, scenario_id: str | None = None,
+                labels: list[str] | None = None) -> dict:
     """Delete an uploaded file from this group's upload folder.
 
     Refused while the path is still referenced by a library value (material_data)
     or by a frozen per-geometry snapshot (object_property_data): those resolve the
     file from disk until every scenario syncs, so deleting it would silently drop
-    their texture. Only files inside uploads/groups/<group id>/ are reachable."""
+    their texture. Only files inside uploads/groups/<group id>/ are reachable.
+
+    For a spectral file, pass its `labels` (the UI parsed them from the .xml) to
+    also clear that global data from the active scenario's context."""
     grp = _group_or_404(db, group_id)
     base = (settings.data_dir / "uploads" / "groups" / str(grp.id)).resolve()
     target = (settings.data_dir / path).resolve()
@@ -736,4 +758,21 @@ def delete_file(db: Session, group_id: int, path: str) -> dict:
     if not target.is_file():
         raise api_error(404, "FILE_NOT_FOUND", "File not found")
     target.unlink()
+    if labels:
+        _run_on_active_context(
+            db, session_id, scenario_id,
+            lambda sctx: material_apply.remove_spectral_labels(sctx, labels),
+        )
     return {"success": True, "path": path}
+
+
+def delete_spectral_labels(db: Session, session_id: str, group_id: int,
+                           labels: list[str], scenario_id: str | None) -> dict:
+    """Remove spectral global-data labels from the active scenario's context
+    (call site 1). Labels are supplied by the UI (parsed from the .xml)."""
+    _group_or_404(db, group_id)
+    removed = _run_on_active_context(
+        db, session_id, scenario_id,
+        lambda sctx: material_apply.remove_spectral_labels(sctx, labels),
+    )
+    return {"success": True, "removed": removed or 0}

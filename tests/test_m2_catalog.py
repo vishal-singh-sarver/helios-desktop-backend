@@ -91,23 +91,28 @@ def test_material_types_seven_types_viz_on_visualiser_only(client):
 
 
 def test_material_types_parameter_groups(client):
-    """Migration 027: params nest into `groups` (Farquhar collapsible + stomatal
-    selector sub-models); grouped props leave the flat `properties` list and
-    carry display labels."""
+    """Migration 027: params nest into `groups` (Farquhar + stomatal selector
+    sub-models); grouped props leave the flat `properties` list and carry display
+    labels. Migration 031 gates the Farquhar group on a `submodel` selector."""
     r = client.get("/api/catalog/material-types")
     assert r.status_code == 200
     by_name = {mt["materialtype"]: mt for mt in r.json()["material_types"]}
 
-    # Photosynthesis: one plain collapsible group (no selector).
+    # Photosynthesis: one selector-gated sub-model group (migration 031).
     photo = by_name["Photosynthesis"]
     top = {p["property"] for p in photo["properties"]}
     assert "vcmax25" not in top  # moved into the Farquhar group
     assert {"two_sided_heat_transfer", "stomatal_sidedness"} <= top
     assert "radiation_flux" not in top  # computed input, withheld (migration 029)
+    assert "submodel" in top  # the selector itself stays top-level
+    photo_props = {p["property"]: p for p in photo["properties"]}
+    assert photo_props["submodel"]["datatype"] == "enum"
+    assert photo_props["submodel"]["enum_values"] == ["farquhar_model"]
     pgroups = {g["name"]: g for g in photo["groups"]}
     assert set(pgroups) == {"Farquhar model"}
     farq = pgroups["Farquhar model"]
-    assert farq["selector_property"] is None and farq["selector_value"] is None
+    assert farq["selector_property"] == "submodel"
+    assert farq["selector_value"] == "farquhar_model"
     assert [p["property"] for p in farq["properties"]] == [
         "vcmax25", "jmax25", "tpu25", "rd25", "alpha", "theta",
         "dha_vcmax", "topt_vcmax", "dha_jmax", "topt_jmax", "dhd_jmax",

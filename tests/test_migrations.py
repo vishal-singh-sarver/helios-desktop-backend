@@ -449,3 +449,107 @@ def test_025_visualiser_texture_toggle(temp_engine):
             "JOIN material_group mg ON mg.id = pm.material_group_id "
             "WHERE pt.property = 'texture_toggle' AND mg.name = 'Default Visualiser'"
         )).scalar() == "0"
+
+
+def test_031_photosynthesis_submodel_selector(temp_engine):
+    """031 adds the `submodel` enum to Photosynthesis (only) and gates the
+    Farquhar group on it. The selector must stay TOP-LEVEL and editable — if it
+    landed in a group or was withheld, the catalog would drop it and the group
+    would be permanently invisible."""
+    database.run_migrations()
+    assert 31 in _versions(temp_engine)
+
+    with temp_engine.begin() as c:
+        assert c.execute(text(
+            "SELECT d.name FROM property_type pt JOIN datatype d ON d.id = pt.datatype_id "
+            "WHERE pt.property = 'submodel'"
+        )).scalar() == "enum"
+        assert c.execute(text(
+            "SELECT enum_values FROM property_type WHERE property = 'submodel'"
+        )).scalar() == '["farquhar_model"]'
+        # Mapped to ONLY the Photosynthesis type...
+        owners = {r[0] for r in c.execute(text(
+            "SELECT mt.materialtype FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE pt.property = 'submodel'"
+        ))}
+        assert owners == {"Photosynthesis"}
+        # ...as a top-level, editable field (the two ways it could vanish).
+        group_name, visibility = c.execute(text(
+            "SELECT mpt.group_name, mpt.visibility FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "WHERE pt.property = 'submodel'"
+        )).one()
+        assert group_name is None
+        assert visibility == "editable"
+        # All 14 Farquhar links are gated, and still carry 027's group name.
+        gated = c.execute(text(
+            "SELECT count(*) FROM material_property_type mpt "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE mt.materialtype = 'Photosynthesis' AND mpt.group_name = 'Farquhar model' "
+            "  AND mpt.selector_property = 'submodel' "
+            "  AND mpt.selector_value = 'farquhar_model'"
+        )).scalar()
+        assert gated == 14
+        # The seeded default member selects Farquhar, so its group is not hidden.
+        assert c.execute(text(
+            "SELECT md.value FROM material_data md "
+            "JOIN property_type pt ON pt.id = md.property_type_id "
+            "JOIN project_material pm ON pm.id = md.project_material_id "
+            "JOIN material_group mg ON mg.id = pm.material_group_id "
+            "WHERE pt.property = 'submodel' AND mg.name = 'Default Photosyn'"
+        )).scalar() == "farquhar_model"
+
+
+def test_031_backfills_existing_members_and_frozen_snapshots(temp_engine):
+    """The upgrade case, and the only thing that catches a broken backfill.
+
+    A pre-031 database has Photosynthesis members with saved Farquhar values and
+    no `submodel`. Once the group is gated, an unmatched selector makes
+    member_property_values drop those 14 keys, the form blanks them, and the next
+    full-replacement PUT deletes them — silent data loss. The frozen per-object
+    snapshot needs the same value or every existing assignment reports a spurious
+    library_drift."""
+    _apply_through(temp_engine, 30)
+    with temp_engine.begin() as c:
+        photo = c.execute(text(
+            "SELECT id FROM material_type WHERE materialtype='Photosynthesis'")).scalar()
+        vcmax = c.execute(text(
+            "SELECT id FROM property_type WHERE property='vcmax25'")).scalar()
+        grd = c.execute(text("SELECT id FROM object_types WHERE object='Ground'")).scalar()
+        c.execute(text("INSERT INTO projects(id,session_id,name) VALUES('p1','s1','P1')"))
+        c.execute(text("INSERT INTO scenarios(id,project_id,name) VALUES('sc1','p1','Main')"))
+        c.execute(text("INSERT INTO material_group(id,project_id,scenario_id,name) "
+                       "VALUES (900,'p1','sc1','LegacyPhoto')"))
+        c.execute(text("INSERT INTO project_material(id,material_group_id,material_type_id) "
+                       "VALUES (900,900,:p)"), {"p": photo})
+        c.execute(text("INSERT INTO material_data(project_material_id,property_type_id,value) "
+                       "VALUES (900,:v,'100')"), {"v": vcmax})
+        c.execute(text("INSERT INTO scenario_object(id,scenario_id,project_id,name,object_type_id,helios_uuids) "
+                       "VALUES (900,'sc1','p1','Ground',:g,'[]')"), {"g": grd})
+        c.execute(text("INSERT INTO object_material(scenario_object_id,project_material_id,"
+                       "material_group_id,material_type_id) VALUES (900,900,900,:p)"), {"p": photo})
+        c.execute(text("INSERT INTO object_property_data(scenario_object_id,project_material_id,property_type_id,value) "
+                       "VALUES (900,900,:v,'100')"), {"v": vcmax})
+
+    database.run_migrations()   # applies 031 on the populated DB
+    assert 31 in _versions(temp_engine)
+
+    with temp_engine.begin() as c:
+        # The pre-existing coefficient is untouched...
+        assert c.execute(text(
+            "SELECT value FROM material_data WHERE project_material_id=900 "
+            "AND property_type_id=(SELECT id FROM property_type WHERE property='vcmax25')"
+        )).scalar() == "100"
+        # ...and now sits alongside a selector value that keeps it visible.
+        assert c.execute(text(
+            "SELECT value FROM material_data WHERE project_material_id=900 "
+            "AND property_type_id=(SELECT id FROM property_type WHERE property='submodel')"
+        )).scalar() == "farquhar_model"
+        # The frozen snapshot got the same treatment.
+        assert c.execute(text(
+            "SELECT value FROM object_property_data WHERE scenario_object_id=900 "
+            "AND project_material_id=900 "
+            "AND property_type_id=(SELECT id FROM property_type WHERE property='submodel')"
+        )).scalar() == "farquhar_model"

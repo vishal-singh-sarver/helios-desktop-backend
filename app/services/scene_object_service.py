@@ -122,7 +122,20 @@ def _sctx(session_id: str, project_id: str, scenario_id: str):
 
     The scenario lock is held ONLY to create the context (idempotent get-or-
     create), then released — it must NOT be held across return (the plain Lock
-    is not re-entrant; mutation blocks re-acquire it separately)."""
+    is not re-entrant; mutation blocks re-acquire it separately).
+
+    An ALREADY-LIVE scenario is returned without taking the lock at all. The
+    lock guards creation, which happens once; every later call only needed a
+    dict lookup, yet still queued behind whatever held it — including a
+    background autosave, which holds it for as long as writeXML takes (18s on a
+    600x600 ground). That made every read after a save block, so a GET the app
+    fires right after `init` looked like the context was not ready. Reading the
+    registry dict is atomic under the GIL, and discard_scenario drops its entry
+    BEFORE saving, so a lookup can never return a context mid-teardown."""
+    sctx = session_registry.get_scenario_context(session_id, project_id, scenario_id)
+    if sctx is not None and (sctx.context is not None or not helios_ctx.PYHELIOS_AVAILABLE):
+        return sctx
+
     with session_registry._scenario_lock:
         sctx = session_registry.get_or_create_scenario_context(session_id, project_id, scenario_id)
         if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
@@ -582,8 +595,21 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
     _autosave(sctx)
 
 
-@_with_scenario_lock
 def ensure_hydrated(db: Session, sctx, scenario_id: str) -> None:
+    """Hydrate once; skip the lock entirely once it is done.
+
+    Hydration is a one-time job, but the lock was taken before the check that
+    discovers it has already run — so every later request queued behind whatever
+    held it, including a background autosave (18s on a 600x600 ground). The flag
+    is re-checked inside the lock, so two callers racing here still hydrate once.
+    """
+    if sctx.hydrated:
+        return
+    _hydrate(db, sctx, scenario_id)
+
+
+@_with_scenario_lock
+def _hydrate(db: Session, sctx, scenario_id: str) -> None:
     """Make this scenario's geometry live in its own context, exactly once.
 
     The scenario's `context.xml` (loaded by `_sctx` via `load_scenario_snapshot`)
@@ -1098,6 +1124,17 @@ def update_object(db: Session, session_id: str, project_id: str,
             else:
                 new_vals[name] = decode_value(ctext, defs[name].datatype)
         validate_cross_field(new_vals, ot.object)
+        # The canonical TEXT as stored BEFORE this write, captured so a change
+        # the engine refuses can be rolled back exactly (see the except below).
+        # Read rather than re-encoded: these values round-tripped once already.
+        pt_to_name = {defs[name].property_type_id: name for name in canonical}
+        prev_canonical: dict[str, str | None] = dict.fromkeys(canonical)
+        for row in (db.query(ObjectPropertyData)
+                    .filter(ObjectPropertyData.scenario_object_id == so.id,
+                            ObjectPropertyData.project_material_id.is_(None),
+                            ObjectPropertyData.property_type_id.in_(pt_to_name))
+                    .all()):
+            prev_canonical[pt_to_name[row.property_type_id]] = row.value
         _upsert_intrinsic(db, so.id, canonical, defs)
         changed = {name for name in canonical if old_vals.get(name) != new_vals.get(name)}
         if changed:
@@ -1118,7 +1155,20 @@ def update_object(db: Session, session_id: str, project_id: str,
     db.refresh(so)
 
     if intrinsic_change is not None:
-        _apply_intrinsic_change(db, sctx, so, *intrinsic_change)
+        try:
+            _apply_intrinsic_change(db, sctx, so, *intrinsic_change)
+        except HTTPException:
+            # The engine refused the change and kept the previous geometry, so
+            # the row must not keep the values it refused. Left in place they
+            # describe a geometry that can never be built (resolution 600 with
+            # a repeat of 1 exceeds the ground texture's pixel cap), and every
+            # later hydration skips it — the object stays listed by the API with
+            # no primitives behind it, which reads as a scenario that loaded
+            # "ready" into an empty viewport.
+            _upsert_intrinsic(db, so.id, prev_canonical, defs)
+            so.updated_at = _now()
+            db.commit()
+            raise
 
     # Assign the material groups listed in the body (one or many). Reuses the
     # POST endpoint's path, so the same 404 / already-assigned / duplicate-type

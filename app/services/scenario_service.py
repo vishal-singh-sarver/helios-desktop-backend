@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.scenario_context import ScenarioContext
 from app.core.session_store import registry
-from app.db.models import Project, Scenario
+from app.db.models import Project, Scenario, ScenarioObject
 from app.helios import context as helios_ctx
 from app.helios.persistence import (
     _ensure_scenario_structure,
@@ -264,7 +264,25 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
               "message": "Preparing geometry"})
         sos.ensure_hydrated(db, sctx, scenario_id)
 
+        # "Ready" means every geometry the DB says exists is LIVE in the context,
+        # not merely that hydration returned. It swallows per-object build
+        # failures on purpose (`except HTTPException: continue`) so one bad row
+        # cannot make a scenario unopenable — but that left init reporting
+        # {"objects": 0, "message": "Scenario ready"} for a scenario where
+        # nothing loaded, while the object list still returned every row. The
+        # client then drew a geometry that has no primitives behind it.
+        expected = (
+            db.query(ScenarioObject)
+            .filter(ScenarioObject.scenario_id == scenario_id)
+            .count()
+        )
         objects = len(sctx.persisted_objects) if sctx.persisted_objects else 0
+        if objects < expected:
+            emit({"error": f"{expected - objects} of {expected} geometries could not "
+                            f"be loaded into the scenario",
+                  "objects": objects, "expected": expected})
+            return
+
         emit({"stage": "done", "progress": 1.0, "objects": objects,
               "message": "Scenario ready"})
     except HTTPException as exc:
@@ -276,10 +294,16 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
 def discard_scenario(session_id: str, project_id: str, scenario_id: str) -> dict:
     """Autosave a scenario's context to context.xml, then drop it from memory.
 
-    Called when the user switches away. The registry lock is held across save +
-    remove so a concurrent _sctx/_resolve_scenario cannot re-create the context
+    Called when the user switches away. The registry lock is held across remove +
+    save so a concurrent _sctx/_resolve_scenario cannot re-create the context
     half-way through the teardown. A scenario with no live context is a no-op
     success — discard is idempotent and safe to call blindly on navigation.
+
+    The entry is dropped BEFORE the save, not after: _sctx returns an already-live
+    scenario without taking the lock, so an entry left in place for the duration
+    of the write would be handed to a request as if it were current. Removing
+    first makes that lookup miss, and the request then waits on the lock exactly
+    as it used to. `sctx` is a local reference, so the save is unaffected.
     """
     from app.helios.persistence import trigger_scenario_autosave
 
@@ -287,12 +311,12 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str) -> dict
         sctx = registry.get_scenario_context(session_id, project_id, scenario_id)
         if sctx is None:
             return {"success": True, "scenario_id": scenario_id, "discarded": False}
+        registry.remove_scenario(session_id, project_id, scenario_id)
         saved = False
         try:
             trigger_scenario_autosave(sctx)
             saved = True
         except Exception:
             pass    # never block the release on a save failure
-        registry.remove_scenario(session_id, project_id, scenario_id)
     return {"success": True, "scenario_id": scenario_id,
             "discarded": True, "saved": saved}

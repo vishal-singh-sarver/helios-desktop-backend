@@ -28,6 +28,8 @@ from __future__ import annotations
 import functools
 import json
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -72,6 +74,23 @@ from app.services.eav_validation import (
 )
 
 _GROUP_PREFIX = "Group"
+
+# context.xml saves run here instead of on the request thread (see _autosave).
+# ONE worker: saves for a scenario stay ordered, so a slower earlier write can
+# never land after — and overwrite — a newer one.
+_SAVE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autosave")
+
+# Newest-wins guard for overlapping updates to ONE object: the latest ticket
+# handed out per scenario_object.id. The client disables Save while a request is
+# in flight, but update_object is a sync def and so runs in a threadpool — a
+# retry or a second client can still overlap, and the loser would otherwise
+# write its older values over the winner's. Keyed by object id alone: that is an
+# autoincrement primary key, unique across every scenario. Per-object and NOT
+# per-scenario on purpose — two edits of one object each carry the full property
+# set (saga.ts sends the whole form), so dropping the older one loses nothing,
+# whereas edits to two different objects share nothing and must both apply.
+_UPDATE_SEQ: dict[int, int] = {}
+_UPDATE_SEQ_LOCK = threading.Lock()
 
 # Object-data key stamped on every built object so hydration can re-map a loaded
 # compound object back to its DB scenario_object.id (objIDs/UUIDs are NOT
@@ -362,13 +381,23 @@ def _build(db: Session, sctx, so: ScenarioObject) -> list[int]:
     return uuids
 
 
-@_with_scenario_lock
 def _autosave(sctx) -> None:
-    """Persist the scenario's context (geometry + weather) to context.xml after
-    a geometry change. Locked so writeXML never serializes a context mid-mutation.
-    Best-effort — `trigger_scenario_autosave` no-ops when headless and
-    swallows/logs any writeXML failure (never fails the request)."""
-    trigger_scenario_autosave(sctx)
+    """QUEUE a context.xml save — the caller does NOT wait for it.
+
+    The response never reads context.xml (serialize_object builds from the DB +
+    session state), so blocking a mutation on the write was pure latency (~75%
+    of a create request). Geometry and materials survive in the DB, so a save
+    lost to a hard crash costs at most the newest archives/ entry.
+
+    The lock is taken INSIDE the queued work, not around the submit: held here
+    it would be released before the write ran, letting writeXML serialize a
+    context mid-mutation. Best-effort as before — trigger_scenario_autosave
+    no-ops when headless and swallows/logs any writeXML failure."""
+    def _run() -> None:
+        with session_registry._scenario_lock:
+            trigger_scenario_autosave(sctx)
+
+    _SAVE_POOL.submit(_run)
 
 
 def _rebuild(db: Session, sctx, so: ScenarioObject) -> None:
@@ -962,10 +991,24 @@ def get_object(db: Session, session_id: str, project_id: str,
 
 def update_object(db: Session, session_id: str, project_id: str,
                   scenario_id: str, object_id: int, body) -> dict:
+    with _UPDATE_SEQ_LOCK:
+        seq = _UPDATE_SEQ[object_id] = _UPDATE_SEQ.get(object_id, 0) + 1
+
     _resolve_scope(db, session_id, project_id, scenario_id)
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
+
+    # A newer update for this object arrived while we were getting here, and it
+    # carries the same full property set — so this one is already obsolete.
+    # Checked BEFORE the write, not before the rebuild: a superseded request
+    # that had already written would put its older values over the newer ones,
+    # which is the very thing this guards against. Returns the object as it
+    # stands; the newer request applies what the caller asked for.
+    with _UPDATE_SEQ_LOCK:
+        superseded = _UPDATE_SEQ.get(object_id) != seq
+    if superseded:
+        return {"success": True, "object": serialize_object(db, sctx, so)}
 
     intrinsic_change = None
     if body.properties:

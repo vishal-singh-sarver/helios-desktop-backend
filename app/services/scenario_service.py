@@ -80,12 +80,15 @@ def _resolve_scenario(
     if scenario is None:
         raise HTTPException(404, f"Scenario {sid} not found in this project")
 
-    with registry._scenario_lock:
+    with registry._scenario_lock.write():
         sctx = registry.get_or_create_scenario_context(session_id, pid, sid)
         if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
             sctx.context = helios_ctx.Context()
             # Restore weather data from scenario-specific XML if it exists
             load_scenario_snapshot(sctx)
+            # Only now is the context worth reading — `_sctx` lets callers skip
+            # the lock on this flag, so it must not be set before loadXML ends.
+            sctx.initialized = True
     return sctx
 
 
@@ -264,6 +267,13 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
               "message": "Preparing geometry"})
         sos.ensure_hydrated(db, sctx, scenario_id)
 
+        # Hydration only QUEUES its context.xml save. Wait for it here so
+        # "ready" means the write is done too — this is the request that is
+        # still reporting progress, and the client's next call is not.
+        emit({"stage": "persist", "progress": 0.9,
+              "message": "Saving scenario"})
+        sos.wait_for_saves()
+
         # "Ready" means every geometry the DB says exists is LIVE in the context,
         # not merely that hydration returned. It swallows per-object build
         # failures on purpose (`except HTTPException: continue`) so one bad row
@@ -307,7 +317,7 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str) -> dict
     """
     from app.helios.persistence import trigger_scenario_autosave
 
-    with registry._scenario_lock:
+    with registry._scenario_lock.write():
         sctx = registry.get_scenario_context(session_id, project_id, scenario_id)
         if sctx is None:
             return {"success": True, "scenario_id": scenario_id, "discarded": False}

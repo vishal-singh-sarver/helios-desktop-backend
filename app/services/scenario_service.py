@@ -62,6 +62,13 @@ def _resolve_scenario(
     4. Get-or-create the in-memory ScenarioContext (fresh after restart).
     5. If PyHelios is available and the scenario has no live Context yet,
        create an empty one — no file hydration (weather is session-only).
+
+    An already-live scenario is returned without taking the lock, exactly as
+    `_sctx` does for geometry. The lock guards CREATION, which happens once;
+    taking it on every later call meant every weather request — upload, header,
+    time series — queued behind whatever held it, including a context.xml save
+    (18s on a 600x600 ground). Geometry had this fast-path and weather did not,
+    so the same scenario felt instant in the viewport and frozen in Weather.
     """
     pid = project_id.strip()
     sid = scenario_id.strip()
@@ -79,6 +86,11 @@ def _resolve_scenario(
     )
     if scenario is None:
         raise HTTPException(404, f"Scenario {sid} not found in this project")
+
+    # After the auth checks, so an unauthorised caller still 404s.
+    sctx = registry.get_scenario_context(session_id, pid, sid)
+    if sctx is not None and (sctx.initialized or not helios_ctx.PYHELIOS_AVAILABLE):
+        return sctx
 
     with registry._scenario_lock.write():
         sctx = registry.get_or_create_scenario_context(session_id, pid, sid)

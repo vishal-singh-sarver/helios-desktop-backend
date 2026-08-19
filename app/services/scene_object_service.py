@@ -122,23 +122,47 @@ def _sctx(session_id: str, project_id: str, scenario_id: str):
 
     The scenario lock is held ONLY to create the context (idempotent get-or-
     create), then released — it must NOT be held across return (the plain Lock
-    is not re-entrant; mutation blocks re-acquire it separately)."""
-    with session_registry._scenario_lock:
+    is not re-entrant; mutation blocks re-acquire it separately).
+
+    An ALREADY-LIVE scenario is returned without taking the lock at all. The
+    lock guards creation, which happens once; every later call only needed a
+    dict lookup, yet still queued behind whatever held it — including a
+    background autosave, which holds it for as long as writeXML takes (18s on a
+    600x600 ground). That made every read after a save block, so a GET the app
+    fires right after `init` looked like the context was not ready. Reading the
+    registry dict is atomic under the GIL, and discard_scenario drops its entry
+    BEFORE saving, so a lookup can never return a context mid-teardown.
+
+    "Live" is `initialized`, set only once loadXML has finished — NOT
+    `context is not None`, which is true from the moment the empty Context is
+    allocated, a full loadXML before it holds any geometry. Gating on the
+    latter let a request that arrived while `init` was still loading skip the
+    lock and read an empty scene: 200s with no primitives behind them, and a
+    viewer stuck on "Loading scene..." while init was still working."""
+    sctx = session_registry.get_scenario_context(session_id, project_id, scenario_id)
+    if sctx is not None and (sctx.initialized or not helios_ctx.PYHELIOS_AVAILABLE):
+        return sctx
+
+    with session_registry._scenario_lock.write():
         sctx = session_registry.get_or_create_scenario_context(session_id, project_id, scenario_id)
         if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
             sctx.context = helios_ctx.Context()
             load_scenario_snapshot(sctx)
+            sctx.initialized = True
     return sctx
 
 
 def _with_scenario_lock(fn):
-    """Serialize a context-touching helper under the (re-entrant) scenario lock.
-    Geometry + weather now share one sctx.context, so every read/mutation/
-    serialize of it must be serialized. RLock makes the nested calls safe
-    (e.g. _apply_assignment_change → _rebuild → _teardown + _build)."""
+    """Serialize a MUTATION of the shared sctx.context — exclusive against
+    every other mutation and against any concurrent read of it.
+
+    Non-mutating work (the autosave's writeXML, packing primitives for a
+    geometry response) takes `.read()` instead and runs concurrently. Re-entrant
+    for its holder, so the nested helpers are safe (e.g.
+    _apply_assignment_change → _rebuild → _teardown + _build)."""
     @functools.wraps(fn)
     def _wrapper(*args, **kwargs):
-        with session_registry._scenario_lock:
+        with session_registry._scenario_lock.write():
             return fn(*args, **kwargs)
     return _wrapper
 
@@ -418,10 +442,22 @@ def _autosave(sctx) -> None:
     context mid-mutation. Best-effort as before — trigger_scenario_autosave
     no-ops when headless and swallows/logs any writeXML failure."""
     def _run() -> None:
-        with session_registry._scenario_lock:
+        with session_registry._scenario_lock.read():
             trigger_scenario_autosave(sctx)
 
     _SAVE_POOL.submit(_run)
+
+
+def wait_for_saves() -> None:
+    """Block until every already-queued context.xml save has been written.
+
+    The pool has ONE worker, so a task submitted now cannot run until the saves
+    ahead of it are done — waiting on it waits for them.
+
+    `init` uses this before reporting a scenario ready, so "ready" means the
+    save queue is drained too and the client's next call cannot land mid-write.
+    """
+    _SAVE_POOL.submit(lambda: None).result()
 
 
 @_with_scenario_lock
@@ -582,8 +618,21 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
     _autosave(sctx)
 
 
-@_with_scenario_lock
 def ensure_hydrated(db: Session, sctx, scenario_id: str) -> None:
+    """Hydrate once; skip the lock entirely once it is done.
+
+    Hydration is a one-time job, but the lock was taken before the check that
+    discovers it has already run — so every later request queued behind whatever
+    held it, including a background autosave (18s on a 600x600 ground). The flag
+    is re-checked inside the lock, so two callers racing here still hydrate once.
+    """
+    if sctx.hydrated:
+        return
+    _hydrate(db, sctx, scenario_id)
+
+
+@_with_scenario_lock
+def _hydrate(db: Session, sctx, scenario_id: str) -> None:
     """Make this scenario's geometry live in its own context, exactly once.
 
     The scenario's `context.xml` (loaded by `_sctx` via `load_scenario_snapshot`)
@@ -645,15 +694,23 @@ def ensure_hydrated(db: Session, sctx, scenario_id: str) -> None:
         mapped.add(so.id)
 
     # DB rows missing from the XML → build from DB (applies materials + tags).
+    # autosave=False per object: _build queues a save of the WHOLE scene, so N
+    # missing rows meant N full serializations of it. One save at the end covers
+    # them all, and there is nothing to lose by waiting — every row being built
+    # here is already in the DB.
+    built = False
     for so in rows:
         if so.id not in mapped and so.id not in sctx.persisted_objects:
             try:
-                _build(db, sctx, so)
+                _build(db, sctx, so, autosave=False)
+                built = True
             except HTTPException:
                 continue    # leave DB-only; retried by rebuild-first paths
 
     db.commit()
     sctx.hydrated = True
+    if built:
+        _autosave(sctx)
 
 
 # ── Serialization ────────────────────────────────────────────────────────────
@@ -1098,6 +1155,17 @@ def update_object(db: Session, session_id: str, project_id: str,
             else:
                 new_vals[name] = decode_value(ctext, defs[name].datatype)
         validate_cross_field(new_vals, ot.object)
+        # The canonical TEXT as stored BEFORE this write, captured so a change
+        # the engine refuses can be rolled back exactly (see the except below).
+        # Read rather than re-encoded: these values round-tripped once already.
+        pt_to_name = {defs[name].property_type_id: name for name in canonical}
+        prev_canonical: dict[str, str | None] = dict.fromkeys(canonical)
+        for row in (db.query(ObjectPropertyData)
+                    .filter(ObjectPropertyData.scenario_object_id == so.id,
+                            ObjectPropertyData.project_material_id.is_(None),
+                            ObjectPropertyData.property_type_id.in_(pt_to_name))
+                    .all()):
+            prev_canonical[pt_to_name[row.property_type_id]] = row.value
         _upsert_intrinsic(db, so.id, canonical, defs)
         changed = {name for name in canonical if old_vals.get(name) != new_vals.get(name)}
         if changed:
@@ -1118,7 +1186,20 @@ def update_object(db: Session, session_id: str, project_id: str,
     db.refresh(so)
 
     if intrinsic_change is not None:
-        _apply_intrinsic_change(db, sctx, so, *intrinsic_change)
+        try:
+            _apply_intrinsic_change(db, sctx, so, *intrinsic_change)
+        except HTTPException:
+            # The engine refused the change and kept the previous geometry, so
+            # the row must not keep the values it refused. Left in place they
+            # describe a geometry that can never be built (resolution 600 with
+            # a repeat of 1 exceeds the ground texture's pixel cap), and every
+            # later hydration skips it — the object stays listed by the API with
+            # no primitives behind it, which reads as a scenario that loaded
+            # "ready" into an empty viewport.
+            _upsert_intrinsic(db, so.id, prev_canonical, defs)
+            so.updated_at = _now()
+            db.commit()
+            raise
 
     # Assign the material groups listed in the body (one or many). Reuses the
     # POST endpoint's path, so the same 404 / already-assigned / duplicate-type
@@ -1172,12 +1253,17 @@ def next_name(db: Session, session_id: str, project_id: str,
     return {"name": next_default_name(_object_names_lower(db, scenario_id), ot.object)}
 
 
-@_with_scenario_lock
 def get_object_geometry_binary(db: Session, session_id: str, project_id: str,
                                scenario_id: str, object_id: int) -> bytes:
     """getObjectGeometry (spec §5.8): binary buffer for the stored UUIDs.
     Rebuild-first contract: an object not built in this session is built
-    before serving, so stale prior-session UUIDs are never packed."""
+    before serving, so stale prior-session UUIDs are never packed.
+
+    NOT wrapped as a mutation: packing only reads, and taking the exclusive lock
+    for the whole call queued this behind a running autosave. The steps that DO
+    mutate (`_sctx`, `ensure_hydrated`, `_build`) take it themselves, and the
+    read lock goes around the packing alone — acquiring it out here and then
+    calling `_build` would be a read→write upgrade, which deadlocks."""
     _resolve_scope(db, session_id, project_id, scenario_id)
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
@@ -1188,10 +1274,10 @@ def get_object_geometry_binary(db: Session, session_id: str, project_id: str,
         _build(db, sctx, so)    # retry path for a previously failed build
     uuids = json.loads(so.helios_uuids or "[]")
     from app.services.geometry_pack import pack_primitives_binary
-    return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
+    with session_registry._scenario_lock.read():
+        return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
 
 
-@_with_scenario_lock
 def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
                               scenario_id: str) -> bytes:
     """Whole-scene binary for one scenario's persisted objects (spec §12.3
@@ -1200,6 +1286,10 @@ def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
     The legacy GET /api/geometry/all/binary predates the per-project
     context refactor and cannot reach this context; this scenario-scoped
     endpoint is the supported whole-scene fetch for persisted geometry.
+
+    NOT wrapped as a mutation — see get_object_geometry_binary. This is the call
+    that draws the scene, so holding it behind a save was what kept a new ground
+    invisible until its writeXML finished.
     """
     _resolve_scope(db, session_id, project_id, scenario_id)
     sctx = _sctx(session_id, project_id, scenario_id)
@@ -1217,7 +1307,8 @@ def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
         if so.id in sctx.persisted_objects:
             uuids.extend(json.loads(so.helios_uuids or "[]"))
     from app.services.geometry_pack import pack_primitives_binary
-    return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
+    with session_registry._scenario_lock.read():
+        return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
 
 
 # ── Scenario-level run configuration (spec §5.9) ─────────────────────────────

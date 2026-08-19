@@ -1,6 +1,74 @@
 import threading
+from contextlib import contextmanager
+
 from app.core.project_context import ProjectContext
 from app.core.scenario_context import ScenarioContext
+
+
+class ScenarioLock:
+    """Many concurrent readers of a PyHelios context, or one mutator.
+
+    An exclusive lock here made the autosave and the geometry read block each
+    other, though NEITHER mutates the context: writeXML serialises it to a file,
+    pack_primitives reads primitive data. A save therefore held off the very
+    fetch that draws the scene, so a new ground did not appear until its write
+    had finished — the wait the deferred save was meant to remove, moved from
+    the response to the render. Mutations still exclude everything.
+
+    write() is re-entrant for its holder — the mutation helpers nest
+    (_apply_assignment_change → _rebuild → _teardown + _build) — and that holder
+    may take read() too, so a mutator can serialise without deadlocking itself.
+
+    A waiting mutation blocks NEW readers: viewport polling is continuous, and
+    without that an edit could wait behind an unbroken run of reads forever.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._owner: int | None = None      # thread holding write()
+        self._depth = 0                     # its re-entrancy depth
+        self._waiting_writers = 0
+
+    @contextmanager
+    def read(self):
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner != me:           # its own holder never waits
+                while self._owner is not None or self._waiting_writers:
+                    self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def write(self):
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner == me:
+                self._depth += 1
+            else:
+                self._waiting_writers += 1
+                try:
+                    while self._owner is not None or self._readers:
+                        self._cond.wait()
+                finally:
+                    self._waiting_writers -= 1
+                self._owner = me
+                self._depth = 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._depth -= 1
+                if self._depth == 0:
+                    self._owner = None
+                    self._cond.notify_all()
 
 
 class SessionRegistry:
@@ -23,11 +91,10 @@ class SessionRegistry:
         self._store: dict[str, dict[str, ProjectContext]] = {}
         # {session_id: {project_id: {scenario_id: ScenarioContext}}}
         self._scenarios: dict[str, dict[str, dict[str, ScenarioContext]]] = {}
-        # Serializes access to a scenario's shared PyHelios context (geometry +
-        # weather live in the same sctx.context now). Re-entrant so the nested
-        # scene-object helpers (e.g. _apply_assignment_change → _rebuild →
-        # _build, each acquiring) don't self-deadlock.
-        self._scenario_lock = threading.RLock()
+        # Guards a scenario's shared PyHelios context (geometry + weather live
+        # in the same sctx.context). Mutations take .write(); the autosave and
+        # the geometry reads take .read() and so no longer block each other.
+        self._scenario_lock = ScenarioLock()
 
     # ── Session level ────────────────────────────────────────────────
 

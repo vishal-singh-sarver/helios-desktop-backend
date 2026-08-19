@@ -117,5 +117,16 @@ async def discard_scenario(
 
     Call when the user switches away. Idempotent — discarding a scenario with no
     live context succeeds with discarded=false.
+
+    Run off the event loop: the autosave inside serialises the whole scene via
+    PyHelios and gzips the previous snapshot, both blocking. Called directly from
+    an `async def` it froze the entire backend for the duration — every request,
+    not just this one. /init suffered worst: its work runs in an executor thread
+    and keeps going, but the coroutine that DELIVERS its progress events is on
+    the loop, so nothing reached the browser until the freeze ended and then the
+    whole queue drained at once — the client saw no loading, then an immediate
+    "Scenario ready". Same treatment /init and the geometry routes already get.
     """
-    return scenario_service.discard_scenario(session_id, project_id, scenario_id)
+    return await asyncio.to_thread(
+        scenario_service.discard_scenario, session_id, project_id, scenario_id
+    )

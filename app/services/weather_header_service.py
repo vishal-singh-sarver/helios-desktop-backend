@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
+from app.core.session_store import with_context_write_lock
 from app.helios.persistence import queue_scenario_autosave
 from app.services.scenario_service import _resolve_scenario
 
@@ -58,6 +59,7 @@ def get_headers(
     }
 
 
+@with_context_write_lock
 def replace_headers(
     session_id: str,
     project_id: str,
@@ -127,6 +129,7 @@ def replace_headers(
     }
 
 
+@with_context_write_lock
 def clear_headers(
     session_id: str, project_id: str, scenario_id: str, db: Session
 ) -> dict:
@@ -155,6 +158,7 @@ def clear_headers(
     return {"success": True, "count": removed}
 
 
+@with_context_write_lock
 def delete_header(
     session_id: str,
     project_id: str,

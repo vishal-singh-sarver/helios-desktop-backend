@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.session_store import with_context_write_lock
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
 from app.helios import context as helios_ctx
 from app.helios.persistence import (
@@ -680,6 +681,7 @@ def _write_temp_csv(header: list[str], rows: list[list[str]]) -> str:
     return path
 
 
+@with_context_write_lock
 def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
     """Transform the uploaded CSV and bulk-load it into PyHelios via a temp file."""
     if not file_bytes:
@@ -803,6 +805,7 @@ def _cleanup_pyhelios_cells(ctx, cells: list[tuple[str, Any, Any]]) -> None:
             pass
 
 
+@with_context_write_lock
 def add_columns(
     sctx: "ScenarioContext", columns: list["AddColumn"], db: Session
 ) -> dict:
@@ -1008,6 +1011,7 @@ def add_columns(
     return {"success": True, "columns": created_columns}
 
 
+@with_context_write_lock
 def update_columns(
     sctx: "ScenarioContext", column_id: int, column: "UpdateColumn", db: Session
 ) -> dict:
@@ -1207,6 +1211,7 @@ def update_columns(
     return {"success": True, "columns": [updated_column]}
 
 
+@with_context_write_lock
 def add_rows(
     sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session
 ) -> dict:
@@ -1337,6 +1342,7 @@ def add_rows(
 # ─── update — batch update of existing cells ────────────────────────────────
 
 
+@with_context_write_lock
 def update_cells(sctx: "ScenarioContext", req: "UpdateRequest", db: Session) -> dict:
     """Update one or more existing cells in a single call.
 
@@ -1408,6 +1414,7 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest", db: Session) -> 
 # ─── delete — direct updateTimeseriesData calls (no wrappers) ────────────────
 
 
+@with_context_write_lock
 def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
     """Remove a row, a column, or wipe everything.
 
@@ -1482,6 +1489,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
 # ─── delete_rows — batch row delete (POST /deleteRow) ────────────────────────
 
 
+@with_context_write_lock
 def delete_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session) -> dict:
     """Delete one or more rows in a single call.
 
@@ -1553,6 +1561,7 @@ def delete_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session
 # ─── clear_data — clear both stores ──────────────────────────────────────────
 
 
+@with_context_write_lock
 def clear_data(sctx: "ScenarioContext", db: Session) -> dict:
     """Clear everything for the scenario: SQL headers + PyHelios cells.
 

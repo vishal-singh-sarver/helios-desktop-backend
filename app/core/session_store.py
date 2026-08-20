@@ -1,3 +1,4 @@
+import functools
 import threading
 from contextlib import contextmanager
 
@@ -180,6 +181,27 @@ class SessionRegistry:
     ) -> None:
         """Wipe every scenario for this project. Called on project delete."""
         self._scenarios.get(session_id, {}).pop(project_id, None)
+
+
+def with_context_write_lock(fn):
+    """Serialise a function that MUTATES a scenario's PyHelios context.
+
+    Weather mutates sctx.context directly (loadTabularTimeseriesData,
+    addTimeseriesData, clearTimeseriesData, deleteTimeseriesVariable) and took
+    no lock at all. That was survivable while its save ran inline on the same
+    thread — mutation and serialisation could not overlap. Once the save moved
+    to the queue, they could: the queued writeXML holds .read() while it walks
+    the context, and an unlocked weather mutation would rewrite it underneath.
+    Measured with .read() held for 1.5s: a geometry PATCH correctly waited
+    1.51s, a weather clear_data went through in 0.01s.
+
+    Re-entrant for its holder, so a mutator calling another is safe.
+    """
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        with registry._scenario_lock.write():
+            return fn(*args, **kwargs)
+    return _wrapper
 
 
 # Module-level singleton

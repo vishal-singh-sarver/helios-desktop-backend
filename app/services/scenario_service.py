@@ -285,14 +285,23 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         second project loaded on top of the first: two 1000x1000 contexts is
         ~21 GB and the kernel SIGKILLs the server (observed twice).
 
-        Only ever drops a context that never finished hydrating. A live one is
-        shared with whatever else is using the scenario and is not this
-        request's to release. Nothing is saved first: this context was read from
-        disk and never mutated, so there is nothing to lose.
+        The lock is REQUIRED, not decoration. `hydrated` is False for the whole
+        of another request's hydration, so checking it unlocked is a race, not a
+        liveness test: a concurrent hydrate would still be running, this would
+        evict the context out from under it, and the next lookup would build a
+        SECOND one — two live Contexts, the exact leak this exists to prevent.
+        Taking .write() serialises against `_hydrate` (which holds it for the
+        duration), so by the time the check runs the other request has either
+        finished — `hydrated` True, and this leaves it alone — or has not
+        started.
+
+        Nothing is saved: the context is partial, and everything in it is
+        already in the DB.
         """
-        live = registry.get_scenario_context(session_id, project_id, scenario_id)
-        if live is not None and not live.hydrated:
-            registry.remove_scenario(session_id, project_id, scenario_id)
+        with registry._scenario_lock.write():
+            live = registry.get_scenario_context(session_id, project_id, scenario_id)
+            if live is not None and not live.hydrated:
+                registry.remove_scenario(session_id, project_id, scenario_id)
 
     try:
         emit({"stage": "context", "progress": 0.1,
@@ -363,10 +372,10 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
     write — the geometry is in the DB, and a half-hydrated context has nothing
     the DB does not already have.
 
-    Called when the user switches away. The registry lock is held across remove +
-    save so a concurrent _sctx/_resolve_scenario cannot re-create the context
-    half-way through the teardown. A scenario with no live context is a no-op
-    success — discard is idempotent and safe to call blindly on navigation.
+    Called when the user switches away. The registry entry is dropped under
+    .write(); the save then runs under .read(), which excludes mutations
+    without stalling other readers. A scenario with no live context is a
+    no-op success — discard is idempotent and safe to call on navigation.
 
     The entry is dropped BEFORE the save, not after: _sctx returns an already-live
     scenario without taking the lock, so an entry left in place for the duration
@@ -382,11 +391,15 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
             return {"success": True, "scenario_id": scenario_id, "discarded": False}
         registry.remove_scenario(session_id, project_id, scenario_id)
 
-    # Saved OUTSIDE the lock. The registry entry is already gone, so nothing can
-    # be handed this context any more and the lock is protecting nothing — while
-    # holding it across a writeXML stalled EVERY scenario in the process, other
-    # projects included, for the length of the write. `sctx` is a local
-    # reference, so the save is unaffected by the removal.
+    # Under .read(), NOT .write(). Removing the registry entry stops anyone NEW
+    # from being handed this context, but it does nothing about requests that
+    # resolved it before the discard — one of those re-entering a mutation
+    # would rewrite the context while this writeXML walks it, and a queued save
+    # for the same sctx could run its own write concurrently and double-rotate
+    # the archive. .read() excludes both (mutations take .write(), and the
+    # queued save takes .read() the same way) without holding every other
+    # scenario off for the length of the write, which is what taking .write()
+    # here did.
     #
     # Still SYNCHRONOUS, unlike every other save: discard is the one path where
     # the context is about to be released, so a queued write would serialise a
@@ -394,7 +407,8 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
     saved = False
     if save:
         try:
-            trigger_scenario_autosave(sctx)
+            with registry._scenario_lock.read():
+                trigger_scenario_autosave(sctx)
             saved = True
         except Exception:
             pass    # never block the release on a save failure

@@ -705,9 +705,22 @@ def _hydrate(db: Session, sctx, scenario_id: str, cancelled=None) -> None:
         # persisted_objects, the guard below skips it next time, and `hydrated`
         # is left False so a later init finishes the job.
         if cancelled is not None and cancelled.is_set():
+            # NOTHING IS SAVED HERE, deliberately. This context holds a partial
+            # scene, and writing it would overwrite the scenario's real
+            # context.xml AND rotate the good copy into the single archive slot
+            # — the exact corruption /discard?save=false exists to prevent.
+            # Queueing it also defeated that flag outright: the closure holds
+            # sctx and runs after the release, so a client that asked NOT to
+            # save got its scene overwritten anyway (measured: a good 1550-byte
+            # file replaced by a half-built 2877-byte one).
+            #
+            # Nothing is lost. Every object here is already in the DB, and the
+            # next open rebuilds from it — that is what hydration IS.
+            #
+            # The commit stands: _build already wrote these rows, and leaving
+            # the session uncommitted would strand them. The ids it records are
+            # session-scoped and re-derived on the next hydrate.
             db.commit()
-            if built:
-                queue_scenario_autosave(sctx)
             return
         if so.id not in mapped and so.id not in sctx.persisted_objects:
             try:

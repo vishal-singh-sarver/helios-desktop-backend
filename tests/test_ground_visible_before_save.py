@@ -9,6 +9,7 @@ now overlap; mutations still exclude both.
 import time
 from uuid import uuid4
 
+from app.helios import persistence
 from app.services import scene_object_service as sos
 
 GROUND = {"length": 10, "breadth": 10, "resolution_x": 2, "resolution_y": 2,
@@ -31,7 +32,7 @@ def test_ground_is_drawable_while_the_save_is_still_running(client, monkeypatch)
     ot = next(o["id"] for o in client.get("/api/catalog/object-types").json()
               ["object_types"] if o["object"] == "Ground")
 
-    real = sos.trigger_scenario_autosave
+    real = persistence.trigger_scenario_autosave
     started, finished = [], []
 
     def _slow(sctx):
@@ -40,7 +41,7 @@ def test_ground_is_drawable_while_the_save_is_still_running(client, monkeypatch)
         finished.append(time.monotonic())
         return real(sctx)
 
-    monkeypatch.setattr(sos, "trigger_scenario_autosave", _slow)
+    monkeypatch.setattr(persistence, "trigger_scenario_autosave", _slow)
 
     t = time.monotonic()
     r = client.post(base + "/objects", json={"object_type_id": ot,
@@ -72,7 +73,7 @@ def test_a_mutation_still_excludes_a_running_save(client, monkeypatch):
     client.post(base + "/objects", json={"object_type_id": ot,
                 "properties": GROUND}, headers=h)
 
-    real = sos.trigger_scenario_autosave
+    real = persistence.trigger_scenario_autosave
     overlap = []
     saving = threading_flag = {"in": False}
 
@@ -89,7 +90,7 @@ def test_a_mutation_still_excludes_a_running_save(client, monkeypatch):
             overlap.append(True)
         return real_build(*a, **kw)
 
-    monkeypatch.setattr(sos, "trigger_scenario_autosave", _slow)
+    monkeypatch.setattr(persistence, "trigger_scenario_autosave", _slow)
     monkeypatch.setattr(sos, "_build", _watch_build)
 
     # A second ground: its build must wait for the in-flight save.

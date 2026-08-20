@@ -11,6 +11,7 @@ import threading
 import time
 from uuid import uuid4
 
+from app.helios import persistence
 from app.services import scene_object_service as sos
 
 GROUND = {"length": 10, "breadth": 10, "resolution_x": 2, "resolution_y": 2,
@@ -30,7 +31,7 @@ def test_weather_request_is_served_while_a_save_runs(client, monkeypatch):
     ot = next(o["id"] for o in client.get("/api/catalog/object-types").json()
               ["object_types"] if o["object"] == "Ground")
 
-    real = sos.trigger_scenario_autosave
+    real = persistence.trigger_scenario_autosave
     running = {"in": False}
 
     def _slow(sctx):
@@ -39,7 +40,7 @@ def test_weather_request_is_served_while_a_save_runs(client, monkeypatch):
         running["in"] = False
         return real(sctx)
 
-    monkeypatch.setattr(sos, "trigger_scenario_autosave", _slow)
+    monkeypatch.setattr(persistence, "trigger_scenario_autosave", _slow)
 
     # Create a ground → queues a slow save.
     r = client.post(base + "/objects", json={"object_type_id": ot,

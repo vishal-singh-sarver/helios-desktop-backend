@@ -35,7 +35,7 @@ from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
 from app.helios import context as helios_ctx
 from app.helios.persistence import (
     _ensure_scenario_structure,
-    trigger_scenario_autosave,
+    queue_scenario_autosave,
 )
 
 # PyHelios's specific exception for "thing not found" errors (missing label,
@@ -732,7 +732,7 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
     if truncated_any:
         response["message"] = "Some values contained more than 7 decimal places and were truncated."
     
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return response
 
 
@@ -988,7 +988,7 @@ def add_columns(
             )
 
         db.commit()
-        trigger_scenario_autosave(sctx)
+        queue_scenario_autosave(sctx)
 
     except HTTPException:
         db.rollback()
@@ -1190,7 +1190,7 @@ def update_columns(
         }
 
         db.commit()
-        trigger_scenario_autosave(sctx)
+        queue_scenario_autosave(sctx)
 
     except HTTPException:
         db.rollback()
@@ -1325,7 +1325,7 @@ def add_rows(
         _add_row(ctx, row_data["date"], row_data["time"], cells)
         added_rows += 1
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {
         "success": True,
         "row_count": len(existing_timestamps) + len(rows),
@@ -1401,7 +1401,7 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest", db: Session) -> 
         except HeliosRuntimeError as exc:
             raise HTTPException(404, f"updates[{i}]: {exc}")
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {"success": True, "updated_count": len(req.updates)}
 
 
@@ -1424,7 +1424,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         ctx.clearTimeseriesData()
         db.query(WeatherDataHeader).filter_by(scenario_id=sctx.scenario_id).delete()
         db.commit()
-        trigger_scenario_autosave(sctx)
+        queue_scenario_autosave(sctx)
         return {"success": True, "row_count": 0, "column_count": 2}
 
     # STEP A — clear one row
@@ -1471,7 +1471,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
     labels_after = list(ctx.listTimeseriesVariables())
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0
     column_count = 2 + len(labels_after)
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {
         "success": True,
         "row_count": row_count,
@@ -1540,7 +1540,7 @@ def delete_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0
     column_count = 2 + len(labels_after)
     deleted = len(targets)
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {
         "success": True,
         "deleted_rows": deleted,
@@ -1581,7 +1581,7 @@ def clear_data(sctx: "ScenarioContext", db: Session) -> dict:
     except Exception:
         pass  # SQL is the source of truth; orphan cells will be invisible to /addRow
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {
         "success": True,
         "headers_removed": headers_removed,

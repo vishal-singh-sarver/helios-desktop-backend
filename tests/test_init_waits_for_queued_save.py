@@ -11,6 +11,7 @@ import time
 from uuid import uuid4
 
 from app.helios.persistence import _scenario_context_xml
+from app.helios import persistence
 from app.services import scene_object_service as sos
 
 GROUND = {"length": 10, "breadth": 10, "resolution_x": 2, "resolution_y": 2,
@@ -48,13 +49,13 @@ def test_init_does_not_report_ready_while_a_save_is_queued(client, monkeypatch):
     sh, pid, sid = _setup(client)
     _seed(client, sh, pid, sid)
 
-    real_save = sos.trigger_scenario_autosave
+    real_save = persistence.trigger_scenario_autosave
 
     def _slow_save(sctx):
         time.sleep(SAVE_SECONDS)          # stand in for an 18s writeXML
         return real_save(sctx)
 
-    monkeypatch.setattr(sos, "trigger_scenario_autosave", _slow_save)
+    monkeypatch.setattr(persistence, "trigger_scenario_autosave", _slow_save)
 
     t = time.monotonic()
     resp = client.get(
@@ -76,13 +77,13 @@ def test_hydration_queues_one_save_not_one_per_object(client, monkeypatch):
     _seed(client, sh, pid, sid, count=3)
 
     calls = []
-    real_save = sos.trigger_scenario_autosave
+    real_save = persistence.trigger_scenario_autosave
 
     def _counting_save(sctx):
         calls.append(sctx.scenario_id)
         return real_save(sctx)
 
-    monkeypatch.setattr(sos, "trigger_scenario_autosave", _counting_save)
+    monkeypatch.setattr(persistence, "trigger_scenario_autosave", _counting_save)
     client.get(f"/api/project/{pid}/scenarios/{sid}/init?session_id={sh}")
 
     assert len(calls) == 1, (

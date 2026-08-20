@@ -21,7 +21,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
-from app.helios.persistence import trigger_scenario_autosave
+from app.helios.persistence import queue_scenario_autosave
 from app.services.scenario_service import _resolve_scenario
 
 
@@ -112,7 +112,7 @@ def replace_headers(
         db.rollback()
         raise HTTPException(500, "Failed to replace headers")
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
 
     rows = (
         db.query(WeatherDataHeader)
@@ -150,7 +150,7 @@ def clear_headers(
         except Exception:
             pass  # SQL is the source of truth; orphan cells will be invisible to /addRow
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
 
     return {"success": True, "count": removed}
 
@@ -195,7 +195,7 @@ def delete_header(
             except Exception:
                 pass
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
 
     return {"success": True, "header_id": header_id}
 

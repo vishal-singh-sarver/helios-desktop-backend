@@ -29,7 +29,6 @@ import functools
 import json
 import math
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -57,7 +56,12 @@ from app.db.models import (
 )
 from app.helios import context as helios_ctx
 from app.helios import registry as reg
-from app.helios.persistence import load_scenario_snapshot, trigger_scenario_autosave
+from app.helios.persistence import (
+    load_scenario_snapshot,
+    queue_scenario_autosave,
+    trigger_scenario_autosave,
+    wait_for_scenario_saves,
+)
 from app.services import material_apply
 from app.services import material_sync_service as sync_svc
 from app.services.eav_validation import (
@@ -75,10 +79,8 @@ from app.services.eav_validation import (
 
 _GROUP_PREFIX = "Group"
 
-# context.xml saves run here instead of on the request thread (see _autosave).
-# ONE worker: saves for a scenario stay ordered, so a slower earlier write can
-# never land after — and overwrite — a newer one.
-_SAVE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autosave")
+# The save queue lives in app.helios.persistence — geometry and weather write
+# the same context.xml, so they must share one ordered worker.
 
 # Newest-wins guard for overlapping updates to ONE object: the latest ticket
 # handed out per scenario_object.id. The client disables Save while a request is
@@ -147,7 +149,10 @@ def _sctx(session_id: str, project_id: str, scenario_id: str):
         sctx = session_registry.get_or_create_scenario_context(session_id, project_id, scenario_id)
         if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
             sctx.context = helios_ctx.Context()
-            load_scenario_snapshot(sctx)
+            if not load_scenario_snapshot(sctx):
+                # See _resolve_scenario: a raised loadXML leaves its geometry
+                # behind, and hydration would rebuild on top of it.
+                sctx.context = helios_ctx.Context()
             sctx.initialized = True
     return sctx
 
@@ -441,23 +446,16 @@ def _autosave(sctx) -> None:
     it would be released before the write ran, letting writeXML serialize a
     context mid-mutation. Best-effort as before — trigger_scenario_autosave
     no-ops when headless and swallows/logs any writeXML failure."""
-    def _run() -> None:
-        with session_registry._scenario_lock.read():
-            trigger_scenario_autosave(sctx)
-
-    _SAVE_POOL.submit(_run)
+    queue_scenario_autosave(sctx)
 
 
 def wait_for_saves() -> None:
     """Block until every already-queued context.xml save has been written.
 
-    The pool has ONE worker, so a task submitted now cannot run until the saves
-    ahead of it are done — waiting on it waits for them.
-
     `init` uses this before reporting a scenario ready, so "ready" means the
     save queue is drained too and the client's next call cannot land mid-write.
     """
-    _SAVE_POOL.submit(lambda: None).result()
+    wait_for_scenario_saves()
 
 
 @_with_scenario_lock
@@ -618,7 +616,7 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
     _autosave(sctx)
 
 
-def ensure_hydrated(db: Session, sctx, scenario_id: str) -> None:
+def ensure_hydrated(db: Session, sctx, scenario_id: str, cancelled=None) -> None:
     """Hydrate once; skip the lock entirely once it is done.
 
     Hydration is a one-time job, but the lock was taken before the check that
@@ -628,11 +626,11 @@ def ensure_hydrated(db: Session, sctx, scenario_id: str) -> None:
     """
     if sctx.hydrated:
         return
-    _hydrate(db, sctx, scenario_id)
+    _hydrate(db, sctx, scenario_id, cancelled)
 
 
 @_with_scenario_lock
-def _hydrate(db: Session, sctx, scenario_id: str) -> None:
+def _hydrate(db: Session, sctx, scenario_id: str, cancelled=None) -> None:
     """Make this scenario's geometry live in its own context, exactly once.
 
     The scenario's `context.xml` (loaded by `_sctx` via `load_scenario_snapshot`)
@@ -700,6 +698,17 @@ def _hydrate(db: Session, sctx, scenario_id: str) -> None:
     # here is already in the DB.
     built = False
     for so in rows:
+        # Stop between objects when the client that asked for this scenario has
+        # gone away. Checked HERE and not inside _build: a build is one engine
+        # call and cannot be interrupted part-way, but the loop around it can.
+        # Bailing is safe and resumable — every object already built stays in
+        # persisted_objects, the guard below skips it next time, and `hydrated`
+        # is left False so a later init finishes the job.
+        if cancelled is not None and cancelled.is_set():
+            db.commit()
+            if built:
+                queue_scenario_autosave(sctx)
+            return
         if so.id not in mapped and so.id not in sctx.persisted_objects:
             try:
                 _build(db, sctx, so, autosave=False)
@@ -1279,7 +1288,7 @@ def get_object_geometry_binary(db: Session, session_id: str, project_id: str,
 
 
 def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
-                              scenario_id: str) -> bytes:
+                              scenario_id: str, cancelled=None) -> bytes:
     """Whole-scene binary for one scenario's persisted objects (spec §12.3
     'before the frontend's first geometry fetch' — fetching hydrates).
 
@@ -1308,7 +1317,8 @@ def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
             uuids.extend(json.loads(so.helios_uuids or "[]"))
     from app.services.geometry_pack import pack_primitives_binary
     with session_registry._scenario_lock.read():
-        return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
+        return pack_primitives_binary(helios_ctx.get_context(sctx), uuids,
+                                      cancelled=cancelled)
 
 
 # ── Scenario-level run configuration (spec §5.9) ─────────────────────────────

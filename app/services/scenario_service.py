@@ -97,7 +97,13 @@ def _resolve_scenario(
         if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
             sctx.context = helios_ctx.Context()
             # Restore weather data from scenario-specific XML if it exists
-            load_scenario_snapshot(sctx)
+            if not load_scenario_snapshot(sctx):
+                # loadXML raised. It does not unwind, so everything it read
+                # before failing is still in there; hydration would rebuild the
+                # DB rows on top and save the doubled result. Start clean and
+                # let hydration rebuild from the DB, which is the source of
+                # truth for the object set anyway.
+                sctx.context = helios_ctx.Context()
             # Only now is the context worth reading — `_sctx` lets callers skip
             # the lock on this flag, so it must not be set before loadXML ends.
             sctx.initialized = True
@@ -255,7 +261,7 @@ def delete_scenario(
 
 
 def init_scenario(session_id: str, project_id: str, scenario_id: str,
-                  db: Session, emit) -> None:
+                  db: Session, emit, cancelled=None) -> None:
     """Create + hydrate a scenario's context, reporting progress through `emit`.
 
     Runs the work the lazy paths would otherwise do on a random request:
@@ -270,14 +276,54 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
     """
     from app.services import scene_object_service as sos   # avoid import cycle
 
+    def _abandon() -> None:
+        """Drop a context whose client walked away before it finished loading.
+
+        loadXML cannot be interrupted, so a cancelled open still pays for the
+        whole read — but nothing has to KEEP the result. Left in the registry it
+        stays resident until the scenario or project is deleted, so opening a
+        second project loaded on top of the first: two 1000x1000 contexts is
+        ~21 GB and the kernel SIGKILLs the server (observed twice).
+
+        The lock is REQUIRED, not decoration. `hydrated` is False for the whole
+        of another request's hydration, so checking it unlocked is a race, not a
+        liveness test: a concurrent hydrate would still be running, this would
+        evict the context out from under it, and the next lookup would build a
+        SECOND one — two live Contexts, the exact leak this exists to prevent.
+        Taking .write() serialises against `_hydrate` (which holds it for the
+        duration), so by the time the check runs the other request has either
+        finished — `hydrated` True, and this leaves it alone — or has not
+        started.
+
+        Nothing is saved: the context is partial, and everything in it is
+        already in the DB.
+        """
+        with registry._scenario_lock.write():
+            live = registry.get_scenario_context(session_id, project_id, scenario_id)
+            if live is not None and not live.hydrated:
+                registry.remove_scenario(session_id, project_id, scenario_id)
+
     try:
         emit({"stage": "context", "progress": 0.1,
               "message": "Loading scenario context"})
         sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
 
+        # Checked BEFORE hydrating: the load above is the expensive half, and
+        # the next scenario's init is already queued behind the lock it holds.
+        # Releasing here is what keeps the peak at one context instead of two.
+        if cancelled is not None and cancelled.is_set():
+            _abandon()
+            emit({"error": "Scenario load cancelled", "cancelled": True})
+            return
+
         emit({"stage": "hydrate", "progress": 0.5,
               "message": "Preparing geometry"})
-        sos.ensure_hydrated(db, sctx, scenario_id)
+        sos.ensure_hydrated(db, sctx, scenario_id, cancelled)
+
+        if cancelled is not None and cancelled.is_set():
+            _abandon()
+            emit({"error": "Scenario load cancelled", "cancelled": True})
+            return
 
         # Hydration only QUEUES its context.xml save. Wait for it here so
         # "ready" means the write is done too — this is the request that is
@@ -313,13 +359,23 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         emit({"error": str(exc) or exc.__class__.__name__})
 
 
-def discard_scenario(session_id: str, project_id: str, scenario_id: str) -> dict:
+def discard_scenario(session_id: str, project_id: str, scenario_id: str,
+                     save: bool = True) -> dict:
     """Autosave a scenario's context to context.xml, then drop it from memory.
 
-    Called when the user switches away. The registry lock is held across remove +
-    save so a concurrent _sctx/_resolve_scenario cannot re-create the context
-    half-way through the teardown. A scenario with no live context is a no-op
-    success — discard is idempotent and safe to call blindly on navigation.
+    `save=False` releases WITHOUT writing — the cancel path. A load the user
+    walked away from leaves a half-hydrated context, and saving that would
+    overwrite the scenario's real context.xml while rotating the good copy into
+    archives: cancelling a load would corrupt the saved scene. So the client
+    could not release a cancelled load at all, and its memory stayed resident
+    until the scenario or project was deleted. Nothing is lost by skipping the
+    write — the geometry is in the DB, and a half-hydrated context has nothing
+    the DB does not already have.
+
+    Called when the user switches away. The registry entry is dropped under
+    .write(); the save then runs under .read(), which excludes mutations
+    without stalling other readers. A scenario with no live context is a
+    no-op success — discard is idempotent and safe to call on navigation.
 
     The entry is dropped BEFORE the save, not after: _sctx returns an already-live
     scenario without taking the lock, so an entry left in place for the duration
@@ -334,9 +390,25 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str) -> dict
         if sctx is None:
             return {"success": True, "scenario_id": scenario_id, "discarded": False}
         registry.remove_scenario(session_id, project_id, scenario_id)
-        saved = False
+
+    # Under .read(), NOT .write(). Removing the registry entry stops anyone NEW
+    # from being handed this context, but it does nothing about requests that
+    # resolved it before the discard — one of those re-entering a mutation
+    # would rewrite the context while this writeXML walks it, and a queued save
+    # for the same sctx could run its own write concurrently and double-rotate
+    # the archive. .read() excludes both (mutations take .write(), and the
+    # queued save takes .read() the same way) without holding every other
+    # scenario off for the length of the write, which is what taking .write()
+    # here did.
+    #
+    # Still SYNCHRONOUS, unlike every other save: discard is the one path where
+    # the context is about to be released, so a queued write would serialise a
+    # context that may be gone by the time the worker reaches it.
+    saved = False
+    if save:
         try:
-            trigger_scenario_autosave(sctx)
+            with registry._scenario_lock.read():
+                trigger_scenario_autosave(sctx)
             saved = True
         except Exception:
             pass    # never block the release on a save failure

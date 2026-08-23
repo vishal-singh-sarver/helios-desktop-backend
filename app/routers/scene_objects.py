@@ -8,13 +8,15 @@ Required header: session-id. The legacy in-memory /api/geometry/* primitive
 endpoints remain preview-only and never write these tables.
 """
 import asyncio
+import threading
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_session_id
 from app.db.database import get_db
+from app.services.geometry_pack import PackCancelled
 from app.schemas.scene_objects import (
     AssignMaterialGroupRequest,
     GroupAssignmentUpdateRequest,
@@ -133,16 +135,49 @@ async def get_object_geometry_binary(
 
 @router.get(_BASE + "/geometry/binary")
 async def get_scene_geometry_binary(
+    request: Request,
     project_id: str,
     scenario_id: str,
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
     """Whole-scene binary for the scenario's persisted geometry. Fetching
-    hydrates (spec §12.3) — use this as the first viewport load."""
-    content = await asyncio.to_thread(
-        svc.get_scene_geometry_binary, db, session_id, project_id, scenario_id
-    )
+    hydrates (spec §12.3) — use this as the first viewport load.
+
+    Stops packing when the client goes away. This is the longest read in the
+    app — 228 MB on a 1000x1000 ground, and the viewport asks for it more than
+    once — so it kept building a buffer nobody would receive whenever the user
+    navigated away mid-load.
+
+    The disconnect is watched with a raw `request.receive()` rather than
+    `request.is_disconnected()`: under the app's own `@app.middleware("http")`
+    (main.py) the latter never reports True, because BaseHTTPMiddleware leaves
+    the message empty. Safe on a GET — with no body to read, the watcher cannot
+    swallow the `http.request` message a body-reading route would need.
+    """
+    cancelled = threading.Event()
+
+    async def _watch_for_disconnect():
+        try:
+            while True:
+                message = await request.receive()
+                if message.get("type") == "http.disconnect":
+                    cancelled.set()
+                    return
+        except Exception:           # noqa: BLE001 — a dead watcher must not fail the request
+            pass
+
+    watcher = asyncio.create_task(_watch_for_disconnect())
+    try:
+        content = await asyncio.to_thread(
+            svc.get_scene_geometry_binary, db, session_id, project_id,
+            scenario_id, cancelled,
+        )
+    except PackCancelled:
+        # The client is already gone; the status is for logs, not for them.
+        return Response(status_code=499)
+    finally:
+        watcher.cancel()
     return Response(content=content, media_type="application/octet-stream")
 
 

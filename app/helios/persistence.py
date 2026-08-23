@@ -31,6 +31,7 @@ import json
 import logging
 import lzma
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +39,15 @@ from app.core.config import settings
 
 
 logger = logging.getLogger(__name__)
-MAX_AUTOSAVE_ARCHIVES = 10
+
+# How many rotated context.xml snapshots to keep per scenario. ONE: the
+# previous save is a rollback point, older ones were never read by anything and
+# a scene of this size makes them expensive — a 613 MB context.xml gzips to
+# tens of MB, ten deep, per scenario, across 1,300+ scenarios.
+#
+# The rotation prunes to below this number BEFORE writing the new archive, so a
+# value of N leaves exactly N on disk.
+MAX_AUTOSAVE_ARCHIVES = 1
 
 
 # ── Path helpers ─────────────────────────────────────────────────────────────
@@ -145,28 +154,79 @@ def trigger_scenario_autosave(sctx) -> None:
         )
 
 
+# ── Deferred save ─────────────────────────────────────────────────────────────
+#
+# ONE worker: saves for a scenario stay ordered, so a slower earlier write can
+# never land after — and overwrite — a newer one. Geometry and weather share the
+# same context.xml, so they must share this queue too.
+
+_SAVE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autosave")
+
+
+def queue_scenario_autosave(sctx) -> None:
+    """QUEUE a context.xml save — the caller does NOT wait for the write.
+
+    No response is built from context.xml (geometry serializes from the DB +
+    session state, weather from the live context), so making a mutation wait on
+    writeXML was pure latency — and on a 1000x1000 ground that is a million
+    primitives serialized while the user watches a spinner.
+
+    The lock is taken INSIDE the queued work, not around the submit: held at
+    submit time it would be released before the write ran, letting writeXML
+    serialize a context mid-mutation.
+
+    Best-effort — `trigger_scenario_autosave` no-ops when headless and
+    swallows/logs any writeXML failure, so a queued save never surfaces.
+    """
+    # Imported here, not at module scope: session_store is a higher layer and
+    # importing it eagerly would make persistence depend on the registry.
+    from app.core.session_store import registry
+
+    def _run() -> None:
+        with registry._scenario_lock.read():
+            trigger_scenario_autosave(sctx)
+
+    _SAVE_POOL.submit(_run)
+
+
+def wait_for_scenario_saves() -> None:
+    """Block until every already-queued save has been written.
+
+    The pool has ONE worker, so a task submitted now cannot run until the saves
+    ahead of it are done — waiting on it waits for them.
+    """
+    _SAVE_POOL.submit(lambda: None).result()
+
+
 # ── Load ──────────────────────────────────────────────────────────────────────
 
 
-def load_scenario_snapshot(sctx) -> None:
+def load_scenario_snapshot(sctx) -> bool:
     """
     Restore a scenario's PyHelios context from disk.
 
     Reads:
         data/projects/<pid>/scenarios/<sid>/context_file/context.xml
 
-    No-op (silent) when the file doesn't exist — a fresh scenario has
-    nothing to restore.
+    Returns True when the context is trustworthy — loaded, or nothing to load.
+    Returns False when loadXML RAISED, because it does not unwind: a failed load
+    leaves everything it read so far in the context (3,000,000 primitives
+    measured on a 613 MB file). Hydration then rebuilds every DB row on top of
+    those orphans, so the scene is held twice and the doubled context is saved
+    back — making the next open worse again. Callers must discard the context
+    on False rather than build on it.
     """
     new_xml = _scenario_context_xml(sctx.project_id, sctx.scenario_id)
     if not new_xml.exists():
-        return
+        return True
 
     try:
         sctx.context.loadXML(str(new_xml))
         logger.info("[scenario-load] restored scenario %s", sctx.scenario_id)
+        return True
     except Exception:
         logger.exception("[scenario-load] failed for scenario %s", sctx.scenario_id)
+        return False
 
 
 # ── Versioning (SQLite-based, unchanged) ─────────────────────────────────────

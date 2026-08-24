@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import functools
 import json
+import time
+import logging
 import math
 import threading
 
@@ -76,6 +78,8 @@ from app.services.eav_validation import (
     validate_name,
     validate_properties,
 )
+
+logger = logging.getLogger(__name__)
 
 _GROUP_PREFIX = "Group"
 
@@ -1328,10 +1332,20 @@ def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
     for so in rows:
         if so.id in sctx.persisted_objects:
             uuids.extend(json.loads(so.helios_uuids or "[]"))
-    from app.services.geometry_pack import pack_primitives_binary
-    with session_registry._scenario_lock.read():
-        return pack_primitives_binary(helios_ctx.get_context(sctx), uuids,
-                                      cancelled=cancelled)
+    from app.services.geometry_pack import PackCancelled, pack_primitives_binary
+    started = time.monotonic()
+    try:
+        with session_registry._scenario_lock.read():
+            payload = pack_primitives_binary(helios_ctx.get_context(sctx), uuids,
+                                             cancelled=cancelled)
+    except PackCancelled:
+        logger.info("[geometry] cancelled scenario=%s after %.1fs — client gone",
+                    scenario_id[:8], time.monotonic() - started)
+        raise
+    logger.info("[geometry] served    scenario=%s %.1f MB, %d primitives, %.1fs",
+                scenario_id[:8], len(payload) / 1048576, len(uuids),
+                time.monotonic() - started)
+    return payload
 
 
 # ── Scenario-level run configuration (spec §5.9) ─────────────────────────────

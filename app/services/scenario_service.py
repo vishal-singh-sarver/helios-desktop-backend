@@ -12,7 +12,9 @@ Disk layout per scenario:
 """
 from __future__ import annotations
 
+import logging
 import shutil
+import time
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -23,6 +25,8 @@ from app.core.scenario_context import ScenarioContext
 from app.core.session_store import registry
 from app.db.models import Project, Scenario, ScenarioObject
 from app.helios import context as helios_ctx
+logger = logging.getLogger(__name__)
+
 from app.helios.persistence import (
     _ensure_scenario_structure,
     load_scenario_snapshot,
@@ -302,7 +306,12 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
             live = registry.get_scenario_context(session_id, project_id, scenario_id)
             if live is not None and not live.hydrated:
                 registry.remove_scenario(session_id, project_id, scenario_id)
+                logger.info("[context] released  scenario=%s (abandoned)",
+                            scenario_id[:8])
 
+    _t0 = time.monotonic()
+    logger.info("[init]    started   scenario=%s project=%s",
+                scenario_id[:8], project_id[:8])
     try:
         emit({"stage": "context", "progress": 0.1,
               "message": "Loading scenario context"})
@@ -312,6 +321,8 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         # the next scenario's init is already queued behind the lock it holds.
         # Releasing here is what keeps the peak at one context instead of two.
         if cancelled is not None and cancelled.is_set():
+            logger.info("[init]    cancelled scenario=%s during load, %.1fs",
+                        scenario_id[:8], time.monotonic() - _t0)
             _abandon()
             emit({"error": "Scenario load cancelled", "cancelled": True})
             return
@@ -321,6 +332,8 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         sos.ensure_hydrated(db, sctx, scenario_id, cancelled)
 
         if cancelled is not None and cancelled.is_set():
+            logger.info("[init]    cancelled scenario=%s during hydrate, %.1fs",
+                        scenario_id[:8], time.monotonic() - _t0)
             _abandon()
             emit({"error": "Scenario load cancelled", "cancelled": True})
             return
@@ -346,16 +359,24 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         )
         objects = len(sctx.persisted_objects) if sctx.persisted_objects else 0
         if objects < expected:
+            logger.error("[init]    incomplete scenario=%s only %d of %d "
+                         "geometries are live", scenario_id[:8], objects, expected)
             emit({"error": f"{expected - objects} of {expected} geometries could not "
                             f"be loaded into the scenario",
                   "objects": objects, "expected": expected})
             return
 
+        logger.info("[init]    ready     scenario=%s objects=%d in %.1fs",
+                    scenario_id[:8], objects, time.monotonic() - _t0)
         emit({"stage": "done", "progress": 1.0, "objects": objects,
               "message": "Scenario ready"})
     except HTTPException as exc:
+        logger.warning("[init]    failed    scenario=%s %s (%.1fs)",
+                       scenario_id[:8], exc.detail, time.monotonic() - _t0)
         emit({"error": exc.detail, "status": exc.status_code})
     except Exception as exc:   # noqa: BLE001 — the stream must always end
+        logger.exception("[init]    failed    scenario=%s after %.1fs",
+                         scenario_id[:8], time.monotonic() - _t0)
         emit({"error": str(exc) or exc.__class__.__name__})
 
 
@@ -412,5 +433,7 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
             saved = True
         except Exception:
             pass    # never block the release on a save failure
+    logger.info("[context] released  scenario=%s (discard, saved=%s)",
+                scenario_id[:8], saved)
     return {"success": True, "scenario_id": scenario_id,
             "discarded": True, "saved": saved}

@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     app_env: str = "development"
     backend_version: str = "1.0.0"
     log_level: str = "INFO"
+    # Per-request access logging. On by default: without it the server keeps no
+    # record of which endpoint did what, which made a duplicate scenario load
+    # undiagnosable without patching the source. HELIOS_ACCESS_LOG=0 to silence.
+    access_log: bool = True
 
     # Server
     host: str = "127.0.0.1"

@@ -197,6 +197,9 @@ def create_scenario(
     # Register an empty ScenarioContext in memory
     registry.get_or_create_scenario_context(session_id, project_id, scenario.id)
 
+    logger.info("[scenario] created   id=%s project=%s name=%r%s",
+                scenario.id[:8], project_id[:8], scenario.name,
+                f" forked from {source_scenario_id[:8]}" if source_scenario_id else "")
     return {
         "success": True,
         "scenario_id": scenario.id,
@@ -243,6 +246,8 @@ def delete_scenario(
     if scenario is None:
         raise HTTPException(404, f"Scenario {scenario_id} not found")
 
+    deleted_name = scenario.name      # read before the row goes
+
     try:
         db.delete(scenario)
         db.commit()
@@ -253,6 +258,8 @@ def delete_scenario(
     registry.remove_scenario(session_id, project_id, scenario_id)
     shutil.rmtree(_scenario_dir(project_id, scenario_id), ignore_errors=True)
 
+    logger.info("[scenario] deleted   id=%s project=%s name=%r",
+                scenario_id[:8], project_id[:8], deleted_name)
     return {"success": True, "scenario_id": scenario_id}
 
 

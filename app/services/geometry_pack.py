@@ -22,6 +22,33 @@ class PackCancelled(Exception):
 _CANCEL_CHECK_EVERY = 2048
 
 
+def _default_uvs(nv: int):
+    """The UVs Helios MEANS when a textured primitive stores none.
+
+    Empty UV is not missing data in the engine — it is a valid state meaning
+    "stretch the whole image across this shape" (Context.cpp checks
+    uv.size() == 4 against empty in copyPrimitive). Texture and UVs live in two
+    different places: getTextureFile reads the MATERIAL, getTextureUV reads the
+    primitive's own uv field, and assigning a textured material touches only the
+    first. So a colour-mode ground — built by addTileObject with no texturefile,
+    hence no UVs — that later gets the default soil texture through its material
+    label is textured with no UVs, and the engine considers that perfectly normal.
+
+    The wire format cannot express it: the reader requires vertexCount*8 bytes of
+    UV whenever the texture path is non-empty. Writing the full-image quad here
+    says the same thing the engine means, so the texture still renders.
+
+    Returns None for vertex counts with no obvious full-image mapping; the caller
+    then declares no texture at all rather than emit a buffer that cannot be read.
+    """
+    if nv == 4:
+        return np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                        dtype=np.float32)
+    if nv == 3:
+        return np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    return None
+
+
 def pack_primitives_binary(ctx, uuids: list, progress_cb=None,
                            prefetched_mat_labels=None,
                            prefetched_colors=None,
@@ -79,19 +106,39 @@ def pack_primitives_binary(ctx, uuids: list, progress_cb=None,
             verts = vert_data[v_start:v_end].astype(np.float32)
             clr = colors[idx].astype(np.float32)
             uuid_val = uuids[idx]
-            chunk = struct.pack("<iI", uuid_val, nv)
-            chunk += verts.tobytes()
-            chunk += clr[:3].tobytes()
-            chunk += struct.pack("<H", len(tex_bytes))
+            # UVs are RESOLVED BEFORE the texture length is written, because the
+            # two have to agree. The reader requires exactly nv*8 bytes of UV
+            # whenever the length is non-zero, and this used to write the length
+            # unconditionally and the UVs only if the engine had any — so a
+            # textured primitive with no stored UVs produced a buffer that could
+            # not be parsed, and the WHOLE object failed to draw (HELIO-339:
+            # "needed 32 more byte(s) at offset 233, buffer is 233 byte(s)").
+            uv_raw = None
             if tex_bytes:
-                chunk += tex_bytes
                 uv_j = textured_uv_idx.get(idx)
                 if uv_j is not None:
                     uv_start = int(uv_offsets[uv_j])
                     uv_end = int(uv_offsets[uv_j + 1])
-                    uv_raw = uv_data[uv_start:uv_end].reshape(-1, 2).astype(np.float32)
-                    uv_raw[:, 1] = 1.0 - uv_raw[:, 1]  # V-flip for Three.js
-                    chunk += uv_raw.tobytes()
+                    cand = uv_data[uv_start:uv_end].reshape(-1, 2).astype(np.float32)
+                    if cand.shape[0] == nv:
+                        cand[:, 1] = 1.0 - cand[:, 1]   # V-flip for Three.js
+                        uv_raw = cand
+                if uv_raw is None:
+                    # No UVs stored, or a count that does not match the vertices.
+                    # The full-image quad is what the engine means by empty UV.
+                    uv_raw = _default_uvs(nv)
+
+            chunk = struct.pack("<iI", uuid_val, nv)
+            chunk += verts.tobytes()
+            chunk += clr[:3].tobytes()
+            if tex_bytes and uv_raw is not None:
+                chunk += struct.pack("<H", len(tex_bytes))
+                chunk += tex_bytes
+                chunk += uv_raw.tobytes()
+            else:
+                # Declaring no texture is the only other self-consistent option.
+                # Renders as flat colour rather than losing the whole object.
+                chunk += struct.pack("<H", 0)
             chunks.append(chunk)
 
     for nv in np.unique(vc_arr):

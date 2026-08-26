@@ -30,7 +30,10 @@ import gzip
 import json
 import logging
 import lzma
+import os
+import shutil
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -108,9 +111,49 @@ def _rotate_scenario_current(project_id: str, scenario_id: str) -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     archive_path = archives_dir / f"autosave_{ts}.xml.gz"
 
-    raw_xml = current_xml.read_bytes()
-    archive_path.write_bytes(gzip.compress(raw_xml, compresslevel=6))
+    # STREAMED, a megabyte at a time. This was read_bytes() + gzip.compress(),
+    # which held the entire previous snapshot in RAM *and* its compressed copy —
+    # ~400 MB of transient allocation on a 200 MB scene, measured. It runs
+    # inside /discard, which is exactly when the next project starts loading, so
+    # it was a large part of the peak that aborts the process on Linux.
+    # Byte-for-byte identical output; only the memory profile changes.
+    with current_xml.open("rb") as src, \
+            gzip.open(archive_path, "wb", compresslevel=6) as dst:
+        shutil.copyfileobj(src, dst, 1024 * 1024)
     current_xml.unlink(missing_ok=True)
+
+
+_STALE_TEMP_SECONDS = 60 * 60      # an hour; a 1000x1000 writeXML takes ~16s
+
+
+def _sweep_stale_temps(context_dir: Path) -> None:
+    """Delete half-written context.xml temps left by a killed backend.
+
+    The temp used to be a NamedTemporaryFile in /tmp, which the OS cleared on
+    reboot. It now lives BESIDE context.xml so os.replace cannot fail EXDEV —
+    which also means nothing ever clears it. A SIGKILL during writeXML (the
+    app's reaper, the OOM killer, a power cut) strands the partial file in the
+    project folder for good, and `_project_disk_stats` sums everything under
+    that tree, so a 240 MB corpse also inflates the size shown in the UI.
+
+    AGE-BASED, not "delete every temp found". Two saves for one scenario can
+    overlap — a queued autosave and a synchronous discard save both take
+    .read(), and readers run concurrently — so a young temp may be one that
+    another thread is writing right now. An hour is far beyond any real write.
+
+    Best-effort: a scenario that cannot be tidied must still be saveable.
+    """
+    cutoff = time.time() - _STALE_TEMP_SECONDS
+    try:
+        for stale in context_dir.glob("context.xml.tmp-*"):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink(missing_ok=True)
+                    logger.info("[scenario-autosave] removed stale temp %s", stale.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
 
 
 def trigger_scenario_autosave(sctx) -> None:
@@ -126,32 +169,56 @@ def trigger_scenario_autosave(sctx) -> None:
     if not sctx.context or not hasattr(sctx.context, "writeXML"):
         return
 
-    _ensure_scenario_structure(sctx.project_id, sctx.scenario_id)
-
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
+    # GUARDED, because this is now the first write to the USER'S data directory.
+    # The temp used to be a NamedTemporaryFile in /tmp — a different filesystem,
+    # essentially never full or read-only — so every data-dir failure surfaced
+    # later, inside one of the logging handlers below. Moving it beside the
+    # target (required, so os.replace cannot fail EXDEV) put an unguarded
+    # OSError on the path: on EACCES, EROFS, EDQUOT or a full disk it escaped
+    # into the save worker, where concurrent.futures stores the exception on a
+    # Future nobody reads. The save died silently — nothing on stderr, nothing
+    # in backend.log — and wait_for_scenario_saves() still reported success.
+    try:
+        _ensure_scenario_structure(sctx.project_id, sctx.scenario_id)
+        final_path = _scenario_context_xml(sctx.project_id, sctx.scenario_id)
+        _sweep_stale_temps(final_path.parent)
+        # suffix=".xml" is load-bearing: PyHelios validates the output extension.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=final_path.parent, prefix="context.xml.tmp-", suffix=".xml")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+    except OSError:
+        logger.exception(
+            "[scenario-autosave] cannot open a temp file for scenario %s — "
+            "is the data directory writable?", sctx.scenario_id)
+        return
 
     try:
         sctx.context.writeXML(str(tmp_path))
-        raw_xml = tmp_path.read_bytes()
     except Exception:
         logger.exception("[scenario-autosave] writeXML failed for scenario %s", sctx.scenario_id)
-        return
-    finally:
         tmp_path.unlink(missing_ok=True)
+        return
 
     try:
         _rotate_scenario_current(sctx.project_id, sctx.scenario_id)
-        _scenario_context_xml(sctx.project_id, sctx.scenario_id).write_bytes(raw_xml)
+        # MOVED, not copied through RAM. This was read_bytes() + write_bytes(),
+        # which held the whole scene in memory for no reason — the engine had
+        # already written the file. 200 MB -> 0 MB, measured.
+        #
+        # os.replace is also atomic, so a failure now leaves the previous
+        # context.xml intact instead of a truncated one.
+        os.replace(tmp_path, final_path)
         logger.debug(
             "[scenario-autosave] saved scenario %s (%d bytes)",
-            sctx.scenario_id, len(raw_xml),
+            sctx.scenario_id, final_path.stat().st_size,
         )
     except Exception:
         logger.exception(
             "[scenario-autosave] rotation/write failed for scenario %s",
             sctx.scenario_id,
         )
+        tmp_path.unlink(missing_ok=True)
 
 
 # ── Deferred save ─────────────────────────────────────────────────────────────

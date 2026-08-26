@@ -247,6 +247,7 @@ def delete_scenario(
         raise HTTPException(500, "Failed to delete scenario")
 
     registry.remove_scenario(session_id, project_id, scenario_id)
+    helios_ctx.release_memory()
     shutil.rmtree(_scenario_dir(project_id, scenario_id), ignore_errors=True)
 
     return {"success": True, "scenario_id": scenario_id}
@@ -298,10 +299,24 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         Nothing is saved: the context is partial, and everything in it is
         already in the DB.
         """
+        nonlocal sctx
+        dropped = False
         with registry._scenario_lock.write():
             live = registry.get_scenario_context(session_id, project_id, scenario_id)
             if live is not None and not live.hydrated:
                 registry.remove_scenario(session_id, project_id, scenario_id)
+                dropped = True
+        # BOTH names, and `sctx` is the one that matters. `_abandon` only ever
+        # runs after `sctx = _resolve_scenario(...)` below, and _resolve_scenario
+        # returns the very object the registry held — so `live is sctx`, and
+        # clearing `live` alone leaves init_scenario's own frame pinning the
+        # context. The trim then runs against a fully live 1.4 GB allocation and
+        # reclaims nothing, on the one path this was written for. Both callers
+        # return immediately after, so dropping `sctx` here is safe.
+        live = None
+        sctx = None
+        if dropped:
+            helios_ctx.release_memory()
 
     try:
         emit({"stage": "context", "progress": 0.1,
@@ -383,7 +398,10 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
     first makes that lookup miss, and the request then waits on the lock exactly
     as it used to. `sctx` is a local reference, so the save is unaffected.
     """
-    from app.helios.persistence import trigger_scenario_autosave
+    from app.helios.persistence import (
+        trigger_scenario_autosave,
+        wait_for_scenario_saves,
+    )
 
     with registry._scenario_lock.write():
         sctx = registry.get_scenario_context(session_id, project_id, scenario_id)
@@ -412,5 +430,24 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
             saved = True
         except Exception:
             pass    # never block the release on a save failure
+
+    # DRAIN FIRST, then drop, then trim — all three, in this order.
+    #
+    # `sctx` is not the last reference while a save is still queued:
+    # queue_scenario_autosave submits a closure OVER sctx to a one-worker pool,
+    # and the work item pins it until it has run. Trimming with that pending
+    # reclaims nothing — measured 0.1 MB of a 200 MB allocation — and when the
+    # worker finally drops it, no trim follows. Every geometry and weather edit
+    # queues one, so a discard right after an edit is the common case, not the
+    # rare one. This waits for work that was already going to run; it does not
+    # cause a write that was not already queued.
+    #
+    # Then `del sctx`: held to the end of the function it would keep the whole
+    # context alive and the trim would again find nothing to give back.
+    # All outside the lock, so none of it stalls another scenario.
+    wait_for_scenario_saves()
+    del sctx
+    helios_ctx.release_memory()
+
     return {"success": True, "scenario_id": scenario_id,
             "discarded": True, "saved": saved}

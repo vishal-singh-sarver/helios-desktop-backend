@@ -71,7 +71,16 @@ if _PYHELIOS_USE_SOURCE:
                 _build_cmd = [str(_build_script)]
             if _build_script.exists():
                 print("[pyhelios] Building from source (this may take a few minutes)...")
-                _result = subprocess.run(_build_cmd, cwd=str(_pyhelios_src.parent), timeout=600)
+                # stdin=DEVNULL, never inherited. The Electron app spawns the
+                # backend with a PIPE on stdin as a liveness signal and never
+                # writes to it (main/backend-manager.ts); a child that inherits
+                # that pipe and reads it blocks forever, and this one runs
+                # during module import, so the whole backend hangs before it
+                # can serve. DEVNULL gives the build script an immediate EOF.
+                _result = subprocess.run(
+                    _build_cmd, cwd=str(_pyhelios_src.parent), timeout=600,
+                    stdin=subprocess.DEVNULL,
+                )
                 if _result.returncode == 0 and _lib_path.exists():
                     print("[pyhelios] Build complete.")
                 else:

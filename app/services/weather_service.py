@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import math
 import os
 import shutil
@@ -38,6 +39,8 @@ from app.helios.persistence import (
     _ensure_scenario_structure,
     queue_scenario_autosave,
 )
+
+logger = logging.getLogger(__name__)
 
 # PyHelios's specific exception for "thing not found" errors (missing label,
 # missing cell, etc.). Defensive import: if PyHelios isn't available, define
@@ -735,6 +738,8 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
         response["message"] = "Some values contained more than 7 decimal places and were truncated."
     
     queue_scenario_autosave(sctx)
+    logger.info("[weather]  imported  scenario=%s %d rows x %d columns",
+                sctx.scenario_id[:8], len(rows), len(header))
     return response
 
 
@@ -1591,6 +1596,8 @@ def clear_data(sctx: "ScenarioContext", db: Session) -> dict:
         pass  # SQL is the source of truth; orphan cells will be invisible to /addRow
 
     queue_scenario_autosave(sctx)
+    logger.info("[weather]  cleared   scenario=%s %d headers removed",
+                sctx.scenario_id[:8], headers_removed)
     return {
         "success": True,
         "headers_removed": headers_removed,

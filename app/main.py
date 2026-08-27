@@ -1,3 +1,7 @@
+import logging
+
+import time
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -46,6 +50,24 @@ async def stale_pyhelios_header(request: Request, call_next):
     from app.helios.context import _PYHELIOS_STALE
     if _PYHELIOS_STALE:
         response.headers["X-PyHelios-Stale"] = "true"
+    return response
+
+
+# Anything slower than this gets a line of its own. The access log records every
+# request; this makes the slow ones findable without reading all of them, and
+# turns "the app feels slow" into a path and a number.
+SLOW_REQUEST_SECONDS = 2.0
+
+
+@app.middleware("http")
+async def log_slow_requests(request: Request, call_next):
+    started = time.monotonic()
+    response = await call_next(request)
+    elapsed = time.monotonic() - started
+    if elapsed >= SLOW_REQUEST_SECONDS:
+        logging.getLogger("app.slow").warning(
+            "[slow]    %.1fs  %s %s -> %s",
+            elapsed, request.method, request.url.path, response.status_code)
     return response
 
 # ── Routers ────────────────────────────────────────────────────────────────

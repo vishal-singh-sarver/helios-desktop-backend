@@ -23,6 +23,7 @@ material_group_id (never the name), so there is nothing to reconcile.
 """
 from __future__ import annotations
 
+import logging
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -58,6 +59,8 @@ from app.services.eav_validation import (
     validate_properties,
     visualiser_mode_required,
 )
+
+logger = logging.getLogger(__name__)
 
 _NAME_PREFIX = "Material"
 # Allowed upload extensions per file-typed material property.
@@ -373,6 +376,8 @@ def create_group(db: Session, session_id: str, body) -> dict:
         db.refresh(grp)
 
         # A new group is assigned nowhere — no reconcile/repaint to do.
+        logger.info("[material] group created  id=%s name=%r members=%d",
+                    grp.id, grp.name, len(members))
         return {"success": True, "group": serialize_group(db, grp)}
     except HTTPException:
         raise   # deliberate validation errors keep their specific message/code
@@ -636,6 +641,7 @@ def delete_group(db: Session, session_id: str, group_id: int,
                  scenario_id: str | None) -> dict:
     grp = _group_or_404(db, group_id)
     scn = _scenario_scope_or_404(db, session_id, scenario_id) if scenario_id else None
+    deleted_name = grp.name           # read before the row goes
 
     db.delete(grp)   # cascades members + material_data — LIBRARY ONLY: applied
     db.commit()      # rows in every scenario survive until their sync
@@ -648,6 +654,8 @@ def delete_group(db: Session, session_id: str, group_id: int,
         result = _eager_reconcile(db, session_id, scn, group_id)
         out["unassigned_from"] = result["applied"]["removed_groups"]
         out["sync"] = _sync_block(scn, result)
+    logger.info("[material] group deleted  id=%s name=%r unassigned-from=%d",
+                group_id, deleted_name, out["unassigned_from"])
     return out
 
 

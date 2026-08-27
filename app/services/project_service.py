@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from fastapi import HTTPException
+import logging
 import shutil
 from datetime import datetime, timezone
 
@@ -10,6 +11,8 @@ from app.core.session_store import registry
 from app.core.config import settings
 from app.helios import context as helios_ctx
 from app.services.weather_header_service import serialize as serialize_header
+
+logger = logging.getLogger(__name__)
 
 
 def create_project(session_id: str, name: str, latitude: float,
@@ -61,6 +64,8 @@ def create_project(session_id: str, name: str, latitude: float,
     # user does their first weather mutation.
     registry.get_or_create_scenario_context(session_id, project.id, main_scenario.id)
 
+    logger.info("[project]  created   id=%s name=%r main-scenario=%s",
+                project.id[:8], clean_name, main_scenario.id[:8])
     return {
         "success": True,
         "project_id": project.id,
@@ -291,12 +296,16 @@ def delete_project(session_id: str, project_id: str, db: Session) -> dict:
     if not project:
         raise HTTPException(404, "Project not found")
 
+    deleted_name = project.name       # read before the row goes
+
     try:
         db.delete(project)
         db.commit()
     except Exception:
         db.rollback()
         raise HTTPException(500, "Failed to delete project")
+
+    logger.info("[project]  deleted   id=%s name=%r", project_id[:8], deleted_name)
 
     # Mutate store — remove reference, GC handles cleanup.
     # remove_project also wipes all scenarios for this project from memory.

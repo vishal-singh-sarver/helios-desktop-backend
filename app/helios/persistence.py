@@ -192,6 +192,7 @@ def trigger_scenario_autosave(sctx) -> None:
             "[scenario-autosave] cannot open a temp file for scenario %s — "
             "is the data directory writable?", sctx.scenario_id)
         return
+    _started = time.monotonic()
 
     try:
         sctx.context.writeXML(str(tmp_path))
@@ -209,10 +210,12 @@ def trigger_scenario_autosave(sctx) -> None:
         # os.replace is also atomic, so a failure now leaves the previous
         # context.xml intact instead of a truncated one.
         os.replace(tmp_path, final_path)
-        logger.debug(
-            "[scenario-autosave] saved scenario %s (%d bytes)",
-            sctx.scenario_id, final_path.stat().st_size,
-        )
+        # Size comes from stat(), not len(raw_xml): there is no raw_xml any
+        # more, and reading the file back just to measure it would reintroduce
+        # exactly the buffering this removed.
+        logger.info("[save]    written   scenario=%s %.1f MB in %.1fs",
+                    sctx.scenario_id[:8], final_path.stat().st_size / 1048576,
+                    time.monotonic() - _started)
     except Exception:
         logger.exception(
             "[scenario-autosave] rotation/write failed for scenario %s",
@@ -253,6 +256,7 @@ def queue_scenario_autosave(sctx) -> None:
         with registry._scenario_lock.read():
             trigger_scenario_autosave(sctx)
 
+    logger.debug("[save]    queued    scenario=%s", sctx.scenario_id[:8])
     _SAVE_POOL.submit(_run)
 
 
@@ -285,14 +289,34 @@ def load_scenario_snapshot(sctx) -> bool:
     """
     new_xml = _scenario_context_xml(sctx.project_id, sctx.scenario_id)
     if not new_xml.exists():
+        logger.info("[context] no snapshot scenario=%s — building from the DB",
+                    sctx.scenario_id[:8])
         return True
 
+    size_mb = new_xml.stat().st_size / 1048576
+    started = time.monotonic()
     try:
         sctx.context.loadXML(str(new_xml))
-        logger.info("[scenario-load] restored scenario %s", sctx.scenario_id)
+        logger.info("[context] loaded    scenario=%s %.1f MB in %.1fs",
+                    sctx.scenario_id[:8], size_mb, time.monotonic() - started)
         return True
-    except Exception:
-        logger.exception("[scenario-load] failed for scenario %s", sctx.scenario_id)
+    except Exception as exc:
+        # One line, not a traceback. This failure is EXPECTED and handled: a
+        # tiled ground fails to reload because texture_repeat is not written to
+        # context.xml, so the repeat returns as 1 and the engine's
+        # subdiv < repeat x texture_pixels check rejects it. It fires on every
+        # open of such a scenario, and a 12-line stack for a known, recovered
+        # condition trains the reader to skip the log — which is how a real
+        # error gets missed. Anything OTHER than that keeps its traceback.
+        detail = str(exc)
+        if "resolution of the texture image" in detail:
+            logger.warning(
+                "[context] load-failed scenario=%s after %.1fs — texture repeat "
+                "not persisted (known engine limit); rebuilding from the DB",
+                sctx.scenario_id[:8], time.monotonic() - started)
+        else:
+            logger.exception("[context] load-failed scenario=%s — rebuilding "
+                             "from the DB", sctx.scenario_id[:8])
         return False
 
 

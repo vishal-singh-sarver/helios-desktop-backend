@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import functools
 import json
+import time
+import logging
 import math
 import threading
 
@@ -76,6 +78,8 @@ from app.services.eav_validation import (
     validate_name,
     validate_properties,
 )
+
+logger = logging.getLogger(__name__)
 
 _GROUP_PREFIX = "Group"
 
@@ -1099,6 +1103,9 @@ def create_object(db: Session, session_id: str, project_id: str,
         db.delete(so)
         db.commit()
         raise
+    logger.info("[geometry] created   scenario=%s object=%s name=%r %d primitives",
+                scenario_id[:8], so.id, so.name,
+                len(json.loads(so.helios_uuids or "[]")))
     return {"success": True, "object": serialize_object(db, sctx, so)}
 
 
@@ -1258,6 +1265,9 @@ def update_object(db: Session, session_id: str, project_id: str,
     for entry in body.materials:
         assign_material_group(db, session_id, project_id, scenario_id, object_id, entry)
 
+    logger.info("[geometry] updated   scenario=%s object=%s name=%r %d primitives",
+                scenario_id[:8], object_id, so.name,
+                len(json.loads(so.helios_uuids or "[]")))
     return {"success": True, "object": serialize_object(db, sctx, so)}
 
 
@@ -1285,6 +1295,7 @@ def delete_object(db: Session, session_id: str, project_id: str,
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
+    deleted_name = so.name            # read before the row goes
 
     # deleteObject removes the compound object and its primitives, so the
     # per-primitive material data dies with them — no label cleanup needed.
@@ -1292,6 +1303,8 @@ def delete_object(db: Session, session_id: str, project_id: str,
     db.delete(so)   # cascades intrinsic + snapshot rows + assignments
     db.commit()
     _autosave(sctx)
+    logger.info("[geometry] deleted   scenario=%s object=%s name=%r",
+                scenario_id[:8], object_id, deleted_name)
     return {"success": True, "object_id": object_id}
 
 
@@ -1357,10 +1370,20 @@ def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
     for so in rows:
         if so.id in sctx.persisted_objects:
             uuids.extend(json.loads(so.helios_uuids or "[]"))
-    from app.services.geometry_pack import pack_primitives_binary
-    with session_registry._scenario_lock.read():
-        return pack_primitives_binary(helios_ctx.get_context(sctx), uuids,
-                                      cancelled=cancelled)
+    from app.services.geometry_pack import PackCancelled, pack_primitives_binary
+    started = time.monotonic()
+    try:
+        with session_registry._scenario_lock.read():
+            payload = pack_primitives_binary(helios_ctx.get_context(sctx), uuids,
+                                             cancelled=cancelled)
+    except PackCancelled:
+        logger.info("[geometry] cancelled scenario=%s after %.1fs — client gone",
+                    scenario_id[:8], time.monotonic() - started)
+        raise
+    logger.info("[geometry] served    scenario=%s %.1f MB, %d primitives, %.1fs",
+                scenario_id[:8], len(payload) / 1048576, len(uuids),
+                time.monotonic() - started)
+    return payload
 
 
 # ── Scenario-level run configuration (spec §5.9) ─────────────────────────────

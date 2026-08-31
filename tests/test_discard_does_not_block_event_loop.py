@@ -52,12 +52,26 @@ def test_a_slow_discard_does_not_stall_other_requests(client, monkeypatch):
                         raising=False)
     monkeypatch.setattr(persistence, "trigger_scenario_autosave", _slow_save)
 
+    # QUEUE the slow save rather than just marking the scene dirty. discard
+    # drains the queue before deciding whether to write, so this guarantees the
+    # slow save runs inside the request. Relying on the scene still being dirty
+    # was ordering-dependent: the ground's own save usually lands first, leaving
+    # it clean, and the test then passed on a 4ms discard that proved nothing.
+    from app.core.session_store import registry
+    live = registry.get_scenario_context(session_id, pid, sid)
+    assert live is not None, "no live scenario to discard"
+    persistence.queue_scenario_autosave(live)
+
     timings = {}
 
     def _discard():
         t = time.monotonic()
-        client.post(f"/api/project/{pid}/scenarios/{sid}/discard", headers=h)
+        resp = client.post(f"/api/project/{pid}/scenarios/{sid}/discard", headers=h)
         timings["discard"] = time.monotonic() - t
+        # Recorded so a fast discard cannot pass as "not slow" when it was
+        # actually an error or a no-op release.
+        timings["status"] = resp.status_code
+        timings["body"] = resp.json()
 
     d = threading.Thread(target=_discard)
     d.start()

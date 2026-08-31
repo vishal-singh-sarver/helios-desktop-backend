@@ -450,8 +450,21 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
     # Still SYNCHRONOUS, unlike every other save: discard is the one path where
     # the context is about to be released, so a queued write would serialise a
     # context that may be gone by the time the worker reaches it.
+    # DRAIN FIRST. Every mutation already queues a save, so by the time the
+    # user navigates away the write is usually done or in flight. Waiting for
+    # it costs nothing that was not already going to be spent, and it is what
+    # makes the dirty check below meaningful — an undrained queue would leave
+    # the scene looking dirty and we would serialise it a second time.
+    wait_for_scenario_saves()
+
+    # SKIP THE WRITE WHEN THE FILE ALREADY MATCHES. This was an unconditional
+    # writeXML, and on a high-resolution textured ground it is ~16s of
+    # re-serialising a scene byte-identical to what is already on disk — paid
+    # while the user waits to get back to the project list. Persistence is the
+    # mutation's job; discard only has to cover a change that raced the drain.
     saved = False
-    if save:
+    dirty = sctx.mutation_seq != sctx.saved_seq
+    if save and dirty:
         try:
             with registry._scenario_lock.read():
                 trigger_scenario_autosave(sctx)
@@ -459,27 +472,19 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
         except Exception:
             pass    # never block the release on a save failure
 
-    # DRAIN FIRST, then drop, then trim — all three, in this order.
-    #
-    # `sctx` is not the last reference while a save is still queued:
-    # queue_scenario_autosave submits a closure OVER sctx to a one-worker pool,
-    # and the work item pins it until it has run. Trimming with that pending
-    # reclaims nothing — measured 0.1 MB of a 200 MB allocation — and when the
-    # worker finally drops it, no trim follows. Every geometry and weather edit
-    # queues one, so a discard right after an edit is the common case, not the
-    # rare one. This waits for work that was already going to run; it does not
-    # cause a write that was not already queued.
-    #
-    # Then `del sctx`: held to the end of the function it would keep the whole
-    # context alive and the trim would again find nothing to give back.
-    # All outside the lock, so none of it stalls another scenario.
-    wait_for_scenario_saves()
+    # `del sctx` before the trim: held to the end of the function it would keep
+    # the whole context alive and malloc_trim would find nothing to give back.
+    # The queued-save closure held a reference too, which is the other reason
+    # the drain above has to come first. Outside the lock, so a 62 ms reclaim
+    # never stalls another scenario.
     del sctx
     helios_ctx.release_memory()
 
     # Logged AFTER the trim, not before: the line claims the context was
     # released, and until release_memory() has run that is not yet true.
-    logger.info("[context] released  scenario=%s (discard, saved=%s)",
-                scenario_id[:8], saved)
+    # `saved` distinguishes a real write from a skip — without it a fast
+    # discard and a broken one look identical in the log.
+    logger.info("[context] released  scenario=%s (discard, saved=%s, dirty=%s)",
+                scenario_id[:8], saved, dirty)
     return {"success": True, "scenario_id": scenario_id,
             "discarded": True, "saved": saved}

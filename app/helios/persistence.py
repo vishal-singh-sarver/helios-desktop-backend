@@ -194,6 +194,12 @@ def trigger_scenario_autosave(sctx) -> None:
         return
     _started = time.monotonic()
 
+    # CAPTURED BEFORE the write, not after. writeXML takes seconds on a large
+    # scene, and a mutation landing inside that window is not in the bytes we
+    # are about to lay down. Recording the sequence we actually serialised
+    # leaves such a scene dirty, so the next save — or /discard — still writes.
+    _writing_seq = sctx.mutation_seq
+
     try:
         sctx.context.writeXML(str(tmp_path))
     except Exception:
@@ -210,6 +216,9 @@ def trigger_scenario_autosave(sctx) -> None:
         # os.replace is also atomic, so a failure now leaves the previous
         # context.xml intact instead of a truncated one.
         os.replace(tmp_path, final_path)
+        # Only now is the file on disk. Set AFTER os.replace, never before: a
+        # failure between here and there must leave the scene dirty.
+        sctx.saved_seq = _writing_seq
         # Size comes from stat(), not len(raw_xml): there is no raw_xml any
         # more, and reading the file back just to measure it would reintroduce
         # exactly the buffering this removed.
@@ -251,6 +260,11 @@ def queue_scenario_autosave(sctx) -> None:
     # Imported here, not at module scope: session_store is a higher layer and
     # importing it eagerly would make persistence depend on the registry.
     from app.core.session_store import registry
+
+    # Every mutation site calls this immediately after mutating, so it is the
+    # one place that reliably means "the context no longer matches disk".
+    # /discard reads the counters to decide whether it can skip its writeXML.
+    sctx.mutation_seq += 1
 
     def _run() -> None:
         with registry._scenario_lock.read():

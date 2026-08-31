@@ -80,6 +80,9 @@ def test_blocker4_weather_mutation_is_excluded_by_a_running_save(client):
 def test_blocker3_discard_holds_a_lock_while_it_writes(client):
     """discard's writeXML must exclude mutations, not run bare."""
     sh, pid, sid, h, base = _project(client)
+    # Dirty it: discard now skips the write when context.xml already matches,
+    # and a skipped write cannot be observed holding a lock.
+    registry.get_scenario_context(sh, pid, sid).mutation_seq += 1
 
     seen = {}
     real = persistence.trigger_scenario_autosave

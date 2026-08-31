@@ -261,10 +261,50 @@ if (Test-Path $imagesDir) {
   $pyInstallerArgs += @('--add-data', "$imagesDir;pyhelios\pyhelios_build\build\lib\images")
 }
 
-# Plugin assets (shaders, textures, spectral data)
+# Plugin assets (shaders, textures, spectral data).
+#
+# Only the asset subdirectories are bundled, NOT the whole build/plugins tree.
+# CMake writes its artifacts alongside the assets - per-plugin CMakeFiles/,
+# <target>.dir/Release/ object trees, MSBuild .tlog logs, and the vendored
+# freetype/glew/glfw sources under visualizer/lib. Copying the lot dragged in
+# ~138 MB of dead weight and produced staged paths over 260 chars, the same
+# MAX_PATH failure the pyhelios comment above warns about.
+#
+# Do NOT swap this for an extension filter: .obj is ambiguous here. Under
+# plantarchitecture/assets it is a Wavefront 3D model that IS needed; under
+# <target>.dir/Release/ it is an MSVC object file that is not. Only a
+# directory-level split separates them correctly.
+#
+# Each entry maps <build/plugins>/<rel> to the same <rel> in the bundle, so
+# runtime lookups (helios::resolveFilePath("plugins/...")) resolve unchanged.
+# A missing asset dir does not fail the build - it fails silently at runtime -
+# so when a plugin gains an asset directory, add it here.
+$pluginAssetDirs = @(
+  'leafoptics\spectral_data'
+  'lidar\data'
+  'lidar\xml'
+  'plantarchitecture\assets'
+  'solarposition\lib'
+  'solarposition\ssolar_goa'
+  'visualizer\fonts'
+  'visualizer\shaders'
+  'visualizer\textures'
+  'weberpenntree\leaves'
+  'weberpenntree\wood'
+  'weberpenntree\xml'
+)
 $pluginsDir = Join-Path $buildRootDir 'plugins'
 if (Test-Path $pluginsDir) {
-  $pyInstallerArgs += @('--add-data', "$pluginsDir;pyhelios\pyhelios_build\build\plugins")
+  foreach ($rel in $pluginAssetDirs) {
+    $assetPath = Join-Path $pluginsDir $rel
+    if (Test-Path $assetPath) {
+      $pyInstallerArgs += @('--add-data', "$assetPath;pyhelios\pyhelios_build\build\plugins\$rel")
+    } else {
+      Write-Host "[!] Plugin asset dir not found, skipping: $assetPath"
+    }
+  }
+} else {
+  Write-Host "[!] WARNING: plugins build dir not found at $pluginsDir"
 }
 
 # Built binaries in bin/ (if any)

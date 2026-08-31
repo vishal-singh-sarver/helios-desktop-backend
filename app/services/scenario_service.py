@@ -256,6 +256,7 @@ def delete_scenario(
         raise HTTPException(500, "Failed to delete scenario")
 
     registry.remove_scenario(session_id, project_id, scenario_id)
+    helios_ctx.release_memory()
     shutil.rmtree(_scenario_dir(project_id, scenario_id), ignore_errors=True)
 
     logger.info("[scenario] deleted   id=%s project=%s name=%r",
@@ -309,12 +310,26 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         Nothing is saved: the context is partial, and everything in it is
         already in the DB.
         """
+        nonlocal sctx
+        dropped = False
         with registry._scenario_lock.write():
             live = registry.get_scenario_context(session_id, project_id, scenario_id)
             if live is not None and not live.hydrated:
                 registry.remove_scenario(session_id, project_id, scenario_id)
+                dropped = True
                 logger.info("[context] released  scenario=%s (abandoned)",
                             scenario_id[:8])
+        # BOTH names, and `sctx` is the one that matters. `_abandon` only ever
+        # runs after `sctx = _resolve_scenario(...)` below, and _resolve_scenario
+        # returns the very object the registry held — so `live is sctx`, and
+        # clearing `live` alone leaves init_scenario's own frame pinning the
+        # context. The trim then runs against a fully live 1.4 GB allocation and
+        # reclaims nothing, on the one path this was written for. Both callers
+        # return immediately after, so dropping `sctx` here is safe.
+        live = None
+        sctx = None
+        if dropped:
+            helios_ctx.release_memory()
 
     _t0 = time.monotonic()
     logger.info("[init]    started   scenario=%s project=%s",
@@ -411,7 +426,10 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
     first makes that lookup miss, and the request then waits on the lock exactly
     as it used to. `sctx` is a local reference, so the save is unaffected.
     """
-    from app.helios.persistence import trigger_scenario_autosave
+    from app.helios.persistence import (
+        trigger_scenario_autosave,
+        wait_for_scenario_saves,
+    )
 
     with registry._scenario_lock.write():
         sctx = registry.get_scenario_context(session_id, project_id, scenario_id)
@@ -432,15 +450,41 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
     # Still SYNCHRONOUS, unlike every other save: discard is the one path where
     # the context is about to be released, so a queued write would serialise a
     # context that may be gone by the time the worker reaches it.
+    # DRAIN FIRST. Every mutation already queues a save, so by the time the
+    # user navigates away the write is usually done or in flight. Waiting for
+    # it costs nothing that was not already going to be spent, and it is what
+    # makes the dirty check below meaningful — an undrained queue would leave
+    # the scene looking dirty and we would serialise it a second time.
+    wait_for_scenario_saves()
+
+    # SKIP THE WRITE WHEN THE FILE ALREADY MATCHES. This was an unconditional
+    # writeXML, and on a high-resolution textured ground it is ~16s of
+    # re-serialising a scene byte-identical to what is already on disk — paid
+    # while the user waits to get back to the project list. Persistence is the
+    # mutation's job; discard only has to cover a change that raced the drain.
     saved = False
-    if save:
+    dirty = sctx.mutation_seq != sctx.saved_seq
+    if save and dirty:
         try:
             with registry._scenario_lock.read():
                 trigger_scenario_autosave(sctx)
             saved = True
         except Exception:
             pass    # never block the release on a save failure
-    logger.info("[context] released  scenario=%s (discard, saved=%s)",
-                scenario_id[:8], saved)
+
+    # `del sctx` before the trim: held to the end of the function it would keep
+    # the whole context alive and malloc_trim would find nothing to give back.
+    # The queued-save closure held a reference too, which is the other reason
+    # the drain above has to come first. Outside the lock, so a 62 ms reclaim
+    # never stalls another scenario.
+    del sctx
+    helios_ctx.release_memory()
+
+    # Logged AFTER the trim, not before: the line claims the context was
+    # released, and until release_memory() has run that is not yet true.
+    # `saved` distinguishes a real write from a skip — without it a fast
+    # discard and a broken one look identical in the log.
+    logger.info("[context] released  scenario=%s (discard, saved=%s, dirty=%s)",
+                scenario_id[:8], saved, dirty)
     return {"success": True, "scenario_id": scenario_id,
             "discarded": True, "saved": saved}

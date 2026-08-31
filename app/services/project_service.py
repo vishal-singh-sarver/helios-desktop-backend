@@ -310,6 +310,9 @@ def delete_project(session_id: str, project_id: str, db: Session) -> dict:
     # Mutate store — remove reference, GC handles cleanup.
     # remove_project also wipes all scenarios for this project from memory.
     registry.remove_project(session_id, project_id)
+    # GC frees them; only this returns the pages to the OS. A project can hold
+    # several scenario contexts, so this is the largest single release there is.
+    helios_ctx.release_memory()
 
     # Disk cleanup — one rmtree handles the entire project tree (scenes,
     # scenarios, weather, archives, everything) since scenarios live nested

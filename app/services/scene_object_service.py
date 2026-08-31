@@ -304,6 +304,32 @@ def _surface_signature(surface: tuple[str, str | None]) -> str:
     return f"texture:{path}" if kind == "texture" else kind
 
 
+def _loaded_surface_signature(ctx, uuids: list, desired: str) -> str:
+    """What a LOADED object actually is, which is not always what the DB wants.
+
+    Hydration used to record `desired` as the built signature — an assumption,
+    never checked. If context.xml holds a colour-mode tile (addTileObject with
+    no texturefile, so NO UVs) while the DB says soil or texture, the rebuild
+    guard in _repaint_after_material_change compares desired against desired,
+    sees no change, skips the rebuild, and reapply_all_materials then stamps a
+    texture onto UV-less primitives. That state is self-perpetuating: writeXML
+    only emits <textureUV> when UVs are non-empty, so once saved it reloads the
+    same way every time.
+
+    UVs are the tell. A textured tile bakes them; a colour tile has none. Only
+    the FIRST primitive is inspected — a tile object is homogeneous, and a
+    1000x1000 ground must not pay for a scan to answer this.
+    """
+    if desired == "colour" or not uuids:
+        return desired
+    try:
+        _, offsets = ctx.getPrimitiveTextureUV(uuids[:1])
+        has_uvs = int(offsets[1]) - int(offsets[0]) > 0
+    except Exception:
+        return desired      # cannot tell — do not force a pointless rebuild
+    return desired if has_uvs else "colour"
+
+
 @_with_scenario_lock
 def _drop_live_object(sctx, ctx_object_id: int | None, obj_id: int | None,
                       uuids: list[int]) -> None:
@@ -687,7 +713,10 @@ def _hydrate(db: Session, sctx, scenario_id: str, cancelled=None) -> None:
         reg_id = reg.register_object(
             sctx, so.name, "ground", uuids,
             scenario_object_id=so.id, ctx_object_id=obj_id,
-            built_texture=_surface_signature(_winner_surface(db, so)),
+            # What the XML HOLDS, not what the DB wants. Recording `desired`
+            # here made the rebuild guard compare a value against itself.
+            built_texture=_loaded_surface_signature(
+                ctx, uuids, _surface_signature(_winner_surface(db, so))),
         )
         sctx.persisted_objects[so.id] = reg_id
         sctx.ctx_objects[so.id] = obj_id

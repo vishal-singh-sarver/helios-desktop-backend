@@ -60,17 +60,55 @@ def test_save_false_releases_without_touching_context_xml(client):
     assert xml.read_bytes() == before_bytes, "context.xml contents changed"
 
 
-def test_default_still_saves(client):
-    """The existing contract is unchanged — omitting the flag saves."""
+def _dirty(session_id, pid, sid):
+    """Mark the live scenario as changed since its last save.
+
+    Done on the counter rather than through a real mutation because a mutation
+    queues a save that may drain before discard runs, putting the scene back to
+    clean and quietly testing nothing.
+    """
+    from app.core.session_store import registry
+    sctx = registry.get_scenario_context(session_id, pid, sid)
+    assert sctx is not None, "no live scenario to dirty"
+    sctx.mutation_seq += 1
+    return sctx
+
+
+def test_default_saves_when_there_is_something_to_save(client):
+    """The default persists a change that has not reached disk.
+
+    `_project` drains the queue, so the scene it hands back is already on disk
+    and discard is right to skip it — see the companion test below. Dirtying it
+    here is what exercises the write path.
+    """
     sh, pid, sid, h, base = _project(client)
     xml = _scenario_context_xml(pid, sid)
     before_mtime = xml.stat().st_mtime_ns
     time.sleep(0.01)                      # so a rewrite is detectable
+    _dirty(sh, pid, sid)
 
     r = client.post(f"/api/project/{pid}/scenarios/{sid}/discard", headers=h)
     assert r.status_code == 200, r.text
     assert r.json()["saved"] is True, "the default stopped saving"
     assert xml.stat().st_mtime_ns != before_mtime, "the default did not write"
+
+
+def test_default_skips_the_write_when_the_file_already_matches(client):
+    """The optimisation. Every mutation already queues a save, so on the way
+    back to the project list the file is usually current — and re-serialising
+    it cost ~16s on a high-resolution ground for byte-identical output.
+
+    The scene must still be intact afterwards; skipping a write is only safe
+    because the file was already right."""
+    sh, pid, sid, h, base = _project(client)
+    xml = _scenario_context_xml(pid, sid)
+    before = xml.read_bytes()
+
+    r = client.post(f"/api/project/{pid}/scenarios/{sid}/discard", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["saved"] is False, "re-wrote a scene already on disk"
+    assert r.json()["discarded"] is True
+    assert xml.read_bytes() == before, "the scene on disk changed"
 
 
 def test_save_false_does_not_rotate_the_good_snapshot(client):

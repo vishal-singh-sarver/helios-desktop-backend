@@ -993,6 +993,14 @@ def test_geometry_persists_to_context_xml_and_reloads(client):
     oid = obj["id"]
     assert len(obj["helios_uuids"]) == 4
 
+    # The save is QUEUED, not inline — object create calls
+    # queue_scenario_autosave, so the write lands on a background worker. This
+    # asserted straight after the POST and passed only when the worker happened
+    # to win the race: 1 run in 5 on this machine, on HEAD as well as here.
+    # Same wait every other test in the suite uses.
+    from app.helios import persistence
+    persistence.wait_for_scenario_saves()
+
     xml = settings.scenario_context_file_dir(pid, sid) / "context.xml"
     assert xml.exists() and xml.stat().st_size > 0    # written on create
 

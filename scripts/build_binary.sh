@@ -192,46 +192,9 @@ if [ -d "$BACKEND_DIR/pyhelios/pyhelios_build/build/lib/images" ]; then
     PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $BACKEND_DIR/pyhelios/pyhelios_build/build/lib/images:pyhelios/pyhelios_build/build/lib/images"
 fi
 
-# 5. Plugin assets (shaders, textures, spectral data, ~85 MB)
-#
-# Only the asset subdirectories, NOT the whole build/plugins tree. CMake writes
-# its artifacts alongside the assets — per-plugin CMakeFiles/, <target>.dir/
-# object trees, and the vendored freetype/glew/glfw sources under
-# visualizer/lib — which added ~138 MB of dead weight to the bundle.
-#
-# Do NOT swap this for an extension filter: .obj is ambiguous. Under
-# plantarchitecture/assets it is a Wavefront 3D model that IS needed; under the
-# object trees it is a compiler output that is not. Split by directory only.
-#
-# Each entry keeps its relative path in the bundle, so runtime lookups
-# (helios::resolveFilePath("plugins/...")) resolve unchanged. A missing asset
-# dir does not fail the build — it fails silently at runtime — so when a plugin
-# gains an asset directory, add it here and to build_binary.ps1.
-PLUGIN_ASSET_DIRS="
-leafoptics/spectral_data
-lidar/data
-lidar/xml
-plantarchitecture/assets
-solarposition/lib
-solarposition/ssolar_goa
-visualizer/fonts
-visualizer/shaders
-visualizer/textures
-weberpenntree/leaves
-weberpenntree/wood
-weberpenntree/xml
-"
-PLUGINS_ROOT="$BACKEND_DIR/pyhelios/pyhelios_build/build/plugins"
-if [ -d "$PLUGINS_ROOT" ]; then
-    for rel in $PLUGIN_ASSET_DIRS; do
-        if [ -d "$PLUGINS_ROOT/$rel" ]; then
-            PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $PLUGINS_ROOT/$rel:pyhelios/pyhelios_build/build/plugins/$rel"
-        else
-            echo "[!] Plugin asset dir not found, skipping: $PLUGINS_ROOT/$rel"
-        fi
-    done
-else
-    echo "[!] WARNING: plugins build dir not found at $PLUGINS_ROOT"
+# 5. Plugin assets (shaders, textures, spectral data, ~126 MB)
+if [ -d "$BACKEND_DIR/pyhelios/pyhelios_build/build/plugins" ]; then
+    PYHELIOS_DATA_ARGS="$PYHELIOS_DATA_ARGS --add-data $BACKEND_DIR/pyhelios/pyhelios_build/build/plugins:pyhelios/pyhelios_build/build/plugins"
 fi
 
 # 6. Built binaries in bin/ (if any)

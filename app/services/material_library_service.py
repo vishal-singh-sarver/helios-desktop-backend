@@ -29,13 +29,14 @@ from pathlib import Path
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased, aliased
 
 from app.core.config import settings
 from app.db.models import (
     Datatype,
     MaterialData,
     MaterialGroup,
+    MaterialPropertyType,
     MaterialType,
     ObjectMaterialGroup,
     ObjectPropertyData,
@@ -143,6 +144,108 @@ def _upsert_values(db: Session, material_id: int, canonical: dict[str, str | Non
                                 property_type_id=pt_id, value=value))
         else:
             row.value = value
+
+
+def _shared_editable_properties(db: Session) -> dict[str, set[int]]:
+    """Properties belonging to MORE THAN ONE material type that the user can
+    actually edit, mapped to the material types carrying them.
+
+    Found by SELF-JOINING material_property_type — a row joined to another row
+    with the same property_type_id but a different material_type_id. Derived
+    from the catalog rather than hardcoded, so a property attached to a second
+    type later is picked up instead of silently staying per-member.
+
+    Today that is exactly `two_sided_heat_transfer` (Radiation, Energy Balance,
+    Photosynthesis, Boundary Layer Conductance) and `stomatal_sidedness`.
+
+    EDITABLE ONLY, and that filter is the whole point. Ten properties are
+    shared, but the other eight are `computed` (a model produces them) or
+    `external` (the weather supplies them). The user never types those, and
+    forcing them equal across members would overwrite one model's input with
+    another's output. What remains is facts about the SURFACE itself: a leaf is
+    one-sided or two-sided, and two models in one group cannot disagree on that.
+    """
+    other = aliased(MaterialPropertyType)
+    rows = (
+        db.query(PropertyType.property, MaterialPropertyType.material_type_id)
+        .join(MaterialPropertyType,
+              MaterialPropertyType.property_type_id == PropertyType.id)
+        .join(other,
+              (other.property_type_id == MaterialPropertyType.property_type_id)
+              & (other.material_type_id != MaterialPropertyType.material_type_id))
+        .filter(MaterialPropertyType.visibility == "editable",
+                other.visibility == "editable")
+        .distinct()
+        .all()
+    )
+    shared: dict[str, set[int]] = {}
+    for prop, type_id in rows:
+        shared.setdefault(prop, set()).add(type_id)
+    return shared
+
+
+def _propagate_shared(db: Session, group_id: int, source_material_id: int,
+                      canonical: dict[str, str | None]) -> list[str]:
+    """Mirror a shared editable property onto every sibling member that has it.
+
+    The catalog already models the flag as ONE property_type row shared by four
+    material types (migration 028, deliberately). What is not shared is the
+    VALUE: material_data is keyed (project_material_id, property_type_id), so
+    each member of a group stores its own copy and nothing kept them equal.
+    Setting the Heat Transfer Flag on Radiation and then changing it on Energy
+    Balance left the group asserting both answers at once.
+
+    Last write wins, and ONLY for properties present in this request — a member
+    update must not resurrect a value the caller cleared elsewhere. Groups
+    already holding divergent values converge the next time the field is
+    touched; deliberately not by migration, which would rewrite saved projects
+    with no user action behind it and pick a winner nobody chose.
+    """
+    shared = _shared_editable_properties(db)
+    touched = [p for p in canonical if p in shared]
+    if not touched:
+        return []
+
+    siblings = (
+        db.query(ProjectMaterial)
+        .filter(ProjectMaterial.material_group_id == group_id,
+                ProjectMaterial.id != source_material_id)
+        .all()
+    )
+    if not siblings:
+        return []
+
+    changed: list[str] = []
+    for prop in touched:
+        pt = db.query(PropertyType).filter(PropertyType.property == prop).first()
+        if pt is None:
+            continue
+        value = canonical[prop]
+        for sib in siblings:
+            if sib.material_type_id not in shared[prop]:
+                continue        # this member's type does not carry the property
+            row = (
+                db.query(MaterialData)
+                .filter(MaterialData.project_material_id == sib.id,
+                        MaterialData.property_type_id == pt.id)
+                .first()
+            )
+            if value is None:
+                if row is not None:
+                    db.delete(row)
+                    changed.append(f"{prop}->m{sib.id}=cleared")
+            elif row is None:
+                db.add(MaterialData(project_material_id=sib.id,
+                                    property_type_id=pt.id, value=value))
+                changed.append(f"{prop}->m{sib.id}={value}")
+            elif row.value != value:
+                row.value = value
+                changed.append(f"{prop}->m{sib.id}={value}")
+
+    if changed:
+        logger.info("[material] shared     group=%s from=%s %s",
+                    group_id, source_material_id, ", ".join(changed))
+    return changed
 
 
 def _serialize_member(db: Session, pm: ProjectMaterial, type_names: dict[int, str]) -> dict:
@@ -372,6 +475,10 @@ def create_group(db: Session, session_id: str, body) -> dict:
             db.add(pm)
             db.flush()
             _upsert_values(db, pm.id, canonical, defs, replace=True)
+            # In creation order, so the LAST member carrying a shared property
+            # settles it for the group. A group must not be born holding two
+            # answers to the same physical fact.
+            _propagate_shared(db, grp.id, pm.id, canonical)
         db.commit()
         db.refresh(grp)
 
@@ -480,8 +587,12 @@ def update_group(db: Session, session_id: str, group_id: int, body,
         db.add(pm)
         db.flush()
         _upsert_values(db, pm.id, canonical, defs, replace=True)
+        _propagate_shared(db, grp.id, pm.id, canonical)
     for pm, (mt, defs, canonical) in to_update:
         _upsert_values(db, pm.id, canonical, defs, replace=True)   # group PUT = full replace
+        # After the write, so a shared property set on one member in this same
+        # request reaches the rest. Applied in payload order: last one wins.
+        _propagate_shared(db, grp.id, pm.id, canonical)
         pm.updated_at = _now()
     if new_name is not None:
         grp.name = new_name
@@ -565,6 +676,9 @@ def add_group_material(db: Session, session_id: str, group_id: int, body,
     try:
         db.flush()
         _upsert_values(db, pm.id, canonical, defs, replace=True)
+        # A member joining an existing group brings its own value for any shared
+        # property, so the group would diverge the moment it is added.
+        _propagate_shared(db, grp.id, pm.id, canonical)
         grp.updated_at = _now()
         db.commit()
     except IntegrityError:
@@ -603,6 +717,10 @@ def update_group_material(db: Session, session_id: str, group_id: int,
         required=required,
     )
     _upsert_values(db, pm.id, canonical, defs, replace=True)
+    # THE reported path: set the Heat Transfer Flag on one member, then change
+    # it on another. Both are this endpoint, and without this the two members
+    # keep separate answers.
+    _propagate_shared(db, grp.id, pm.id, canonical)
     pm.updated_at = _now()
     grp.updated_at = _now()
     db.commit()

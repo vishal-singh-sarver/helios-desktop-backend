@@ -196,6 +196,30 @@ if (-not (Test-Path $migrationsDir)) {
 }
 $pyInstallerArgs += @('--add-data', "$migrationsDir;app\db\migrations")
 
+# Committed default textures (backend-api/assets) — the picker set behind
+# /api/textures/defaults. Like the migrations above they are pure data files that
+# nothing imports, so --collect-data app does not reach them.
+#
+# The destination MUST be a bare `assets` at the bundle root: material_service's
+# default_textures_dir() resolves them as parents[2] of its own __file__, which
+# under PyInstaller is _MEIPASS/app/services/material_service.py — so parents[2]
+# is _MEIPASS itself. Nest them any deeper and the lookup silently misses.
+#
+# Missing them does NOT fail the build or the boot; it fails quietly at runtime,
+# twice over: /defaults returns an empty list so the "From Library" grid renders
+# blank, AND the absent directory drops out of the serve endpoint's allowlist, so
+# every material already pointing at one of these files 403s and renders
+# untextured. The mac/linux script has carried this since the start
+# (build_binary.sh, --add-data "$BACKEND_DIR/assets:assets"); Windows did not,
+# which is why textures were missing in dev too — dev spawns this same bundle
+# (main/backend-manager.ts getBackendPath), not the Python source.
+$assetsDir = Join-Path $backendApiDir 'assets'
+if (-not (Test-Path $assetsDir)) {
+  Write-Host "ERROR: default textures folder not found at $assetsDir"
+  exit 1
+}
+$pyInstallerArgs += @('--add-data', "$assetsDir;assets")
+
 # Bundle the pyhelios Python package and its native runtime DLLs only.
 # We deliberately do NOT bundle the entire pyhelios/ submodule (helios-core/,
 # pyhelios_build/build/, tests/, docs/, build_scripts/) - those aren't needed

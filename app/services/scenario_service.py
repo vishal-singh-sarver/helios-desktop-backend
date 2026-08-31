@@ -96,8 +96,13 @@ def _resolve_scenario(
     if sctx is not None and (sctx.initialized or not helios_ctx.PYHELIOS_AVAILABLE):
         return sctx
 
-    with registry._scenario_lock.write():
-        sctx = registry.get_or_create_scenario_context(session_id, pid, sid)
+    # Same shape as `_sctx`: the registry lookup takes the registry lock itself
+    # and returns immediately; the loadXML then runs under THIS scenario's lock
+    # so it cannot hold up any other scenario.
+    sctx = registry.get_or_create_scenario_context(session_id, pid, sid)
+    with sctx.lock.write():
+        # Re-checked inside the lock — two requests can race for the same cold
+        # scenario, and without this the loser loads on top of the winner.
         if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
             sctx.context = helios_ctx.Context()
             # Restore weather data from scenario-specific XML if it exists
@@ -312,9 +317,16 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         """
         nonlocal sctx
         dropped = False
-        with registry._scenario_lock.write():
-            live = registry.get_scenario_context(session_id, project_id, scenario_id)
-            if live is not None and not live.hydrated:
+        # THIS SCENARIO'S write lock, and blocking on it is the point — see the
+        # docstring above. _hydrate holds it for its whole duration, so waiting
+        # here is what makes the `hydrated` check a decision rather than a race.
+        # It is now that scenario's lock rather than a process-wide one, so the
+        # wait no longer stalls every other scenario as well.
+        live = registry.get_scenario_context(session_id, project_id, scenario_id)
+        if live is None:
+            return
+        with live.lock.write():
+            if not live.hydrated:
                 registry.remove_scenario(session_id, project_id, scenario_id)
                 dropped = True
                 logger.info("[context] released  scenario=%s (abandoned)",
@@ -365,7 +377,7 @@ def init_scenario(session_id: str, project_id: str, scenario_id: str,
         # still reporting progress, and the client's next call is not.
         emit({"stage": "persist", "progress": 0.9,
               "message": "Saving scenario"})
-        sos.wait_for_saves()
+        sos.wait_for_saves(sctx)
 
         # "Ready" means every geometry the DB says exists is LIVE in the context,
         # not merely that hydration returned. It swallows per-object build
@@ -431,10 +443,13 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
         wait_for_scenario_saves,
     )
 
-    with registry._scenario_lock.write():
-        sctx = registry.get_scenario_context(session_id, project_id, scenario_id)
-        if sctx is None:
-            return {"success": True, "scenario_id": scenario_id, "discarded": False}
+    sctx = registry.get_scenario_context(session_id, project_id, scenario_id)
+    if sctx is None:
+        return {"success": True, "scenario_id": scenario_id, "discarded": False}
+    # THIS scenario's write lock around the eviction, so a mutation already in
+    # flight on it finishes first. remove_scenario takes the registry lock
+    # itself for the dict work.
+    with sctx.lock.write():
         registry.remove_scenario(session_id, project_id, scenario_id)
 
     # Under .read(), NOT .write(). Removing the registry entry stops anyone NEW
@@ -455,7 +470,7 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
     # it costs nothing that was not already going to be spent, and it is what
     # makes the dirty check below meaningful — an undrained queue would leave
     # the scene looking dirty and we would serialise it a second time.
-    wait_for_scenario_saves()
+    wait_for_scenario_saves(sctx)
 
     # SKIP THE WRITE WHEN THE FILE ALREADY MATCHES. This was an unconditional
     # writeXML, and on a high-resolution textured ground it is ~16s of
@@ -466,7 +481,7 @@ def discard_scenario(session_id: str, project_id: str, scenario_id: str,
     dirty = sctx.mutation_seq != sctx.saved_seq
     if save and dirty:
         try:
-            with registry._scenario_lock.read():
+            with sctx.lock.read():
                 trigger_scenario_autosave(sctx)
             saved = True
         except Exception:

@@ -55,6 +55,18 @@ class ScenarioContext:
         # writeXML it would otherwise repeat for no reason.
         "mutation_seq",
         "saved_seq",
+        # THIS scenario's lock, guarding THIS scenario's PyHelios Context.
+        #
+        # It used to live on the SessionRegistry singleton, so every scenario in
+        # every project in every session queued behind every other. Closing a
+        # 700x700 project made opening a 4x4 one take 7.34s — none of it work,
+        # all of it waiting on a save for a project the user had already closed.
+        #
+        # The engine never required that: two separate Contexts write XML
+        # genuinely in parallel (7.6s of work in 4.0s wall) because PyHelios
+        # releases the GIL and holds no global lock. The serialisation was ours,
+        # and it belongs on the object it protects.
+        "lock",
     )
 
     def __init__(self, project_id: str, scenario_id: str):
@@ -76,6 +88,10 @@ class ScenarioContext:
         self.hydrated = False
         self.mutation_seq = 0
         self.saved_seq = 0
+        # Imported here rather than at module scope: session_store imports this
+        # module, so importing it back at the top would be a cycle.
+        from app.core.session_store import ScenarioLock
+        self.lock = ScenarioLock()
 
     def reset(self):
         """Wipe all state for a fresh load. Old C++ context gets GC'd."""

@@ -33,6 +33,7 @@ import lzma
 import os
 import shutil
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -235,11 +236,39 @@ def trigger_scenario_autosave(sctx) -> None:
 
 # ── Deferred save ─────────────────────────────────────────────────────────────
 #
-# ONE worker: saves for a scenario stay ordered, so a slower earlier write can
-# never land after — and overwrite — a newer one. Geometry and weather share the
-# same context.xml, so they must share this queue too.
+# ONE worker PER SCENARIO. The single worker is what keeps a scenario's saves
+# ordered — a slower earlier write must never land after, and overwrite, a
+# newer one — and geometry and weather share a context.xml, so they share a
+# queue. But that ordering only has to hold WITHIN a scenario.
+#
+# It used to be one worker for the whole process, so a 16s writeXML on one
+# scene delayed every other scene's save: closing a 700x700 project made the
+# next project's first save wait 7.58s. Nothing required that — two Contexts
+# write in parallel perfectly well.
 
-_SAVE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autosave")
+_SAVE_POOLS: dict[str, ThreadPoolExecutor] = {}
+_POOLS_LOCK = threading.Lock()
+
+
+def _pool_for(scenario_id: str) -> ThreadPoolExecutor:
+    """This scenario's save queue, created on first use.
+
+    Never evicted. A pool is one idle thread (~8 KB of stack); reclaiming them
+    would mean proving no save is in flight, which is a race for no gain.
+    """
+    pool = _SAVE_POOLS.get(scenario_id)
+    if pool is not None:
+        return pool
+    with _POOLS_LOCK:
+        # Re-checked inside the lock: two mutations on a new scenario can race
+        # here, and the loser would otherwise get a second pool — two workers
+        # for one scenario, which is exactly the ordering guarantee we rely on.
+        pool = _SAVE_POOLS.get(scenario_id)
+        if pool is None:
+            pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"autosave-{scenario_id[:8]}")
+            _SAVE_POOLS[scenario_id] = pool
+        return pool
 
 
 def queue_scenario_autosave(sctx) -> None:
@@ -257,30 +286,39 @@ def queue_scenario_autosave(sctx) -> None:
     Best-effort — `trigger_scenario_autosave` no-ops when headless and
     swallows/logs any writeXML failure, so a queued save never surfaces.
     """
-    # Imported here, not at module scope: session_store is a higher layer and
-    # importing it eagerly would make persistence depend on the registry.
-    from app.core.session_store import registry
-
     # Every mutation site calls this immediately after mutating, so it is the
     # one place that reliably means "the context no longer matches disk".
     # /discard reads the counters to decide whether it can skip its writeXML.
     sctx.mutation_seq += 1
 
     def _run() -> None:
-        with registry._scenario_lock.read():
+        # This scenario's own lock, not a process-wide one, and taken INSIDE
+        # the queued work rather than around the submit: held at submit time it
+        # would be released before the write ran, letting writeXML serialise a
+        # context mid-mutation.
+        with sctx.lock.read():
             trigger_scenario_autosave(sctx)
 
     logger.debug("[save]    queued    scenario=%s", sctx.scenario_id[:8])
-    _SAVE_POOL.submit(_run)
+    _pool_for(sctx.scenario_id).submit(_run)
 
 
-def wait_for_scenario_saves() -> None:
-    """Block until every already-queued save has been written.
+def wait_for_scenario_saves(sctx=None) -> None:
+    """Block until queued saves have been written.
 
-    The pool has ONE worker, so a task submitted now cannot run until the saves
-    ahead of it are done — waiting on it waits for them.
+    With `sctx`, waits for THAT scenario only — each pool has one worker, so a
+    task submitted now cannot run until the saves ahead of it are done. Without
+    it, waits for every scenario, which is what the tests and shutdown want.
+
+    Passing the scenario matters on the paths that block a user: /discard
+    waiting on every scenario in the process would reintroduce exactly the
+    cross-scenario stall this change removes.
     """
-    _SAVE_POOL.submit(lambda: None).result()
+    if sctx is not None:
+        _pool_for(sctx.scenario_id).submit(lambda: None).result()
+        return
+    for pool in list(_SAVE_POOLS.values()):
+        pool.submit(lambda: None).result()
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────

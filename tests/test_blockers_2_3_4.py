@@ -56,7 +56,10 @@ def test_blocker4_weather_mutation_is_excluded_by_a_running_save(client):
     started = threading.Event()
 
     def _hold_read():
-        with registry._scenario_lock.read():
+        # THIS scenario's lock, as a running save now holds. The invariant is
+        # unchanged — a mutation waits for a save on the SAME scenario — only
+        # the lock is per-scenario instead of process-wide.
+        with registry.get_scenario_context(sh, pid, sid).lock.read():
             started.set()
             time.sleep(HELD)
 
@@ -89,7 +92,8 @@ def test_blocker3_discard_holds_a_lock_while_it_writes(client):
 
     def _observe(sctx):
         # Inside the save: a mutation must not be able to take .write() now.
-        got = registry._scenario_lock._owner is not None or registry._scenario_lock._readers > 0
+        # Read off THIS scenario's lock — the one the save actually holds.
+        got = sctx.lock._owner is not None or sctx.lock._readers > 0
         seen["guarded"] = got
         return real(sctx)
 

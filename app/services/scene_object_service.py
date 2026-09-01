@@ -36,7 +36,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.session_store import registry as session_registry
+from app.core.session_store import _find_sctx, registry as session_registry
 from app.db.models import (
     Datatype,
     MaterialData,
@@ -149,8 +149,17 @@ def _sctx(session_id: str, project_id: str, scenario_id: str):
     if sctx is not None and (sctx.initialized or not helios_ctx.PYHELIOS_AVAILABLE):
         return sctx
 
-    with session_registry._scenario_lock.write():
-        sctx = session_registry.get_or_create_scenario_context(session_id, project_id, scenario_id)
+    # Registry first, and only for the lookup: get_or_create takes the registry
+    # lock itself and returns in microseconds. The expensive part — building the
+    # Context and its loadXML — then runs under THIS scenario's own lock, so a
+    # slow load here no longer holds up any other scenario.
+    sctx = session_registry.get_or_create_scenario_context(
+        session_id, project_id, scenario_id)
+
+    with sctx.lock.write():
+        # Re-checked inside the lock. Two requests can arrive for the same
+        # cold scenario at once; both get the same sctx from the registry, and
+        # without this the loser would loadXML on top of the winner's context.
         if helios_ctx.PYHELIOS_AVAILABLE and sctx.context is None:
             sctx.context = helios_ctx.Context()
             if not load_scenario_snapshot(sctx):
@@ -171,7 +180,12 @@ def _with_scenario_lock(fn):
     _apply_assignment_change → _rebuild → _teardown + _build)."""
     @functools.wraps(fn)
     def _wrapper(*args, **kwargs):
-        with session_registry._scenario_lock.write():
+        # This scenario's lock, found among the arguments — the decorated
+        # helpers take sctx first (`_teardown(sctx, ...)`) or second
+        # (`_build(db, sctx, ...)`), so a fixed position would silently lock
+        # the wrong object the next time a signature moved.
+        sctx = _find_sctx(fn, args, kwargs)
+        with sctx.lock.write():
             return fn(*args, **kwargs)
     return _wrapper
 
@@ -479,13 +493,20 @@ def _autosave(sctx) -> None:
     queue_scenario_autosave(sctx)
 
 
-def wait_for_saves() -> None:
-    """Block until every already-queued context.xml save has been written.
+def wait_for_saves(sctx=None) -> None:
+    """Block until THIS scenario's queued context.xml saves have been written.
 
     `init` uses this before reporting a scenario ready, so "ready" means the
     save queue is drained too and the client's next call cannot land mid-write.
+
+    Scoped to one scenario, and that is the whole point. Waiting on every
+    scenario meant opening a 1.3 KB project sat on "Saving scenario" until a
+    299 MB project's save had finished — the caller only needs ITS OWN writes
+    on disk before it can honestly say ready.
+
+    No argument still waits for everything, for shutdown and for tests.
     """
-    wait_for_scenario_saves()
+    wait_for_scenario_saves(sctx)
 
 
 @_with_scenario_lock
@@ -1338,7 +1359,7 @@ def get_object_geometry_binary(db: Session, session_id: str, project_id: str,
         _build(db, sctx, so)    # retry path for a previously failed build
     uuids = json.loads(so.helios_uuids or "[]")
     from app.services.geometry_pack import pack_primitives_binary
-    with session_registry._scenario_lock.read():
+    with sctx.lock.read():
         return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
 
 
@@ -1373,7 +1394,7 @@ def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
     from app.services.geometry_pack import PackCancelled, pack_primitives_binary
     started = time.monotonic()
     try:
-        with session_registry._scenario_lock.read():
+        with sctx.lock.read():
             payload = pack_primitives_binary(helios_ctx.get_context(sctx), uuids,
                                              cancelled=cancelled)
     except PackCancelled:

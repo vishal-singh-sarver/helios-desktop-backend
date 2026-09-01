@@ -144,5 +144,3 @@ Projects are stored in two layers:
 - **Version archive** — `project_versions.scene_xml` BLOB in SQLite (lzma, ~85-90% compression)
 
 UTC offset is calculated from project coordinates at creation time using `timezonefinder` and stored in the `projects` table.
-
-#test

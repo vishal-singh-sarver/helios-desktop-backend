@@ -4,6 +4,8 @@ PyHelios singleton management — path setup, imports, and accessors.
 Module-level code runs once on first import (at startup via lifespan).
 All routers import get_context() / get_wpt() / get_plantarch() from here.
 """
+import ctypes
+import logging
 import sys
 import uuid as _uuid_mod
 from pathlib import Path
@@ -69,7 +71,16 @@ if _PYHELIOS_USE_SOURCE:
                 _build_cmd = [str(_build_script)]
             if _build_script.exists():
                 print("[pyhelios] Building from source (this may take a few minutes)...")
-                _result = subprocess.run(_build_cmd, cwd=str(_pyhelios_src.parent), timeout=600)
+                # stdin=DEVNULL, never inherited. The Electron app spawns the
+                # backend with a PIPE on stdin as a liveness signal and never
+                # writes to it (main/backend-manager.ts); a child that inherits
+                # that pipe and reads it blocks forever, and this one runs
+                # during module import, so the whole backend hangs before it
+                # can serve. DEVNULL gives the build script an immediate EOF.
+                _result = subprocess.run(
+                    _build_cmd, cwd=str(_pyhelios_src.parent), timeout=600,
+                    stdin=subprocess.DEVNULL,
+                )
                 if _result.returncode == 0 and _lib_path.exists():
                     print("[pyhelios] Build complete.")
                 else:
@@ -141,6 +152,68 @@ def get_plantarch(pctx):
             raise HTTPException(503, "PlantArchitecture plugin not available")
         pctx.plantarch = PlantArchitecture(get_context(pctx))
     return pctx.plantarch
+
+
+# Probed ONCE, not per call. glibc only: absent on macOS and musl, and there is
+# no Windows equivalent, so this is None on those and release_memory is a no-op.
+# CDLL(None) opens the current process rather than guessing a soname —
+# "libc.so.6" is wrong on musl and does not exist on macOS at all.
+try:
+    _malloc_trim = ctypes.CDLL(None).malloc_trim
+    # int malloc_trim(size_t pad). Declared rather than left to ctypes'
+    # default int-sized argument, which is the wrong width for size_t on 64-bit.
+    _malloc_trim.argtypes = [ctypes.c_size_t]
+    _malloc_trim.restype = ctypes.c_int
+except Exception:       # noqa: BLE001 — see below; MUST NOT be narrowed
+    # DELIBERATELY BROAD, and this module runs it at import time.
+    #
+    # A narrow (OSError, AttributeError) looked right and was a Windows
+    # ship-blocker: CPython's CDLL.__init__ takes an `nt` branch that runs
+    # `if '/' in name or '\\' in name` BEFORE dlopen, and with name=None that
+    # raises TypeError — which would escape, abort the import of this module,
+    # and stop the backend booting at all. On the one platform none of us can
+    # test locally.
+    #
+    # Reclaiming memory is an optimisation. Nothing it does may ever be able to
+    # prevent the process from starting, so every failure mode ends here.
+    _malloc_trim = None
+
+_release_log = logging.getLogger("helios.memory")
+
+
+def release_memory() -> None:
+    """Return a dropped context's memory to the OS. Call AFTER the last ref dies.
+
+    Dropping a ScenarioContext frees the C++ context, but freeing is not
+    returning: glibc keeps the pages in its arena and RSS does not move. On a
+    1000x1000 ground, measured:
+
+        context built                      1742.7 MB
+        after del ctx + gc.collect()       1804.6 MB   <- nothing given back
+        after malloc_trim(0)                 65.9 MB
+
+    So opening project A, discarding it, then opening B costs A+B resident
+    rather than max(A,B) — which is why the kernel SIGKILLed the server on the
+    second project. glibc CAN shrink via sbrk when the freed block sits at the
+    top of the heap, which is why a single open/close loop looks fine on a
+    bench and only the discard-then-open case fails.
+
+    Safe with other scenarios still open: it releases FREE pages and cannot
+    touch a live allocation. Verified on a still-open 700x700 scenario after a
+    trim — 490,000 UUIDs read and a full writeXML, both fine.
+
+    Cost is 62 ms on a 1.7 GB heap, 5 ms on a small one. Only ever called on a
+    release path, never on a request that is doing work.
+
+    MUST come after the last reference is gone. A local still holding the sctx
+    keeps the memory live and the trim reclaims nothing.
+    """
+    if _malloc_trim is None:
+        return
+    try:
+        _malloc_trim(0)
+    except Exception:                   # noqa: BLE001 — reclaiming is best-effort
+        _release_log.debug("malloc_trim failed", exc_info=True)
 
 
 def reset_context(pctx) -> None:

@@ -12,7 +12,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.helios.persistence import trigger_scenario_autosave
+from app.helios.persistence import (
+    MAX_AUTOSAVE_ARCHIVES,
+    trigger_scenario_autosave,
+)
 from app.core.config import settings
 
 
@@ -85,19 +88,22 @@ def test_rotation_creates_archive(temp_data_dir):
     assert ctx_xml.exists()
 
 
-def test_archive_cap_at_10(temp_data_dir):
-    """After 12 saves there should be exactly 10 archives — oldest evicted."""
+def test_archive_cap_keeps_one(temp_data_dir):
+    """After 12 saves exactly ONE archive remains — the previous save.
+
+    The cap was 10. A scene of this size makes that expensive (a 613 MB
+    context.xml gzips to tens of MB, ten deep, across 1,300+ scenarios) and
+    nothing ever read past the most recent one. One rollback point is kept, not
+    zero — dropping to 0 would leave no fallback at all.
+    """
     sctx = _make_sctx("p1", "s1")
 
-    # Saves 1..12 → 11 rotated into archives (last save doesn't rotate
-    # itself; it just writes the new current). With cap 10, oldest is
-    # evicted to keep the count at 10.
     for _ in range(12):
         trigger_scenario_autosave(sctx)
 
     archives_dir = settings.scenario_context_file_dir("p1", "s1") / "archives"
     archives = list(archives_dir.glob("autosave_*.xml.gz"))
-    assert len(archives) == 10
+    assert len(archives) == MAX_AUTOSAVE_ARCHIVES == 1
 
 
 def test_archive_content_is_gzipped_xml(temp_data_dir):

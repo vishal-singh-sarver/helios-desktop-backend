@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from app.helios.context import get_context
 from app.helios import registry as reg
 
@@ -30,19 +31,25 @@ def material_snapshot(ctx, label: str) -> dict:
 
 def get_texture_dirs() -> list:
     dirs = []
+    seen = set()
     try:
         import pyhelios
-        base = Path(pyhelios.__file__).parent
-        for candidate in [
-            base / "assets" / "build" / "plugins",
-            base / "pyhelios_build" / "build" / "plugins",
-            base / "helios-core" / "plugins",
-        ]:
-            if candidate.exists():
-                for plugin_dir in candidate.iterdir():
-                    for tex_dir in (plugin_dir / "textures", plugin_dir / "assets"):
-                        if tex_dir.exists():
-                            dirs.append((plugin_dir.name, tex_dir))
+        # pyhelios.__path__[0] is the inner package dir, but the plugin trees live
+        # at the submodule root (its parent) — so check both bases.
+        bases = [Path(p) for p in pyhelios.__path__]
+        bases += [b.parent for b in bases]
+        for base in bases:
+            for candidate in (
+                base / "assets" / "build" / "plugins",
+                base / "pyhelios_build" / "build" / "plugins",
+                base / "helios-core" / "plugins",
+            ):
+                if candidate.exists():
+                    for plugin_dir in candidate.iterdir():
+                        for tex_dir in (plugin_dir / "textures", plugin_dir / "assets"):
+                            if tex_dir.exists() and tex_dir not in seen:
+                                seen.add(tex_dir)
+                                dirs.append((plugin_dir.name, tex_dir))
     except Exception:
         pass
     return dirs
@@ -175,3 +182,33 @@ def get_texture_library() -> dict:
         if files:
             categories[name] = sorted(files)
     return {"categories": categories}
+
+
+# ── Default-texture picker (backend-api/assets) ──────────────────────────────
+# App-owned folder of default textures the user can choose from. 
+# Kept separate from the ground default's own resolution (material_apply) and
+# from user uploads (data/uploads) — this is purely the pickable default set.
+
+
+def default_textures_dir() -> Path:
+    """The committed folder of default textures shipped with the app
+    (backend-api/assets). Version-controlled and pushed with the repo, so the
+    picker never depends on runtime hydration. Drop a .png/.jpg/.jpeg here and
+    commit it to add a new default."""
+    return Path(__file__).resolve().parents[2] / "assets"
+
+
+def list_default_textures() -> list[dict]:
+    """The default textures available in backend-api/assets/ — image files only,
+    with the same watermark/logo exclusions as the plugin library. Each entry is
+    {name, path (absolute)}."""
+    d = default_textures_dir()
+    if not d.is_dir():
+        return []
+    return [
+        {"name": f.name, "path": str(f.resolve())}
+        for f in sorted(d.iterdir())
+        if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg")
+        and f.name not in _TEXTURE_EXCLUDE
+        and not any(f.name.startswith(p) for p in _TEXTURE_EXCLUDE_PREFIXES)
+    ]

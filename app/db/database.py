@@ -77,6 +77,15 @@ def _column_type(conn, table: str, column: str) -> str | None:
     return None
 
 
+def _column_is_nullable(conn, table: str, column: str) -> bool | None:
+    """True/False if the column allows NULL, or None if table/column absent."""
+    rows = conn.execute(text(f'PRAGMA table_info("{table}")')).fetchall()
+    for row in rows:  # cid, name, type, notnull, dflt_value, pk
+        if row[1] == column:
+            return row[3] == 0
+    return None
+
+
 def run_migrations() -> None:
     """
     Apply all .sql migration files in db/migrations/ in version order.
@@ -133,6 +142,32 @@ def run_migrations() -> None:
             conn.execute(text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (10)"))
             applied.add(10)
             print("[db] migration 010 already satisfied (utc_offset is TEXT) — marking applied")
+
+        # 019 rebuilds `project_material` to make project_id nullable (global
+        # materials). The rebuild DROPs the table, whose ON DELETE CASCADE would
+        # fire on a drifted DB that already has the finished shape — re-running it
+        # is destructive. If project_material.project_id is already nullable the
+        # migration is done; stamp it so the rebuild is skipped.
+        # Post-022 the column is GONE (materials live in groups), so the nullable
+        # probe returns None — detect that era by the 022 marker column instead,
+        # or 019 would re-run and crash-loop at startup on the missing column.
+        _pm_has_group = _column_type(conn, "project_material", "material_group_id") is not None
+        if 19 not in applied and (
+            _column_is_nullable(conn, "project_material", "project_id") is True
+            or _pm_has_group
+        ):
+            conn.execute(text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (19)"))
+            applied.add(19)
+            print("[db] migration 019 already satisfied (project_material globalised or grouped) — marking applied")
+
+        # 022 rebuilds `project_material`/`object_material` around material
+        # groups. Re-running it on a finished DB would crash at the first
+        # `SELECT ... project_id FROM project_material` (column gone; not an
+        # _ALREADY_APPLIED_ERRORS token). material_group_id is the marker.
+        if 22 not in applied and _pm_has_group:
+            conn.execute(text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (22)"))
+            applied.add(22)
+            print("[db] migration 022 already satisfied (project_material.material_group_id present) — marking applied")
 
     # 2. Apply each pending migration in its OWN transaction, so one
     #    migration committing is independent of the next.

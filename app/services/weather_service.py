@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import math
 import os
 import shutil
@@ -31,12 +32,15 @@ from typing import TYPE_CHECKING, Any
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.session_store import with_context_write_lock
 from app.db.models import DataUnit, HeliosDataType, WeatherDataHeader
 from app.helios import context as helios_ctx
 from app.helios.persistence import (
     _ensure_scenario_structure,
-    trigger_scenario_autosave,
+    queue_scenario_autosave,
 )
+
+logger = logging.getLogger(__name__)
 
 # PyHelios's specific exception for "thing not found" errors (missing label,
 # missing cell, etc.). Defensive import: if PyHelios isn't available, define
@@ -680,6 +684,7 @@ def _write_temp_csv(header: list[str], rows: list[list[str]]) -> str:
     return path
 
 
+@with_context_write_lock
 def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
     """Transform the uploaded CSV and bulk-load it into PyHelios via a temp file."""
     if not file_bytes:
@@ -732,7 +737,9 @@ def upload_file(sctx: "ScenarioContext", file_bytes: bytes) -> dict:
     if truncated_any:
         response["message"] = "Some values contained more than 7 decimal places and were truncated."
     
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
+    logger.info("[weather]  imported  scenario=%s %d rows x %d columns",
+                sctx.scenario_id[:8], len(rows), len(header))
     return response
 
 
@@ -803,6 +810,7 @@ def _cleanup_pyhelios_cells(ctx, cells: list[tuple[str, Any, Any]]) -> None:
             pass
 
 
+@with_context_write_lock
 def add_columns(
     sctx: "ScenarioContext", columns: list["AddColumn"], db: Session
 ) -> dict:
@@ -988,7 +996,7 @@ def add_columns(
             )
 
         db.commit()
-        trigger_scenario_autosave(sctx)
+        queue_scenario_autosave(sctx)
 
     except HTTPException:
         db.rollback()
@@ -1008,6 +1016,7 @@ def add_columns(
     return {"success": True, "columns": created_columns}
 
 
+@with_context_write_lock
 def update_columns(
     sctx: "ScenarioContext", column_id: int, column: "UpdateColumn", db: Session
 ) -> dict:
@@ -1190,7 +1199,7 @@ def update_columns(
         }
 
         db.commit()
-        trigger_scenario_autosave(sctx)
+        queue_scenario_autosave(sctx)
 
     except HTTPException:
         db.rollback()
@@ -1207,6 +1216,7 @@ def update_columns(
     return {"success": True, "columns": [updated_column]}
 
 
+@with_context_write_lock
 def add_rows(
     sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session
 ) -> dict:
@@ -1325,7 +1335,7 @@ def add_rows(
         _add_row(ctx, row_data["date"], row_data["time"], cells)
         added_rows += 1
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {
         "success": True,
         "row_count": len(existing_timestamps) + len(rows),
@@ -1337,6 +1347,7 @@ def add_rows(
 # ─── update — batch update of existing cells ────────────────────────────────
 
 
+@with_context_write_lock
 def update_cells(sctx: "ScenarioContext", req: "UpdateRequest", db: Session) -> dict:
     """Update one or more existing cells in a single call.
 
@@ -1401,13 +1412,14 @@ def update_cells(sctx: "ScenarioContext", req: "UpdateRequest", db: Session) -> 
         except HeliosRuntimeError as exc:
             raise HTTPException(404, f"updates[{i}]: {exc}")
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {"success": True, "updated_count": len(req.updates)}
 
 
 # ─── delete — direct updateTimeseriesData calls (no wrappers) ────────────────
 
 
+@with_context_write_lock
 def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
     """Remove a row, a column, or wipe everything.
 
@@ -1424,7 +1436,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
         ctx.clearTimeseriesData()
         db.query(WeatherDataHeader).filter_by(scenario_id=sctx.scenario_id).delete()
         db.commit()
-        trigger_scenario_autosave(sctx)
+        queue_scenario_autosave(sctx)
         return {"success": True, "row_count": 0, "column_count": 2}
 
     # STEP A — clear one row
@@ -1471,7 +1483,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
     labels_after = list(ctx.listTimeseriesVariables())
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0
     column_count = 2 + len(labels_after)
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {
         "success": True,
         "row_count": row_count,
@@ -1482,6 +1494,7 @@ def delete(sctx: "ScenarioContext", req: "DeleteRequest", db: Session) -> dict:
 # ─── delete_rows — batch row delete (POST /deleteRow) ────────────────────────
 
 
+@with_context_write_lock
 def delete_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session) -> dict:
     """Delete one or more rows in a single call.
 
@@ -1540,7 +1553,7 @@ def delete_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session
     row_count = ctx.getTimeseriesLength(labels_after[0]) if labels_after else 0
     column_count = 2 + len(labels_after)
     deleted = len(targets)
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
     return {
         "success": True,
         "deleted_rows": deleted,
@@ -1553,6 +1566,7 @@ def delete_rows(sctx: "ScenarioContext", rows: list[dict[str, Any]], db: Session
 # ─── clear_data — clear both stores ──────────────────────────────────────────
 
 
+@with_context_write_lock
 def clear_data(sctx: "ScenarioContext", db: Session) -> dict:
     """Clear everything for the scenario: SQL headers + PyHelios cells.
 
@@ -1581,7 +1595,9 @@ def clear_data(sctx: "ScenarioContext", db: Session) -> dict:
     except Exception:
         pass  # SQL is the source of truth; orphan cells will be invisible to /addRow
 
-    trigger_scenario_autosave(sctx)
+    queue_scenario_autosave(sctx)
+    logger.info("[weather]  cleared   scenario=%s %d headers removed",
+                sctx.scenario_id[:8], headers_removed)
     return {
         "success": True,
         "headers_removed": headers_removed,

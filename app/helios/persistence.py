@@ -30,7 +30,11 @@ import gzip
 import json
 import logging
 import lzma
+import os
+import shutil
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +42,15 @@ from app.core.config import settings
 
 
 logger = logging.getLogger(__name__)
-MAX_AUTOSAVE_ARCHIVES = 10
+
+# How many rotated context.xml snapshots to keep per scenario. ONE: the
+# previous save is a rollback point, older ones were never read by anything and
+# a scene of this size makes them expensive — a 613 MB context.xml gzips to
+# tens of MB, ten deep, per scenario, across 1,300+ scenarios.
+#
+# The rotation prunes to below this number BEFORE writing the new archive, so a
+# value of N leaves exactly N on disk.
+MAX_AUTOSAVE_ARCHIVES = 1
 
 
 # ── Path helpers ─────────────────────────────────────────────────────────────
@@ -99,9 +111,49 @@ def _rotate_scenario_current(project_id: str, scenario_id: str) -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     archive_path = archives_dir / f"autosave_{ts}.xml.gz"
 
-    raw_xml = current_xml.read_bytes()
-    archive_path.write_bytes(gzip.compress(raw_xml, compresslevel=6))
+    # STREAMED, a megabyte at a time. This was read_bytes() + gzip.compress(),
+    # which held the entire previous snapshot in RAM *and* its compressed copy —
+    # ~400 MB of transient allocation on a 200 MB scene, measured. It runs
+    # inside /discard, which is exactly when the next project starts loading, so
+    # it was a large part of the peak that aborts the process on Linux.
+    # Byte-for-byte identical output; only the memory profile changes.
+    with current_xml.open("rb") as src, \
+            gzip.open(archive_path, "wb", compresslevel=6) as dst:
+        shutil.copyfileobj(src, dst, 1024 * 1024)
     current_xml.unlink(missing_ok=True)
+
+
+_STALE_TEMP_SECONDS = 60 * 60      # an hour; a 1000x1000 writeXML takes ~16s
+
+
+def _sweep_stale_temps(context_dir: Path) -> None:
+    """Delete half-written context.xml temps left by a killed backend.
+
+    The temp used to be a NamedTemporaryFile in /tmp, which the OS cleared on
+    reboot. It now lives BESIDE context.xml so os.replace cannot fail EXDEV —
+    which also means nothing ever clears it. A SIGKILL during writeXML (the
+    app's reaper, the OOM killer, a power cut) strands the partial file in the
+    project folder for good, and `_project_disk_stats` sums everything under
+    that tree, so a 240 MB corpse also inflates the size shown in the UI.
+
+    AGE-BASED, not "delete every temp found". Two saves for one scenario can
+    overlap — a queued autosave and a synchronous discard save both take
+    .read(), and readers run concurrently — so a young temp may be one that
+    another thread is writing right now. An hour is far beyond any real write.
+
+    Best-effort: a scenario that cannot be tidied must still be saveable.
+    """
+    cutoff = time.time() - _STALE_TEMP_SECONDS
+    try:
+        for stale in context_dir.glob("context.xml.tmp-*"):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink(missing_ok=True)
+                    logger.info("[scenario-autosave] removed stale temp %s", stale.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
 
 
 def trigger_scenario_autosave(sctx) -> None:
@@ -117,56 +169,169 @@ def trigger_scenario_autosave(sctx) -> None:
     if not sctx.context or not hasattr(sctx.context, "writeXML"):
         return
 
-    _ensure_scenario_structure(sctx.project_id, sctx.scenario_id)
+    # GUARDED, because this is now the first write to the USER'S data directory.
+    # The temp used to be a NamedTemporaryFile in /tmp — a different filesystem,
+    # essentially never full or read-only — so every data-dir failure surfaced
+    # later, inside one of the logging handlers below. Moving it beside the
+    # target (required, so os.replace cannot fail EXDEV) put an unguarded
+    # OSError on the path: on EACCES, EROFS, EDQUOT or a full disk it escaped
+    # into the save worker, where concurrent.futures stores the exception on a
+    # Future nobody reads. The save died silently — nothing on stderr, nothing
+    # in backend.log — and wait_for_scenario_saves() still reported success.
+    try:
+        _ensure_scenario_structure(sctx.project_id, sctx.scenario_id)
+        final_path = _scenario_context_xml(sctx.project_id, sctx.scenario_id)
+        _sweep_stale_temps(final_path.parent)
+        # suffix=".xml" is load-bearing: PyHelios validates the output extension.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=final_path.parent, prefix="context.xml.tmp-", suffix=".xml")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+    except OSError:
+        logger.exception(
+            "[scenario-autosave] cannot open a temp file for scenario %s — "
+            "is the data directory writable?", sctx.scenario_id)
+        return
+    _started = time.monotonic()
 
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
+    # CAPTURED BEFORE the write, not after. writeXML takes seconds on a large
+    # scene, and a mutation landing inside that window is not in the bytes we
+    # are about to lay down. Recording the sequence we actually serialised
+    # leaves such a scene dirty, so the next save — or /discard — still writes.
+    _writing_seq = sctx.mutation_seq
 
     try:
         sctx.context.writeXML(str(tmp_path))
-        raw_xml = tmp_path.read_bytes()
     except Exception:
         logger.exception("[scenario-autosave] writeXML failed for scenario %s", sctx.scenario_id)
-        return
-    finally:
         tmp_path.unlink(missing_ok=True)
+        return
 
     try:
         _rotate_scenario_current(sctx.project_id, sctx.scenario_id)
-        _scenario_context_xml(sctx.project_id, sctx.scenario_id).write_bytes(raw_xml)
-        logger.debug(
-            "[scenario-autosave] saved scenario %s (%d bytes)",
-            sctx.scenario_id, len(raw_xml),
-        )
+        # MOVED, not copied through RAM. This was read_bytes() + write_bytes(),
+        # which held the whole scene in memory for no reason — the engine had
+        # already written the file. 200 MB -> 0 MB, measured.
+        #
+        # os.replace is also atomic, so a failure now leaves the previous
+        # context.xml intact instead of a truncated one.
+        os.replace(tmp_path, final_path)
+        # Only now is the file on disk. Set AFTER os.replace, never before: a
+        # failure between here and there must leave the scene dirty.
+        sctx.saved_seq = _writing_seq
+        # Size comes from stat(), not len(raw_xml): there is no raw_xml any
+        # more, and reading the file back just to measure it would reintroduce
+        # exactly the buffering this removed.
+        logger.info("[save]    written   scenario=%s %.1f MB in %.1fs",
+                    sctx.scenario_id[:8], final_path.stat().st_size / 1048576,
+                    time.monotonic() - _started)
     except Exception:
         logger.exception(
             "[scenario-autosave] rotation/write failed for scenario %s",
             sctx.scenario_id,
         )
+        tmp_path.unlink(missing_ok=True)
+
+
+# ── Deferred save ─────────────────────────────────────────────────────────────
+#
+# ONE worker: saves for a scenario stay ordered, so a slower earlier write can
+# never land after — and overwrite — a newer one. Geometry and weather share the
+# same context.xml, so they must share this queue too.
+
+_SAVE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autosave")
+
+
+def queue_scenario_autosave(sctx) -> None:
+    """QUEUE a context.xml save — the caller does NOT wait for the write.
+
+    No response is built from context.xml (geometry serializes from the DB +
+    session state, weather from the live context), so making a mutation wait on
+    writeXML was pure latency — and on a 1000x1000 ground that is a million
+    primitives serialized while the user watches a spinner.
+
+    The lock is taken INSIDE the queued work, not around the submit: held at
+    submit time it would be released before the write ran, letting writeXML
+    serialize a context mid-mutation.
+
+    Best-effort — `trigger_scenario_autosave` no-ops when headless and
+    swallows/logs any writeXML failure, so a queued save never surfaces.
+    """
+    # Imported here, not at module scope: session_store is a higher layer and
+    # importing it eagerly would make persistence depend on the registry.
+    from app.core.session_store import registry
+
+    # Every mutation site calls this immediately after mutating, so it is the
+    # one place that reliably means "the context no longer matches disk".
+    # /discard reads the counters to decide whether it can skip its writeXML.
+    sctx.mutation_seq += 1
+
+    def _run() -> None:
+        with registry._scenario_lock.read():
+            trigger_scenario_autosave(sctx)
+
+    logger.debug("[save]    queued    scenario=%s", sctx.scenario_id[:8])
+    _SAVE_POOL.submit(_run)
+
+
+def wait_for_scenario_saves() -> None:
+    """Block until every already-queued save has been written.
+
+    The pool has ONE worker, so a task submitted now cannot run until the saves
+    ahead of it are done — waiting on it waits for them.
+    """
+    _SAVE_POOL.submit(lambda: None).result()
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
 
-def load_scenario_snapshot(sctx) -> None:
+def load_scenario_snapshot(sctx) -> bool:
     """
     Restore a scenario's PyHelios context from disk.
 
     Reads:
         data/projects/<pid>/scenarios/<sid>/context_file/context.xml
 
-    No-op (silent) when the file doesn't exist — a fresh scenario has
-    nothing to restore.
+    Returns True when the context is trustworthy — loaded, or nothing to load.
+    Returns False when loadXML RAISED, because it does not unwind: a failed load
+    leaves everything it read so far in the context (3,000,000 primitives
+    measured on a 613 MB file). Hydration then rebuilds every DB row on top of
+    those orphans, so the scene is held twice and the doubled context is saved
+    back — making the next open worse again. Callers must discard the context
+    on False rather than build on it.
     """
     new_xml = _scenario_context_xml(sctx.project_id, sctx.scenario_id)
     if not new_xml.exists():
-        return
+        logger.info("[context] no snapshot scenario=%s — building from the DB",
+                    sctx.scenario_id[:8])
+        return True
 
+    size_mb = new_xml.stat().st_size / 1048576
+    started = time.monotonic()
     try:
         sctx.context.loadXML(str(new_xml))
-        logger.info("[scenario-load] restored scenario %s", sctx.scenario_id)
-    except Exception:
-        logger.exception("[scenario-load] failed for scenario %s", sctx.scenario_id)
+        logger.info("[context] loaded    scenario=%s %.1f MB in %.1fs",
+                    sctx.scenario_id[:8], size_mb, time.monotonic() - started)
+        return True
+    except Exception as exc:
+        # One line, not a traceback. This failure is EXPECTED and handled: a
+        # tiled ground fails to reload because texture_repeat is not written to
+        # context.xml, so the repeat returns as 1 and the engine's
+        # subdiv < repeat x texture_pixels check rejects it. It fires on every
+        # open of such a scenario, and a 12-line stack for a known, recovered
+        # condition trains the reader to skip the log — which is how a real
+        # error gets missed. Anything OTHER than that keeps its traceback.
+        detail = str(exc)
+        if "resolution of the texture image" in detail:
+            logger.warning(
+                "[context] load-failed scenario=%s after %.1fs — texture repeat "
+                "not persisted (known engine limit); rebuilding from the DB",
+                sctx.scenario_id[:8], time.monotonic() - started)
+        else:
+            logger.exception("[context] load-failed scenario=%s — rebuilding "
+                             "from the DB", sctx.scenario_id[:8])
+        return False
 
 
 # ── Versioning (SQLite-based, unchanged) ─────────────────────────────────────

@@ -9,6 +9,8 @@ Required header:
 project_id and scenario_id are URL path parameters. Every request
 routes through _resolve_scenario for auth + context lookup.
 """
+import asyncio
+
 from fastapi import APIRouter, Body, Depends, File, Query, UploadFile
 from sqlalchemy.orm import Session
 
@@ -72,10 +74,22 @@ async def upload_file(
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
-    """Bulk-load a CSV into PyHelios via loadTabularTimeseriesData."""
-    sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+    """Bulk-load a CSV into PyHelios via loadTabularTimeseriesData.
+
+    The only `async def` in this router — it awaits the upload — so it is also
+    the only one that can block the event loop, which is what an `async def`
+    calling into PyHelios does. Every other route here is a plain `def` and
+    FastAPI already runs those in a threadpool. Parsing a real weather file is
+    slow enough to freeze every other request while it runs, so the blocking
+    half goes to a thread; only the file read stays on the loop.
+    """
     content = await file.read()
-    return weather_service.upload_file(sctx, content)
+
+    def _load():
+        sctx = _resolve_scenario(session_id, project_id, scenario_id, db)
+        return weather_service.upload_file(sctx, content)
+
+    return await asyncio.to_thread(_load)
 
 
 @router.post("/project/{project_id}/scenario/{scenario_id}/addCol")

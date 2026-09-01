@@ -5,6 +5,8 @@ The runner must roll an older/drifted database forward without crashing —
 the state left by an app update or a reinstall that kept the existing
 backend-data/ DB, where the schema is ahead of the recorded versions.
 """
+from pathlib import Path
+
 import pytest
 from sqlalchemy import create_engine, text
 
@@ -31,6 +33,241 @@ def _versions(eng):
 def _columns(eng, table):
     with eng.begin() as conn:
         return {r[1] for r in conn.execute(text(f'PRAGMA table_info("{table}")'))}
+
+
+def _apply_through(eng, max_version):
+    """Apply every not-yet-recorded migration with version <= max_version
+    (mimics the runner), leaving later ones pending. Skipping recorded versions
+    makes staged calls safe (e.g. _apply_through(…, 18) → seed → …(…, 21))."""
+    mig_dir = Path(database.__file__).parent / "migrations"
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        ))
+        applied = {r[0] for r in conn.execute(text("SELECT version FROM schema_migrations"))}
+    for f in sorted(mig_dir.glob("*.sql")):
+        v = int(f.stem.split("_")[0])
+        if v > max_version or v in applied:
+            continue
+        with eng.begin() as conn:
+            for stmt in database._split_statements(f.read_text(encoding="utf-8")):
+                conn.execute(text(stmt))
+            conn.execute(
+                text("INSERT OR IGNORE INTO schema_migrations(version) VALUES (:v)"), {"v": v}
+            )
+
+
+def test_019_preserves_data_and_globalises_materials(temp_engine):
+    """019 rebuilds project_material (project_id -> nullable, global-unique name).
+    The rebuild DROPs the table, whose ON DELETE CASCADE would wipe material_data
+    / object_material / frozen object_property_data — so the children are backed
+    up and restored. Verify a populated DB survives, duplicate names de-dup, the
+    defaults seed, the cascade still fires, and the rebuild never wipes data.
+
+    PINNED to the pre-022 era (migration 022 reshapes these tables again, so the
+    post-conditions here only hold at version 21); the 019→022 handover is
+    covered by test_022_wraps_materials_into_groups."""
+    _apply_through(temp_engine, 18)
+    with temp_engine.begin() as c:
+        rad = c.execute(text("SELECT id FROM material_type WHERE materialtype='Radiation'")).scalar()
+        cr = c.execute(text("SELECT id FROM property_type WHERE property='color_r'")).scalar()
+        ln = c.execute(text("SELECT id FROM property_type WHERE property='length'")).scalar()
+        grd = c.execute(text("SELECT id FROM object_types WHERE object='Ground'")).scalar()
+        c.execute(text("INSERT INTO projects(id,session_id,name) VALUES('p1','s1','P1'),('p2','s1','P2')"))
+        c.execute(text("INSERT INTO scenarios(id,project_id,name) VALUES('sc1','p1','Main')"))
+        # Cross-project duplicate name (case-insensitive) — must be de-duped.
+        c.execute(text("INSERT INTO project_material(id,project_id,material_type_id,name) "
+                       "VALUES (1,'p1',:r,'KeepMe'),(2,'p2',:r,'keepme')"), {"r": rad})
+        c.execute(text("INSERT INTO material_data(project_material_id,property_type_id,value) "
+                       "VALUES (1,:cr,'200')"), {"cr": cr})
+        c.execute(text("INSERT INTO scenario_object(id,scenario_id,project_id,name,object_type_id,helios_uuids) "
+                       "VALUES (1,'sc1','p1','Ground',:g,'[]')"), {"g": grd})
+        c.execute(text("INSERT INTO object_material(scenario_object_id,project_material_id,material_type_id,sync) "
+                       "VALUES (1,1,:r,0)"), {"r": rad})
+        c.execute(text("INSERT INTO object_property_data(scenario_object_id,project_material_id,property_type_id,value) "
+                       "VALUES (1,1,:cr,'200')"), {"cr": cr})   # frozen
+        c.execute(text("INSERT INTO object_property_data(scenario_object_id,project_material_id,property_type_id,value) "
+                       "VALUES (1,NULL,:ln,'5')"), {"ln": ln})  # intrinsic
+
+    _apply_through(temp_engine, 21)   # applies 019 (pre-022 era) on the populated DB
+
+    assert 19 in _versions(temp_engine)
+    assert "ctx_object_id" in _columns(temp_engine, "scenario_object")
+    with temp_engine.begin() as c:
+        info = c.execute(text("PRAGMA table_info('project_material')")).fetchall()
+        assert next(r[3] for r in info if r[1] == "project_id") == 0   # project_id nullable
+        # Children preserved through the destructive rebuild (the seeded defaults
+        # also add color material_data, so check the specific pre-existing row).
+        assert c.execute(text("SELECT value FROM material_data "
+                              "WHERE project_material_id=1 AND property_type_id="
+                              "(SELECT id FROM property_type WHERE property='color_r')")).scalar() == "200"
+        assert c.execute(text("SELECT count(*) FROM object_material")).scalar() == 1
+        assert c.execute(text("SELECT count(*) FROM object_property_data "
+                              "WHERE project_material_id IS NOT NULL")).scalar() == 1
+        assert c.execute(text("SELECT count(*) FROM object_property_data "
+                              "WHERE project_material_id IS NULL")).scalar() == 1
+        # One default material per material_type seeded (6 types).
+        assert c.execute(text("SELECT count(*) FROM project_material WHERE project_id IS NULL")).scalar() == 6
+        # Duplicate name de-duped; the lower-id row keeps the original name.
+        names = dict(c.execute(text("SELECT id,name FROM project_material WHERE id IN (1,2)")).fetchall())
+        assert names[1] == "KeepMe"
+        assert names[2].lower() != "keepme"
+        assert c.execute(text("SELECT count(*) FROM sqlite_master WHERE type='index' "
+                              "AND name='idx_project_material_name_ci'")).scalar() == 1
+    # The composite-FK cascade still fires after the rebuild. temp_engine has no
+    # foreign_keys=ON connect listener, so enable it on a raw connection for the
+    # check (PRAGMA must run outside a transaction).
+    raw = temp_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.execute("DELETE FROM project_material WHERE id=1")
+        raw.commit()
+        cur.execute("SELECT count(*) FROM object_material")
+        assert cur.fetchone()[0] == 0
+    finally:
+        raw.close()
+
+
+def test_019_guard_covers_post_022_schema(temp_engine):
+    """The widened 019 guard: on a post-022 schema (project_material has
+    material_group_id, project_id is GONE) with v19 unrecorded (history drift),
+    the runner must stamp 19 and NOT re-run 019 — an unguarded re-run crashes at
+    startup on `no such column: project_id` (crash loop, exit 3)."""
+    database.run_migrations()   # full, current DB (through 022)
+    with temp_engine.begin() as conn:
+        rad = conn.execute(text("SELECT id FROM material_type LIMIT 1")).scalar()
+        conn.execute(text("INSERT INTO material_group(id,name) VALUES(500,'KeepDrift')"))
+        conn.execute(text("INSERT INTO project_material(material_group_id,material_type_id) "
+                          "VALUES(500,:r)"), {"r": rad})
+        conn.execute(text("DELETE FROM schema_migrations WHERE version = 19"))
+
+    database.run_migrations()   # must NOT crash / re-run the rebuild
+
+    with temp_engine.begin() as conn:
+        assert conn.execute(
+            text("SELECT count(*) FROM material_group WHERE name='KeepDrift'")
+        ).scalar() == 1
+    assert 19 in _versions(temp_engine)
+
+
+def test_022_guard_skips_destructive_rebuild(temp_engine):
+    """If project_material already has material_group_id but v22 is unrecorded
+    (history drift), the runner must stamp 22 and NOT re-run the rebuild —
+    re-running crashes on the dropped project_id column."""
+    database.run_migrations()
+    with temp_engine.begin() as conn:
+        defaults = conn.execute(text("SELECT count(*) FROM material_group")).scalar()
+        conn.execute(text("DELETE FROM schema_migrations WHERE version = 22"))
+
+    database.run_migrations()   # must NOT crash
+
+    assert 22 in _versions(temp_engine)
+    with temp_engine.begin() as conn:
+        assert conn.execute(text("SELECT count(*) FROM material_group")).scalar() == defaults
+
+
+def test_022_wraps_materials_into_groups(temp_engine):
+    """022 on a populated pre-022 DB: every material becomes a group with the
+    SAME id (name + provenance carried, defaults included); project_material is
+    reshaped into nameless members; object_material is rebuilt with the group
+    attribution column and without sync; assignments become
+    object_material_group rows (sync carried over); material_data and BOTH
+    kinds of object_property_data rows survive; and the library→applied FK
+    links are gone (the break point)."""
+    _apply_through(temp_engine, 21)
+    with temp_engine.begin() as c:
+        rad = c.execute(text("SELECT id FROM material_type WHERE materialtype='Radiation'")).scalar()
+        cr = c.execute(text("SELECT id FROM property_type WHERE property='color_r'")).scalar()
+        ln = c.execute(text("SELECT id FROM property_type WHERE property='length'")).scalar()
+        grd = c.execute(text("SELECT id FROM object_types WHERE object='Ground'")).scalar()
+        c.execute(text("INSERT INTO projects(id,session_id,name) VALUES('p1','s1','P1')"))
+        c.execute(text("INSERT INTO scenarios(id,project_id,name) VALUES('sc1','p1','Main')"))
+        c.execute(text("INSERT INTO project_material(id,project_id,scenario_id,material_type_id,name) "
+                       "VALUES (100,'p1','sc1',:r,'KeepMe')"), {"r": rad})
+        c.execute(text("INSERT INTO material_data(project_material_id,property_type_id,value) "
+                       "VALUES (100,:cr,'200')"), {"cr": cr})
+        c.execute(text("INSERT INTO scenario_object(id,scenario_id,project_id,name,object_type_id,helios_uuids) "
+                       "VALUES (1,'sc1','p1','Ground',:g,'[]')"), {"g": grd})
+        c.execute(text("INSERT INTO object_material(scenario_object_id,project_material_id,material_type_id,sync) "
+                       "VALUES (1,100,:r,0)"), {"r": rad})
+        c.execute(text("INSERT INTO object_property_data(scenario_object_id,project_material_id,property_type_id,value) "
+                       "VALUES (1,100,:cr,'200')"), {"cr": cr})   # frozen snapshot
+        c.execute(text("INSERT INTO object_property_data(scenario_object_id,project_material_id,property_type_id,value) "
+                       "VALUES (1,NULL,:ln,'5')"), {"ln": ln})    # intrinsic
+
+    database.run_migrations()   # applies 022 on the populated DB
+
+    assert 22 in _versions(temp_engine)
+    assert "material_group_id" in _columns(temp_engine, "project_material")
+    assert "project_id" not in _columns(temp_engine, "project_material")
+    assert "name" not in _columns(temp_engine, "project_material")
+    assert "sync" not in _columns(temp_engine, "object_material")
+    assert "material_group_id" in _columns(temp_engine, "object_material")
+
+    with temp_engine.begin() as c:
+        # Wrapped group: same id, name + provenance carried.
+        grp = c.execute(text(
+            "SELECT project_id, scenario_id, name FROM material_group WHERE id=100"
+        )).fetchone()
+        assert grp == ("p1", "sc1", "KeepMe")
+        # The six mig-019 defaults are wrapped, plus mig-024 seeds a 7th global
+        # "Default Visualiser" group (all NULL-project).
+        assert c.execute(text(
+            "SELECT count(*) FROM material_group WHERE project_id IS NULL"
+        )).scalar() == 7
+        # Member reshaped, values preserved.
+        assert c.execute(text(
+            "SELECT material_group_id FROM project_material WHERE id=100")).scalar() == 100
+        assert c.execute(text(
+            "SELECT value FROM material_data WHERE project_material_id=100 "
+            "AND property_type_id=:cr"), {"cr": c.execute(text(
+                "SELECT id FROM property_type WHERE property='color_r'")).scalar()}
+        ).scalar() == "200"
+        # Materialized row rebuilt with attribution; assignment seeded with sync.
+        om = c.execute(text(
+            "SELECT material_group_id FROM object_material "
+            "WHERE scenario_object_id=1 AND project_material_id=100")).scalar()
+        assert om == 100
+        assert c.execute(text(
+            "SELECT sync FROM object_material_group "
+            "WHERE scenario_object_id=1 AND material_group_id=100")).scalar() == 0
+        # Snapshot + intrinsic rows preserved.
+        assert c.execute(text(
+            "SELECT count(*) FROM object_property_data WHERE project_material_id=100"
+        )).scalar() == 1
+        assert c.execute(text(
+            "SELECT count(*) FROM object_property_data WHERE project_material_id IS NULL"
+        )).scalar() == 1
+        # Whole-DB referential integrity after the rebuilds.
+        assert c.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+
+    # The BREAK POINT: with FK enforcement ON, deleting the group cascades the
+    # library side only — the applied rows and the frozen snapshot survive.
+    raw = temp_engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.execute("DELETE FROM material_group WHERE id=100")
+        raw.commit()
+        cur.execute("SELECT count(*) FROM project_material WHERE id=100")
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT count(*) FROM material_data WHERE project_material_id=100")
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT count(*) FROM object_material WHERE project_material_id=100")
+        assert cur.fetchone()[0] == 1        # survives (soft reference)
+        cur.execute("SELECT count(*) FROM object_material_group WHERE material_group_id=100")
+        assert cur.fetchone()[0] == 1        # survives (soft reference)
+        cur.execute("SELECT count(*) FROM object_property_data WHERE project_material_id=100")
+        assert cur.fetchone()[0] == 1        # frozen snapshot survives
+        # ...and deleting the materialized row still cascades its snapshot.
+        cur.execute("DELETE FROM object_material WHERE scenario_object_id=1 AND project_material_id=100")
+        raw.commit()
+        cur.execute("SELECT count(*) FROM object_property_data WHERE project_material_id=100")
+        assert cur.fetchone()[0] == 0
+    finally:
+        raw.close()
 
 
 def test_clean_install_applies_every_migration(temp_engine):
@@ -80,3 +317,239 @@ def test_rerun_does_not_rebuild_projects_when_010_unrecorded(temp_engine):
         ).scalar()
     assert offset == "+05:30"          # offset preserved, not mangled to +05:00
     assert 10 in _versions(temp_engine)  # and stamped applied
+
+
+def test_023_seeds_radiation_bands(temp_engine):
+    """023 adds 9 per-band radiation floats (PAR/NIR/LW) + the use_radiation_bands
+    boolean, all mapped to the Radiation material type (band fractions 0-1)."""
+    database.run_migrations()
+    assert 23 in _versions(temp_engine)
+
+    band_floats = {
+        f"{kind}_{band}"
+        for band in ("PAR", "NIR", "LW")
+        for kind in ("reflectivity", "transmissivity", "emissivity")
+    }
+    all_new = band_floats | {"use_radiation_bands"}
+
+    with temp_engine.begin() as c:
+        dtypes = dict(c.execute(text(
+            "SELECT pt.property, d.name FROM property_type pt "
+            "JOIN datatype d ON d.id = pt.datatype_id"
+        )).fetchall())
+        ranges = {r[0]: (r[1], r[2]) for r in c.execute(text(
+            "SELECT property, min, max FROM property_type"
+        )).fetchall()}
+        radiation = {r[0] for r in c.execute(text(
+            "SELECT pt.property FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE mt.materialtype = 'Radiation'"
+        ))}
+
+    assert all_new <= set(dtypes), all_new - set(dtypes)
+    assert all(dtypes[p] == "float" for p in band_floats)
+    assert dtypes["use_radiation_bands"] == "boolean"
+    assert all(ranges[p] == (0.0, 1.0) for p in band_floats)
+    assert all_new <= radiation, all_new - radiation
+
+
+def test_024_visualiser_material_type(temp_engine):
+    """024 adds the 7th material type 'Visualiser' as the SOLE owner of the
+    visualisation props (color_r/g/b, opacity, texture_file), removes them from
+    the other 6 types, adds NO model_type row, and seeds a global Default
+    Visualiser group (grey-128 colour + opacity 100)."""
+    database.run_migrations()
+    assert 24 in _versions(temp_engine)
+
+    VIZ = {"color_r", "color_g", "color_b", "opacity", "texture_file", "texture_toggle"}
+    with temp_engine.begin() as c:
+        # The Visualiser type exists and owns EXACTLY the 5 visualisation props.
+        assert c.execute(text(
+            "SELECT count(*) FROM material_type WHERE materialtype = 'Visualiser'"
+        )).scalar() == 1
+        vis_props = {r[0] for r in c.execute(text(
+            "SELECT pt.property FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE mt.materialtype = 'Visualiser'"
+        ))}
+        assert vis_props == VIZ, vis_props ^ VIZ
+
+        # The four original viz props are mapped to ZERO of the other 6 types.
+        assert c.execute(text(
+            "SELECT count(*) FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE mt.materialtype <> 'Visualiser' "
+            "AND pt.property IN ('color_r','color_g','color_b','texture_file')"
+        )).scalar() == 0
+
+        # opacity is an integer percent 0..100.
+        assert c.execute(text(
+            "SELECT min, max FROM property_type WHERE property = 'opacity'"
+        )).fetchone() == (0, 100)
+
+        # Visualiser is a rendering type: NO model_type row (mig 018 untouched).
+        assert c.execute(text(
+            "SELECT count(*) FROM model_type WHERE model = 'Visualiser'"
+        )).scalar() == 0
+
+        # A global Default Visualiser group with one Visualiser member carrying
+        # grey-128 colour + opacity 100.
+        members = c.execute(text(
+            "SELECT pm.id FROM project_material pm "
+            "JOIN material_group mg ON mg.id = pm.material_group_id "
+            "JOIN material_type mt ON mt.id = pm.material_type_id "
+            "WHERE mg.name = 'Default Visualiser' AND mg.project_id IS NULL "
+            "AND mt.materialtype = 'Visualiser'"
+        )).fetchall()
+        assert len(members) == 1
+        vals = dict(c.execute(text(
+            "SELECT pt.property, md.value FROM material_data md "
+            "JOIN property_type pt ON pt.id = md.property_type_id "
+            "WHERE md.project_material_id = :m"
+        ), {"m": members[0][0]}).fetchall())
+        # opacity 100 + colour 128 + texture_toggle '0' (colour mode; migration
+        # 025 seeds the toggle onto this same default member).
+        assert vals == {"color_r": "128", "color_g": "128", "color_b": "128",
+                        "opacity": "100", "texture_toggle": "0"}
+
+        # NULL-project group count is now 7 (6 wrapped mig-019 defaults + this).
+        assert c.execute(text(
+            "SELECT count(*) FROM material_group WHERE project_id IS NULL"
+        )).scalar() == 7
+
+
+def test_025_visualiser_texture_toggle(temp_engine):
+    """025 adds the boolean `texture_toggle` mode selector to Visualiser (only)
+    and seeds the Default Visualiser member to colour mode (toggle = false)."""
+    database.run_migrations()
+    assert 25 in _versions(temp_engine)
+
+    with temp_engine.begin() as c:
+        # texture_toggle is a boolean property...
+        assert c.execute(text(
+            "SELECT d.name FROM property_type pt JOIN datatype d ON d.id = pt.datatype_id "
+            "WHERE pt.property = 'texture_toggle'"
+        )).scalar() == "boolean"
+        # ...mapped to ONLY the Visualiser type.
+        owners = {r[0] for r in c.execute(text(
+            "SELECT mt.materialtype FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE pt.property = 'texture_toggle'"
+        ))}
+        assert owners == {"Visualiser"}
+        # The Default Visualiser member is seeded to colour mode (toggle = '0').
+        assert c.execute(text(
+            "SELECT md.value FROM material_data md "
+            "JOIN property_type pt ON pt.id = md.property_type_id "
+            "JOIN project_material pm ON pm.id = md.project_material_id "
+            "JOIN material_group mg ON mg.id = pm.material_group_id "
+            "WHERE pt.property = 'texture_toggle' AND mg.name = 'Default Visualiser'"
+        )).scalar() == "0"
+
+
+def test_031_photosynthesis_submodel_selector(temp_engine):
+    """031 adds the `submodel` enum to Photosynthesis (only) and gates the
+    Farquhar group on it. The selector must stay TOP-LEVEL and editable — if it
+    landed in a group or was withheld, the catalog would drop it and the group
+    would be permanently invisible."""
+    database.run_migrations()
+    assert 31 in _versions(temp_engine)
+
+    with temp_engine.begin() as c:
+        assert c.execute(text(
+            "SELECT d.name FROM property_type pt JOIN datatype d ON d.id = pt.datatype_id "
+            "WHERE pt.property = 'submodel'"
+        )).scalar() == "enum"
+        assert c.execute(text(
+            "SELECT enum_values FROM property_type WHERE property = 'submodel'"
+        )).scalar() == '["farquhar_model"]'
+        # Mapped to ONLY the Photosynthesis type...
+        owners = {r[0] for r in c.execute(text(
+            "SELECT mt.materialtype FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE pt.property = 'submodel'"
+        ))}
+        assert owners == {"Photosynthesis"}
+        # ...as a top-level, editable field (the two ways it could vanish).
+        group_name, visibility = c.execute(text(
+            "SELECT mpt.group_name, mpt.visibility FROM material_property_type mpt "
+            "JOIN property_type pt ON pt.id = mpt.property_type_id "
+            "WHERE pt.property = 'submodel'"
+        )).one()
+        assert group_name is None
+        assert visibility == "editable"
+        # All 14 Farquhar links are gated, and still carry 027's group name.
+        gated = c.execute(text(
+            "SELECT count(*) FROM material_property_type mpt "
+            "JOIN material_type mt ON mt.id = mpt.material_type_id "
+            "WHERE mt.materialtype = 'Photosynthesis' AND mpt.group_name = 'Farquhar model' "
+            "  AND mpt.selector_property = 'submodel' "
+            "  AND mpt.selector_value = 'farquhar_model'"
+        )).scalar()
+        assert gated == 14
+        # The seeded default member selects Farquhar, so its group is not hidden.
+        assert c.execute(text(
+            "SELECT md.value FROM material_data md "
+            "JOIN property_type pt ON pt.id = md.property_type_id "
+            "JOIN project_material pm ON pm.id = md.project_material_id "
+            "JOIN material_group mg ON mg.id = pm.material_group_id "
+            "WHERE pt.property = 'submodel' AND mg.name = 'Default Photosyn'"
+        )).scalar() == "farquhar_model"
+
+
+def test_031_backfills_existing_members_and_frozen_snapshots(temp_engine):
+    """The upgrade case, and the only thing that catches a broken backfill.
+
+    A pre-031 database has Photosynthesis members with saved Farquhar values and
+    no `submodel`. Once the group is gated, an unmatched selector makes
+    member_property_values drop those 14 keys, the form blanks them, and the next
+    full-replacement PUT deletes them — silent data loss. The frozen per-object
+    snapshot needs the same value or every existing assignment reports a spurious
+    library_drift."""
+    _apply_through(temp_engine, 30)
+    with temp_engine.begin() as c:
+        photo = c.execute(text(
+            "SELECT id FROM material_type WHERE materialtype='Photosynthesis'")).scalar()
+        vcmax = c.execute(text(
+            "SELECT id FROM property_type WHERE property='vcmax25'")).scalar()
+        grd = c.execute(text("SELECT id FROM object_types WHERE object='Ground'")).scalar()
+        c.execute(text("INSERT INTO projects(id,session_id,name) VALUES('p1','s1','P1')"))
+        c.execute(text("INSERT INTO scenarios(id,project_id,name) VALUES('sc1','p1','Main')"))
+        c.execute(text("INSERT INTO material_group(id,project_id,scenario_id,name) "
+                       "VALUES (900,'p1','sc1','LegacyPhoto')"))
+        c.execute(text("INSERT INTO project_material(id,material_group_id,material_type_id) "
+                       "VALUES (900,900,:p)"), {"p": photo})
+        c.execute(text("INSERT INTO material_data(project_material_id,property_type_id,value) "
+                       "VALUES (900,:v,'100')"), {"v": vcmax})
+        c.execute(text("INSERT INTO scenario_object(id,scenario_id,project_id,name,object_type_id,helios_uuids) "
+                       "VALUES (900,'sc1','p1','Ground',:g,'[]')"), {"g": grd})
+        c.execute(text("INSERT INTO object_material(scenario_object_id,project_material_id,"
+                       "material_group_id,material_type_id) VALUES (900,900,900,:p)"), {"p": photo})
+        c.execute(text("INSERT INTO object_property_data(scenario_object_id,project_material_id,property_type_id,value) "
+                       "VALUES (900,900,:v,'100')"), {"v": vcmax})
+
+    database.run_migrations()   # applies 031 on the populated DB
+    assert 31 in _versions(temp_engine)
+
+    with temp_engine.begin() as c:
+        # The pre-existing coefficient is untouched...
+        assert c.execute(text(
+            "SELECT value FROM material_data WHERE project_material_id=900 "
+            "AND property_type_id=(SELECT id FROM property_type WHERE property='vcmax25')"
+        )).scalar() == "100"
+        # ...and now sits alongside a selector value that keeps it visible.
+        assert c.execute(text(
+            "SELECT value FROM material_data WHERE project_material_id=900 "
+            "AND property_type_id=(SELECT id FROM property_type WHERE property='submodel')"
+        )).scalar() == "farquhar_model"
+        # The frozen snapshot got the same treatment.
+        assert c.execute(text(
+            "SELECT value FROM object_property_data WHERE scenario_object_id=900 "
+            "AND project_material_id=900 "
+            "AND property_type_id=(SELECT id FROM property_type WHERE property='submodel')"
+        )).scalar() == "farquhar_model"

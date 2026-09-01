@@ -1,4 +1,5 @@
 import functools
+import inspect
 import threading
 from contextlib import contextmanager
 
@@ -92,10 +93,16 @@ class SessionRegistry:
         self._store: dict[str, dict[str, ProjectContext]] = {}
         # {session_id: {project_id: {scenario_id: ScenarioContext}}}
         self._scenarios: dict[str, dict[str, dict[str, ScenarioContext]]] = {}
-        # Guards a scenario's shared PyHelios context (geometry + weather live
-        # in the same sctx.context). Mutations take .write(); the autosave and
-        # the geometry reads take .read() and so no longer block each other.
-        self._scenario_lock = ScenarioLock()
+        # Guards THE DICTS ABOVE ONLY — inserting or removing a scenario entry.
+        # Held for microseconds, never across engine work.
+        #
+        # A scenario's PyHelios context is guarded by that scenario's own
+        # `sctx.lock` (see ScenarioContext). The two were one lock, which meant
+        # a 16s writeXML on one scenario blocked every other scenario in the
+        # process: opening a 4x4 ground after closing a 700x700 one took 7.34s,
+        # none of it work. Splitting them lets unrelated scenarios proceed,
+        # which the engine has always allowed.
+        self._registry_lock = threading.RLock()
 
     # ── Session level ────────────────────────────────────────────────
 
@@ -150,15 +157,22 @@ class SessionRegistry:
         """
         Look up a live scenario. If it doesn't exist, create a fresh one.
         The caller always gets a ScenarioContext back.
+
+        The registry lock is taken HERE rather than by callers. Two requests
+        racing to open the same scenario must not each build a ScenarioContext
+        and each get a different one — the loser's Context would be mutated by
+        its request and then dropped. It is held only across dict work, never
+        across engine calls, so it stays a microsecond-scale lock.
         """
-        if session_id not in self._scenarios:
-            self._scenarios[session_id] = {}
-        if project_id not in self._scenarios[session_id]:
-            self._scenarios[session_id][project_id] = {}
-        proj_scenarios = self._scenarios[session_id][project_id]
-        if scenario_id not in proj_scenarios:
-            proj_scenarios[scenario_id] = ScenarioContext(project_id, scenario_id)
-        return proj_scenarios[scenario_id]
+        with self._registry_lock:
+            if session_id not in self._scenarios:
+                self._scenarios[session_id] = {}
+            if project_id not in self._scenarios[session_id]:
+                self._scenarios[session_id][project_id] = {}
+            proj_scenarios = self._scenarios[session_id][project_id]
+            if scenario_id not in proj_scenarios:
+                proj_scenarios[scenario_id] = ScenarioContext(project_id, scenario_id)
+            return proj_scenarios[scenario_id]
 
     def get_scenario_context(
         self, session_id: str, project_id: str, scenario_id: str
@@ -174,7 +188,8 @@ class SessionRegistry:
         self, session_id: str, project_id: str, scenario_id: str
     ) -> None:
         """Remove a single scenario from memory."""
-        self._scenarios.get(session_id, {}).get(project_id, {}).pop(scenario_id, None)
+        with self._registry_lock:
+            self._scenarios.get(session_id, {}).get(project_id, {}).pop(scenario_id, None)
 
     def remove_all_scenarios_for_project(
         self, session_id: str, project_id: str
@@ -199,9 +214,49 @@ def with_context_write_lock(fn):
     """
     @functools.wraps(fn)
     def _wrapper(*args, **kwargs):
-        with registry._scenario_lock.write():
+        sctx = _find_sctx(fn, args, kwargs)
+        with sctx.lock.write():
             return fn(*args, **kwargs)
     return _wrapper
+
+
+def _find_sctx(fn, args, kwargs) -> ScenarioContext:
+    """The ScenarioContext a wrapped mutation operates on.
+
+    TWO SHAPES, because the decorated functions genuinely differ. Geometry
+    helpers are handed the context (`_teardown(sctx, ...)`,
+    `_build(db, sctx, ...)`) — position varies, so it is located by type rather
+    than by index. Weather helpers are handed the IDS instead
+    (`clear_headers(session_id, project_id, scenario_id, db)`) and resolve the
+    context themselves, so the lock is looked up from those.
+
+    get_or_create, not get: a weather mutation on a scenario that is not live
+    yet would otherwise find no lock, and the alternative — running unguarded —
+    is the bug this decorator exists to prevent. Creating the entry here is what
+    the function is about to do anyway.
+
+    Raising is deliberate. A mutation that cannot identify its scenario must not
+    run at all rather than run with no lock.
+    """
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, ScenarioContext):
+            return value
+
+    bound = _signature_of(fn).bind_partial(*args, **kwargs).arguments
+    ids = (bound.get("session_id"), bound.get("project_id"), bound.get("scenario_id"))
+    if all(isinstance(i, str) and i for i in ids):
+        return registry.get_or_create_scenario_context(*ids)
+
+    raise RuntimeError(
+        f"{fn.__qualname__}: no ScenarioContext and no "
+        f"(session_id, project_id, scenario_id) in the arguments — this "
+        f"mutation would run with no lock at all")
+
+
+@functools.lru_cache(maxsize=None)
+def _signature_of(fn):
+    """Cached — bind_partial is called on every guarded mutation."""
+    return inspect.signature(fn)
 
 
 # Module-level singleton

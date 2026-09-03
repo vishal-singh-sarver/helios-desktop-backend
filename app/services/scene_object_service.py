@@ -1646,6 +1646,26 @@ def assign_material_group(db: Session, session_id: str, project_id: str,
     if blockers:
         raise _type_conflict_409(db, so, blockers)
 
+    # Before the row is written: refuse a texture this ground cannot be rebuilt
+    # with, rather than letting the engine discover it after the assignment
+    # stands. Only the Visualiser member decides what the tile is built with.
+    winner = next((pm for pm in members
+                   if (mt := db.get(MaterialType, pm.material_type_id)) is not None
+                   and mt.materialtype == material_apply._PRECEDENCE_TYPE), None)
+    if winner is not None:
+        vals = {prop: decode_value(value, dt) for prop, value, dt in (
+            db.query(PropertyType.property, MaterialData.value, Datatype.name)
+            .join(MaterialData, MaterialData.property_type_id == PropertyType.id)
+            .join(Datatype, Datatype.id == PropertyType.datatype_id)
+            .filter(MaterialData.project_material_id == winner.id).all())}
+        if material_apply._is_texture_mode(vals):
+            props = _intrinsic_native(db, so.id)
+            material_apply.check_resolution(
+                (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
+                (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
+                material_apply.resolve_texture_path(vals.get("texture_file")),
+                so.name)
+
     db.add(ObjectMaterialGroup(scenario_object_id=so.id, material_group_id=grp.id,
                                sync=1 if body.sync else 0))
     try:

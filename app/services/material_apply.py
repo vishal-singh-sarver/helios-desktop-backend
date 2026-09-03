@@ -37,6 +37,7 @@ All PyHelios access degrades to a no-op when the native library is unavailable
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -53,9 +54,12 @@ from app.helios import context as helios_ctx
 from app.helios import registry as reg
 from app.services.eav_validation import (
     VISUALISATION_PROPERTIES,
+    api_error,
     decode_value,
     load_type_properties,
 )
+
+logger = logging.getLogger(__name__)
 
 # Viewport precedence among a geometry's assigned materials (Plan B): the
 # Visualiser-type material is the SOLE owner of the single-valued colour/texture/
@@ -138,6 +142,86 @@ def resolve_texture_path(value: str | None) -> str | None:
         path = (settings.data_dir / value).resolve()
         return str(path) if path.exists() else None
     return value
+
+
+def _snap(subdiv: int, repeat: int) -> int:
+    """The repeat the engine will really use: clamped to the subdivision, then
+    walked down to a divisor of it (Context_object.cpp:353-359). Mirroring only
+    the inequality and not this is the classic wrong answer — 521 at repeat 2
+    reads as legal, but 521 is odd so the repeat collapses to 1 and it fails."""
+    r = max(1, min(int(subdiv), int(repeat)))
+    while subdiv % r:
+        r -= 1
+    return r
+
+
+def _texture_pixels(path: str) -> tuple[int, int] | None:
+    """The image's pixel dimensions, read from its header.
+
+    Pillow reads the size lazily — header only, no pixel decode — so this stays
+    cheap even for a large PNG.
+
+    Deliberately NOT asked of the engine. Helios exposes no path-keyed getter,
+    so the only way to ask it is to add a textured primitive and read
+    getPrimitiveTextureSize. That permanently inserts the file into Context's
+    `textures` map, which nothing ever erases, and for a PNG with an alpha
+    channel it forces a full decode — a lot of residue for two integers.
+
+    Routed the way the ENGINE routes, which is by extension and case-sensitive:
+    exactly ".png" goes to its PNG reader, everything else to its JPEG reader
+    (Context.cpp:106-127). Pillow instead sniffs the file's real content, so the
+    two can disagree — an uppercase ".PNG" is a valid PNG to Pillow and is handed
+    to the JPEG loader by Helios, which rejects it. Where the reader Helios will
+    use does not match what the file actually is, report unknown and let the
+    engine raise its own error rather than measure a file it cannot open.
+
+    Returns None when the size cannot be established: missing file, unsupported
+    format, corrupt header, or that reader mismatch. That means UNKNOWN, and the
+    caller must let the build proceed rather than reject on it.
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            fmt = im.format
+            w, h = im.size
+        helios_reads_as_png = path.endswith(".png")
+        if helios_reads_as_png != (fmt == "PNG"):
+            logger.debug("[texture] %r is %s but Helios will read it as %s",
+                         path, fmt, "PNG" if helios_reads_as_png else "JPEG")
+            return None
+        return (int(w), int(h)) if w > 0 and h > 0 else None
+    except Exception:
+        logger.debug("[texture] could not read pixel size of %r", path, exc_info=True)
+        return None
+
+
+def check_resolution(subdiv: tuple[int, int], repeat: tuple[int, int],
+                     texture_path: str | None, ground_name: str) -> None:
+    """Raise if this ground cannot be built with this texture.
+
+    addTileObject refuses `subdiv >= snapped_repeat * texture_pixels` on either
+    axis (Context_object.cpp:377-380) — note `>=`, so a 512px texture caps the
+    subdivision at 511. Called before a material is applied and before a
+    texture is changed under grounds already using it, so the user is told
+    instead of the write landing and the repaint silently failing.
+
+    Silent when it cannot answer — no texture, colour mode, headless, or an
+    unreadable file. We would rather let the engine refuse a build than block
+    one it would have accepted.
+    """
+    if not texture_path:
+        return
+    px = _texture_pixels(texture_path)
+    if px is None:
+        return
+    if not any(int(s) >= _snap(int(s), int(r)) * p
+               for s, r, p in zip(subdiv, repeat, px)):
+        return
+
+    raise api_error(
+        422, "RESOLUTION_TOO_HIGH",
+        f"This texture is {px[0]}x{px[1]} pixels, too small for "
+        f"'{ground_name}' at {subdiv[0]} x {subdiv[1]}.")
 
 
 # ── Snapshot reads ───────────────────────────────────────────────────────────

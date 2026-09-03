@@ -47,7 +47,6 @@ from app.db.models import (
     ScenarioObject,
     _now,
 )
-from app.helios import context as helios_ctx
 from app.services import material_apply
 from app.services import material_sync_service as sync_svc
 from app.services.eav_validation import (
@@ -394,7 +393,7 @@ def _run_on_active_context(db: Session, session_id: str | None,
     return result
 
 
-def _reject_unusable_texture(db: Session, session_id: str, scn: Scenario | None,
+def _reject_unusable_texture(db: Session, scn: Scenario | None,
                              pm_id: int, canonical: dict) -> None:
     """Refuse a member's new texture before it is written, when a ground already
     using it could not be rebuilt with it.
@@ -433,11 +432,9 @@ def _reject_unusable_texture(db: Session, session_id: str, scn: Scenario | None,
     if not grounds:
         return
 
-    ctx = helios_ctx.get_context(sos._sctx(session_id, scn.project_id, scn.id))
     for so in grounds:
         props = sos._intrinsic_native(db, so.id)
         material_apply.check_resolution(
-            ctx,
             (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
             (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
             path, so.name)
@@ -769,7 +766,7 @@ def update_group_material(db: Session, session_id: str, group_id: int,
     )
     # Before anything is staged: a texture no ground using this member could be
     # rebuilt with is refused outright, rather than written and then reported.
-    _reject_unusable_texture(db, session_id, scn, pm.id, canonical)
+    _reject_unusable_texture(db, scn, pm.id, canonical)
 
     _upsert_values(db, pm.id, canonical, defs, replace=True)
     # THE reported path: set the Heat Transfer Flag on one member, then change

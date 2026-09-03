@@ -12,15 +12,13 @@ from app.services import material_apply as ma
 
 
 def _px(path):
-    from pyhelios.Context import Context
-    return ma._texture_pixels(Context(), path)
+    return ma._texture_pixels(path)
 
 
 def _accepts(subdiv, repeat, path, px):
     """True when check_resolution lets this through."""
     try:
-        from pyhelios.Context import Context
-        ma.check_resolution(Context(), subdiv, repeat, path, "g")
+        ma.check_resolution(subdiv, repeat, path, "g")
         return True
     except Exception:
         return False
@@ -73,24 +71,21 @@ def test_the_valid_set_has_gaps():
 
 
 def test_silent_when_it_cannot_answer():
-    """No texture, an unreadable file, or no context: allow the write. We would
+    """No texture, or a file that cannot be read: allow the write. We would
     rather let the engine refuse a build than block one it would accept."""
-    if not helios_ctx.PYHELIOS_AVAILABLE:
-        pytest.skip("native PyHelios unavailable")
-    from pyhelios.Context import Context
-    ctx = Context()
     for path in (None, "", "/nowhere/missing.jpg", "run.sh"):
-        ma.check_resolution(ctx, (9000, 9000), (1, 1), path, "g")   # must not raise
-    ma.check_resolution(None, (9000, 9000), (1, 1), "x.jpg", "g")
+        ma.check_resolution((9000, 9000), (1, 1), path, "g")   # must not raise
 
 
-def test_probe_leaves_no_geometry():
-    """The size read adds a primitive and deletes it."""
+def test_reading_the_size_does_not_touch_the_engine():
+    """The size comes from the file's header, so no Context is created and
+    nothing is inserted into the engine's texture map — which is never erased,
+    and would otherwise keep a stale size for a re-uploaded path."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         pytest.skip("native PyHelios unavailable")
     from pyhelios.Context import Context
     ctx = Context()
     before = ctx.getPrimitiveCount()
     for _ in range(5):
-        assert ma._texture_pixels(ctx, ma._DEFAULT_GROUND_TEXTURE) == (512, 512)
+        assert ma._texture_pixels(ma._DEFAULT_GROUND_TEXTURE) == (512, 512)
     assert ctx.getPrimitiveCount() == before

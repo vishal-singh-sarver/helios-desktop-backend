@@ -155,38 +155,47 @@ def _snap(subdiv: int, repeat: int) -> int:
     return r
 
 
-def _texture_pixels(ctx, path: str) -> tuple[int, int] | None:
-    """The image's pixel size as the ENGINE sees it — the same int2 the guard
-    compares against — read back rather than measured again, so the two cannot
-    disagree.
+def _texture_pixels(path: str) -> tuple[int, int] | None:
+    """The image's pixel dimensions, read from its header.
 
-    `textures` is a private map with no path-keyed getter, and the only way in
-    is getPrimitiveTextureSize(uuid) (Context.cpp:3306). Hence a throwaway
-    patch. It is cheap after the first probe of a given texture: addTexture
-    short-circuits once the path is cached. (0,0) is the engine's MISS value,
-    so it means unknown, never zero.
+    Pillow reads the size lazily — header only, no pixel decode — so this stays
+    cheap even for a large PNG.
 
-    Only ever probe a texture the build will use: nothing erases that map, so
-    probing a losing candidate pins its size for the life of the Context.
+    Deliberately NOT asked of the engine. Helios exposes no path-keyed getter,
+    so the only way to ask it is to add a textured primitive and read
+    getPrimitiveTextureSize. That permanently inserts the file into Context's
+    `textures` map, which nothing ever erases, and for a PNG with an alpha
+    channel it forces a full decode — a lot of residue for two integers.
+
+    Routed the way the ENGINE routes, which is by extension and case-sensitive:
+    exactly ".png" goes to its PNG reader, everything else to its JPEG reader
+    (Context.cpp:106-127). Pillow instead sniffs the file's real content, so the
+    two can disagree — an uppercase ".PNG" is a valid PNG to Pillow and is handed
+    to the JPEG loader by Helios, which rejects it. Where the reader Helios will
+    use does not match what the file actually is, report unknown and let the
+    engine raise its own error rather than measure a file it cannot open.
+
+    Returns None when the size cannot be established: missing file, unsupported
+    format, corrupt header, or that reader mismatch. That means UNKNOWN, and the
+    caller must let the build proceed rather than reject on it.
     """
-    from pyhelios.types import vec2, vec3
-    uuid = None
     try:
-        uuid = ctx.addPatchTextured(vec3(0.0, 0.0, -1.0e6), vec2(1.0e-4, 1.0e-4), path)
-        sz = ctx.getPrimitiveTextureSize(uuid)      # int2, not a tuple
-        return (int(sz.x), int(sz.y)) if sz.x > 0 and sz.y > 0 else None
+        from PIL import Image
+        with Image.open(path) as im:
+            fmt = im.format
+            w, h = im.size
+        helios_reads_as_png = path.endswith(".png")
+        if helios_reads_as_png != (fmt == "PNG"):
+            logger.debug("[texture] %r is %s but Helios will read it as %s",
+                         path, fmt, "PNG" if helios_reads_as_png else "JPEG")
+            return None
+        return (int(w), int(h)) if w > 0 and h > 0 else None
     except Exception:
         logger.debug("[texture] could not read pixel size of %r", path, exc_info=True)
         return None
-    finally:
-        if uuid is not None:
-            try:
-                ctx.deletePrimitive(uuid)
-            except Exception:
-                logger.debug("[texture] probe primitive %s outlived its read", uuid)
 
 
-def check_resolution(ctx, subdiv: tuple[int, int], repeat: tuple[int, int],
+def check_resolution(subdiv: tuple[int, int], repeat: tuple[int, int],
                      texture_path: str | None, ground_name: str) -> None:
     """Raise if this ground cannot be built with this texture.
 
@@ -200,9 +209,9 @@ def check_resolution(ctx, subdiv: tuple[int, int], repeat: tuple[int, int],
     unreadable file. We would rather let the engine refuse a build than block
     one it would have accepted.
     """
-    if not texture_path or ctx is None or not helios_ctx.PYHELIOS_AVAILABLE:
+    if not texture_path:
         return
-    px = _texture_pixels(ctx, texture_path)
+    px = _texture_pixels(texture_path)
     if px is None:
         return
     if not any(int(s) >= _snap(int(s), int(r)) * p

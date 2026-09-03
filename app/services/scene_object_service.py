@@ -1661,7 +1661,6 @@ def assign_material_group(db: Session, session_id: str, project_id: str,
         if material_apply._is_texture_mode(vals):
             props = _intrinsic_native(db, so.id)
             material_apply.check_resolution(
-                helios_ctx.get_context(sctx),
                 (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
                 (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
                 material_apply.resolve_texture_path(vals.get("texture_file")),

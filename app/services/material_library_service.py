@@ -38,6 +38,7 @@ from app.db.models import (
     MaterialGroup,
     MaterialPropertyType,
     MaterialType,
+    ObjectMaterial,
     ObjectMaterialGroup,
     ObjectPropertyData,
     ProjectMaterial,
@@ -46,6 +47,7 @@ from app.db.models import (
     ScenarioObject,
     _now,
 )
+from app.helios import context as helios_ctx
 from app.services import material_apply
 from app.services import material_sync_service as sync_svc
 from app.services.eav_validation import (
@@ -392,6 +394,55 @@ def _run_on_active_context(db: Session, session_id: str | None,
     return result
 
 
+def _reject_unusable_texture(db: Session, session_id: str, scn: Scenario | None,
+                             pm_id: int, canonical: dict) -> None:
+    """Refuse a member's new texture before it is written, when a ground already
+    using it could not be rebuilt with it.
+
+    Raises rather than reporting: `_eager_reconcile` runs after the commit and
+    by contract cannot fail the request, which is why this path currently
+    answers 200 and "Changes have been successfully saved" while nothing
+    repaints.
+
+    The three filters are what keep it from blocking work that would succeed:
+    only a Visualiser member decides what a ground is built with, only a sync=1
+    assignment is repainted from the library, and only this scenario has a live
+    context to check against.
+    """
+    if scn is None or not material_apply._is_texture_mode(canonical):
+        return
+    path = material_apply.resolve_texture_path(canonical.get("texture_file"))
+    if not path:
+        return
+
+    from app.services import scene_object_service as sos
+
+    grounds = (
+        db.query(ScenarioObject)
+        .join(ObjectMaterial, ObjectMaterial.scenario_object_id == ScenarioObject.id)
+        .join(ObjectMaterialGroup,
+              (ObjectMaterialGroup.scenario_object_id == ObjectMaterial.scenario_object_id)
+              & (ObjectMaterialGroup.material_group_id == ObjectMaterial.material_group_id))
+        .join(MaterialType, MaterialType.id == ObjectMaterial.material_type_id)
+        .filter(ObjectMaterial.project_material_id == pm_id,
+                MaterialType.materialtype == "Visualiser",
+                ObjectMaterialGroup.sync == 1,
+                ScenarioObject.scenario_id == scn.id)
+        .all()
+    )
+    if not grounds:
+        return
+
+    ctx = helios_ctx.get_context(sos._sctx(session_id, scn.project_id, scn.id))
+    for so in grounds:
+        props = sos._intrinsic_native(db, so.id)
+        material_apply.check_resolution(
+            ctx,
+            (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
+            (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
+            path, so.name)
+
+
 def _eager_reconcile(db: Session, session_id: str, scn: Scenario, group_id: int) -> dict:
     """Full-cascade semantics for the ACTIVE scenario: hydrate, reconcile this
     group's applied state to library truth, repaint. Runs AFTER the library
@@ -716,6 +767,10 @@ def update_group_material(db: Session, session_id: str, group_id: int,
         type_label=mt.materialtype if mt else "material", type_kind="material type",
         required=required,
     )
+    # Before anything is staged: a texture no ground using this member could be
+    # rebuilt with is refused outright, rather than written and then reported.
+    _reject_unusable_texture(db, session_id, scn, pm.id, canonical)
+
     _upsert_values(db, pm.id, canonical, defs, replace=True)
     # THE reported path: set the Heat Transfer Flag on one member, then change
     # it on another. Both are this endpoint, and without this the two members

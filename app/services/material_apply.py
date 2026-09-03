@@ -37,6 +37,7 @@ All PyHelios access degrades to a no-op when the native library is unavailable
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -53,9 +54,12 @@ from app.helios import context as helios_ctx
 from app.helios import registry as reg
 from app.services.eav_validation import (
     VISUALISATION_PROPERTIES,
+    api_error,
     decode_value,
     load_type_properties,
 )
+
+logger = logging.getLogger(__name__)
 
 # Viewport precedence among a geometry's assigned materials (Plan B): the
 # Visualiser-type material is the SOLE owner of the single-valued colour/texture/
@@ -138,6 +142,91 @@ def resolve_texture_path(value: str | None) -> str | None:
         path = (settings.data_dir / value).resolve()
         return str(path) if path.exists() else None
     return value
+
+
+def _snap(subdiv: int, repeat: int) -> int:
+    """The repeat the engine will really use: clamped to the subdivision, then
+    walked down to a divisor of it (Context_object.cpp:353-359). Mirroring only
+    the inequality and not this is the classic wrong answer — 521 at repeat 2
+    reads as legal, but 521 is odd so the repeat collapses to 1 and it fails."""
+    r = max(1, min(int(subdiv), int(repeat)))
+    while subdiv % r:
+        r -= 1
+    return r
+
+
+def _max_subdiv(requested: int, repeat: int, px: int) -> int:
+    """The biggest subdivision <= requested the engine would accept. Walked,
+    not computed: the snap depends on the candidate, so the valid set has gaps
+    (at 16px/repeat 3: 42 ok, 43 no, 44 no, 45 ok). That is why "lower the
+    resolution" is not on its own useful advice."""
+    for s in range(max(1, int(requested)), 0, -1):
+        if s < _snap(s, repeat) * px:
+            return s
+    return 1
+
+
+def _texture_pixels(ctx, path: str) -> tuple[int, int] | None:
+    """The image's pixel size as the ENGINE sees it — the same int2 the guard
+    compares against — read back rather than measured again, so the two cannot
+    disagree.
+
+    `textures` is a private map with no path-keyed getter, and the only way in
+    is getPrimitiveTextureSize(uuid) (Context.cpp:3306). Hence a throwaway
+    patch. It is cheap after the first probe of a given texture: addTexture
+    short-circuits once the path is cached. (0,0) is the engine's MISS value,
+    so it means unknown, never zero.
+
+    Only ever probe a texture the build will use: nothing erases that map, so
+    probing a losing candidate pins its size for the life of the Context.
+    """
+    from pyhelios.types import vec2, vec3
+    uuid = None
+    try:
+        uuid = ctx.addPatchTextured(vec3(0.0, 0.0, -1.0e6), vec2(1.0e-4, 1.0e-4), path)
+        sz = ctx.getPrimitiveTextureSize(uuid)      # int2, not a tuple
+        return (int(sz.x), int(sz.y)) if sz.x > 0 and sz.y > 0 else None
+    except Exception:
+        logger.debug("[texture] could not read pixel size of %r", path, exc_info=True)
+        return None
+    finally:
+        if uuid is not None:
+            try:
+                ctx.deletePrimitive(uuid)
+            except Exception:
+                logger.debug("[texture] probe primitive %s outlived its read", uuid)
+
+
+def check_resolution(ctx, subdiv: tuple[int, int], repeat: tuple[int, int],
+                     texture_path: str | None, ground_name: str) -> None:
+    """Raise if this ground cannot be built with this texture.
+
+    addTileObject refuses `subdiv >= snapped_repeat * texture_pixels` on either
+    axis (Context_object.cpp:377-380) — note `>=`, so a 512px texture caps the
+    subdivision at 511. Called before a material is applied and before a
+    texture is changed under grounds already using it, so the user is told
+    instead of the write landing and the repaint silently failing.
+
+    Silent when it cannot answer — no texture, colour mode, headless, or an
+    unreadable file. We would rather let the engine refuse a build than block
+    one it would have accepted.
+    """
+    if not texture_path or ctx is None or not helios_ctx.PYHELIOS_AVAILABLE:
+        return
+    px = _texture_pixels(ctx, texture_path)
+    if px is None:
+        return
+    if not any(int(s) >= _snap(int(s), int(r)) * p
+               for s, r, p in zip(subdiv, repeat, px)):
+        return
+
+    mx, my = (_max_subdiv(subdiv[0], repeat[0], px[0]),
+              _max_subdiv(subdiv[1], repeat[1], px[1]))
+    raise api_error(
+        422, "RESOLUTION_TOO_HIGH",
+        f"This texture is {px[0]}x{px[1]} pixels, too small for "
+        f"'{ground_name}' at {subdiv[0]} x {subdiv[1]}. Use a larger image, "
+        f"raise the texture repeat, or set the resolution to at most {mx} x {my}.")
 
 
 # ── Snapshot reads ───────────────────────────────────────────────────────────

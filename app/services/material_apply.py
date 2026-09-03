@@ -155,17 +155,6 @@ def _snap(subdiv: int, repeat: int) -> int:
     return r
 
 
-def _max_subdiv(requested: int, repeat: int, px: int) -> int:
-    """The biggest subdivision <= requested the engine would accept. Walked,
-    not computed: the snap depends on the candidate, so the valid set has gaps
-    (at 16px/repeat 3: 42 ok, 43 no, 44 no, 45 ok). That is why "lower the
-    resolution" is not on its own useful advice."""
-    for s in range(max(1, int(requested)), 0, -1):
-        if s < _snap(s, repeat) * px:
-            return s
-    return 1
-
-
 def _texture_pixels(ctx, path: str) -> tuple[int, int] | None:
     """The image's pixel size as the ENGINE sees it — the same int2 the guard
     compares against — read back rather than measured again, so the two cannot
@@ -220,13 +209,10 @@ def check_resolution(ctx, subdiv: tuple[int, int], repeat: tuple[int, int],
                for s, r, p in zip(subdiv, repeat, px)):
         return
 
-    mx, my = (_max_subdiv(subdiv[0], repeat[0], px[0]),
-              _max_subdiv(subdiv[1], repeat[1], px[1]))
     raise api_error(
         422, "RESOLUTION_TOO_HIGH",
         f"This texture is {px[0]}x{px[1]} pixels, too small for "
-        f"'{ground_name}' at {subdiv[0]} x {subdiv[1]}. Use a larger image, "
-        f"raise the texture repeat, or set the resolution to at most {mx} x {my}.")
+        f"'{ground_name}' at {subdiv[0]} x {subdiv[1]}.")
 
 
 # ── Snapshot reads ───────────────────────────────────────────────────────────

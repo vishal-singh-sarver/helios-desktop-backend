@@ -65,22 +65,11 @@ def test_matches_the_engine():
 
 def test_the_valid_set_has_gaps():
     """Raising the subdivision can turn a failure back into a pass, because the
-    snap depends on the candidate. This is why the error returns a number
-    instead of "lower the resolution" — at 46 that advice reaches 44, which
-    also fails, past 45, which works."""
-    assert [ma._max_subdiv(s, 3, 16) for s in (42, 43, 44, 45, 46)] == [42, 42, 42, 45, 45]
+    snap depends on the candidate: 42 passes, 43 and 44 fail, 45 passes again.
+    Pinned because it is the reason the predicate cannot be simplified to a
+    single threshold."""
     ok = [s < ma._snap(s, 3) * 16 for s in (42, 43, 44, 45, 46)]
     assert ok == [True, False, False, True, False]
-
-
-def test_max_subdiv_is_the_largest_that_works():
-    """Brute-forced: an off-by-one hands the user a number that fails again."""
-    for px in (16, 64, 512):
-        for repeat in (1, 2, 3, 5):
-            for requested in range(1, 200):
-                truth = max((s for s in range(1, requested + 1)
-                             if s < ma._snap(s, repeat) * px), default=1)
-                assert ma._max_subdiv(requested, repeat, px) == truth
 
 
 def test_silent_when_it_cannot_answer():

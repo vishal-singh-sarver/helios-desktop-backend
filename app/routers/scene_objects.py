@@ -305,6 +305,12 @@ def assign_material_group(
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
+    """Assign a material group, REPLACING whatever holds the same material types.
+
+    One request, one transaction: the client does not delete the old material
+    first. A refusal (422 for a texture the geometry cannot be rebuilt with)
+    leaves the old material in place, so the geometry is never left bare.
+    """
     return svc.assign_material_group(db, session_id, project_id, scenario_id,
                                      object_id, body)
 

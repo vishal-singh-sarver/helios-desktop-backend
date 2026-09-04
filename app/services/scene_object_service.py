@@ -1652,6 +1652,36 @@ def _type_conflict_409(db: Session, so: ScenarioObject,
     )
 
 
+def _check_group_texture(db: Session, so: ScenarioObject, members: list) -> None:
+    """Raise 422 if this group's texture is too fine for the ground's resolution.
+
+    Only the Visualiser member decides what the tile is built with, and a group
+    holds at most one, so it is the only member that can make an assignment
+    impossible.
+
+    Runs before anything is displaced, so a refusal leaves the geometry carrying
+    exactly the material it had.
+    """
+    winner = next((pm for pm in members
+                   if (mt := db.get(MaterialType, pm.material_type_id)) is not None
+                   and mt.materialtype == material_apply._PRECEDENCE_TYPE), None)
+    if winner is None:
+        return
+    vals = {prop: decode_value(value, dt) for prop, value, dt in (
+        db.query(PropertyType.property, MaterialData.value, Datatype.name)
+        .join(MaterialData, MaterialData.property_type_id == PropertyType.id)
+        .join(Datatype, Datatype.id == PropertyType.datatype_id)
+        .filter(MaterialData.project_material_id == winner.id).all())}
+    if not material_apply._is_texture_mode(vals):
+        return
+    props = _intrinsic_native(db, so.id)
+    material_apply.check_resolution(
+        (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
+        (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
+        material_apply.resolve_texture_path(vals.get("texture_file")),
+        so.name)
+
+
 def assign_material_group(db: Session, session_id: str, project_id: str,
                           scenario_id: str, object_id: int, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
@@ -1674,32 +1704,34 @@ def assign_material_group(db: Session, session_id: str, project_id: str,
         .order_by(ProjectMaterial.material_type_id)
         .all()
     )
-    # No duplicate material type across this geometry's groups. Reads
-    # object_material directly so STALE rows count as blockers.
-    blockers = sync_svc.find_type_blockers(
-        db, [so.id], [pm.material_type_id for pm in members])
-    if blockers:
-        raise _type_conflict_409(db, so, blockers)
+    # BEFORE anything is displaced: refuse a texture this ground cannot be
+    # rebuilt with. This ordering is the whole point of replacing in one
+    # request — on a refusal the geometry still carries the material it had.
+    _check_group_texture(db, so, members)
 
-    # Before the row is written: refuse a texture this ground cannot be rebuilt
-    # with, rather than letting the engine discover it after the assignment
-    # stands. Only the Visualiser member decides what the tile is built with.
-    winner = next((pm for pm in members
-                   if (mt := db.get(MaterialType, pm.material_type_id)) is not None
-                   and mt.materialtype == material_apply._PRECEDENCE_TYPE), None)
-    if winner is not None:
-        vals = {prop: decode_value(value, dt) for prop, value, dt in (
-            db.query(PropertyType.property, MaterialData.value, Datatype.name)
-            .join(MaterialData, MaterialData.property_type_id == PropertyType.id)
-            .join(Datatype, Datatype.id == PropertyType.datatype_id)
-            .filter(MaterialData.project_material_id == winner.id).all())}
-        if material_apply._is_texture_mode(vals):
-            props = _intrinsic_native(db, so.id)
-            material_apply.check_resolution(
-                (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
-                (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
-                material_apply.resolve_texture_path(vals.get("texture_file")),
-                so.name)
+    # This assignment REPLACES whatever holds the types the group wants, rather
+    # than 409ing and making the client delete first. Reads object_material
+    # directly so STALE rows are displaced too.
+    #
+    # Same row removal as `unassign_material_group`, but WITHOUT its commit and
+    # repaint: those run with the old material gone and the new one not yet in,
+    # so the repaint would rebuild on the default texture — and on a ground too
+    # fine for it, fail, leaving the geometry bare. Staying in this transaction
+    # means a failure below rolls the removal back with it.
+    type_ids = [pm.material_type_id for pm in members]
+    blockers = sync_svc.find_type_blockers(db, [so.id], type_ids)
+    vacated: set[int] = set()
+    for old_id in {om.material_group_id for om in blockers}:
+        rows = sync_svc.group_member_rows(db, so.id, old_id)
+        vacated.update(om.material_type_id for om in rows)
+        for om in rows:
+            db.delete(om)   # snapshot rows cascade via the composite FK
+        old = db.get(ObjectMaterialGroup, (so.id, old_id))
+        if old is not None:
+            db.delete(old)
+    # Types the displaced groups held that this group does not fill — their
+    # labels have to be cleared on the repaint, or they keep painting.
+    cleared = sorted(vacated - set(type_ids))
 
     db.add(ObjectMaterialGroup(scenario_object_id=so.id, material_group_id=grp.id,
                                sync=1 if body.sync else 0))
@@ -1720,7 +1752,7 @@ def assign_material_group(db: Session, session_id: str, project_id: str,
         raise _type_conflict_409(db, so, blockers)
     db.commit()
 
-    _apply_assignment_change(db, sctx, so)
+    _apply_assignment_change(db, sctx, so, cleared_type_ids=cleared)
     omg = db.get(ObjectMaterialGroup, (so.id, grp.id))
     return {"success": True, "assignment": _group_assignment_payload(db, so, omg)}
 

@@ -56,6 +56,13 @@ def _grp_member(assignment_or_group, type_name):
                 if m["material_type"] == type_name)
 
 
+def _assigned_ids(client, h, obj_url):
+    """The group ids currently assigned to a geometry, oldest-assigned first."""
+    r = client.get(obj_url + "/material-groups", headers=h)
+    assert r.status_code == 200, r.text
+    return [g["group_id"] for g in r.json()["material_groups"]]
+
+
 # ── Geometry CRUD ────────────────────────────────────────────────────────────
 
 
@@ -675,16 +682,18 @@ def test_group_assignment_sync_freeze_lifecycle(client):
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "MATERIAL_GROUP_ALREADY_ASSIGNED"
 
-    # No duplicate material type ACROSS the geometry's groups; the 409 names
-    # the blocking group.
+    # Still no duplicate material type across the geometry's groups — but a
+    # second group of that type now DISPLACES the first instead of 409ing, so
+    # the client never has to delete one before assigning the other.
     r = client.post(obj_url + "/material-groups", json={"group_id": rad_two["id"]}, headers=h)
-    assert r.status_code == 409
-    d = r.json()["detail"]
-    assert d["code"] == "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT"
-    assert d["conflicts"][0]["group_id"] == grass["id"]
-    assert d["conflicts"][0]["group_name"] == "Grass Set"
-    assert d["conflicts"][0]["material_type"] == "Radiation"
-    assert "stale" not in d["conflicts"][0]
+    assert r.status_code == 201, r.text
+    assert _assigned_ids(client, h, obj_url) == [rad_two["id"]]
+
+    # Put Grass Set back (displacing Rad Two in turn) for the rest of the
+    # lifecycle below.
+    r = client.post(obj_url + "/material-groups", json={"group_id": grass["id"]}, headers=h)
+    assert r.status_code == 201, r.text
+    assert _assigned_ids(client, h, obj_url) == [grass["id"]]
 
     # A disjoint TYPE set is fine — assign frozen Energy Balance group
     r = client.post(obj_url + "/material-groups",
@@ -903,10 +912,11 @@ def test_assigned_member_gates_selector_submodel(client):
     assert props["stomatal_model"] == "Medlyn"
 
 
-def test_assignment_conflict_names_stale_blocker(client):
-    """A stale leftover (deleted group, not yet synced) still owns its type
-    slot: assigning another group of that type 409s with stale: true, and
-    succeeds after a sync."""
+def test_assignment_displaces_a_stale_leftover(client):
+    """A stale leftover (group deleted from the library, scenario not yet synced)
+    still owns its type slot and still paints — but it no longer BLOCKS. The
+    assignment displaces it like any other holder, so a geometry can never be
+    stuck behind a remnant the user cannot see or reach."""
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     obj = client.post(_base(pid, sid) + "/objects", json={
@@ -917,17 +927,12 @@ def test_assignment_conflict_names_stale_blocker(client):
     old = _mk_group(client, h, [("Radiation", None)], name="Old Rad")
     client.post(obj_url + "/material-groups", json={"group_id": old["id"]}, headers=h)
     client.delete(f"/api/materials/library/groups/{old['id']}", headers=h)   # no eager
+    assert _assigned_ids(client, h, obj_url) == [old["id"]]      # stale, still there
 
     new = _mk_group(client, h, [("Radiation", None)], name="New Rad")
     r = client.post(obj_url + "/material-groups", json={"group_id": new["id"]}, headers=h)
-    assert r.status_code == 409
-    c = r.json()["detail"]["conflicts"][0]
-    assert c["group_id"] == old["id"] and c["group_name"] is None
-    assert c["stale"] is True
-
-    client.put(_base(pid, sid) + "/material-sync", json={}, headers=h)
-    r = client.post(obj_url + "/material-groups", json={"group_id": new["id"]}, headers=h)
     assert r.status_code == 201, r.text
+    assert _assigned_ids(client, h, obj_url) == [new["id"]]
 
 
 def test_inplace_geometry_edits(client):

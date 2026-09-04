@@ -93,12 +93,13 @@ def test_reading_the_size_does_not_touch_the_engine():
     assert ctx.getPrimitiveCount() == before
 
 
-# ── the pre-check endpoint ───────────────────────────────────────────────────
+# ── assignment replaces, in one transaction ──────────────────────────────────
 #
-# The client must DELETE the ground's current material before it can POST a new
-# one, and those are two requests: if the POST fails the DELETE has already
-# committed and the ground is left bare. This endpoint is asked first, so the
-# DELETE is never issued when the answer is no.
+# Assigning used to 409 when another group held the same material type, forcing
+# the client to DELETE first — and when the POST was then refused for an
+# impossible texture, the DELETE had already committed and the geometry was left
+# bare. The assignment now displaces the old material itself, after the texture
+# check, so a refusal changes nothing at all.
 
 GROUND = {
     "length": 10, "breadth": 10,
@@ -143,11 +144,17 @@ def _ground(client, h, pid, sid, **props):
     return r.json()["object"]["id"]
 
 
-def _check(client, h, pid, sid, oid, gid):
-    r = client.get(f"/api/geometry/project/{pid}/scenario/{sid}"
-                   f"/objects/{oid}/material-groups/{gid}/check", headers=h)
-    assert r.status_code == 200, r.text     # always 200 — the verdict is the body
-    return r.json()
+def _assign(client, h, pid, sid, oid, gid):
+    return client.post(f"/api/geometry/project/{pid}/scenario/{sid}"
+                       f"/objects/{oid}/material-groups",
+                       json={"group_id": gid, "sync": True}, headers=h)
+
+
+def _assigned(client, h, pid, sid, oid):
+    r = client.get(f"/api/geometry/project/{pid}/scenario/{sid}/objects/{oid}",
+                   headers=h)
+    assert r.status_code == 200, r.text
+    return [g["group_id"] for g in r.json()["object"]["material_groups"]]
 
 
 def _ground_past_the_cap(client, h, pid, sid, colour):
@@ -169,87 +176,98 @@ def _ground_past_the_cap(client, h, pid, sid, colour):
     return oid
 
 
-def test_precheck_says_yes_when_the_texture_fits(client):
+def test_assigning_replaces_the_material_already_there(client):
+    """One request. B displaces A — no DELETE from the client, so the geometry
+    is never momentarily bare. This used to be a 409."""
     if not helios_ctx.PYHELIOS_AVAILABLE:
         pytest.skip("native PyHelios unavailable")
     h, pid, sid = _setup(client)
-    tex = _mk(client, h, TEXTURED)
-
-    # repeat 2 lifts the cap to 1024, so 600 subdivisions fit
-    oid = _ground(client, h, pid, sid, resolution_x=600, resolution_y=2,
-                  texture_x=2)
-    assert _check(client, h, pid, sid, oid, tex["id"]) == {"ok": True}
-
-
-def test_precheck_says_no_without_touching_anything(client):
-    """The whole point: a no must leave the ground exactly as it was."""
-    if not helios_ctx.PYHELIOS_AVAILABLE:
-        pytest.skip("native PyHelios unavailable")
-    h, pid, sid = _setup(client)
-    base = f"/api/geometry/project/{pid}/scenario/{sid}"
-    colour = _mk(client, h, COLOUR)
-    tex = _mk(client, h, TEXTURED)
-    oid = _ground_past_the_cap(client, h, pid, sid, colour)
-
-    verdict = _check(client, h, pid, sid, oid, tex["id"])
-    assert verdict["ok"] is False
-    assert verdict["code"] == "RESOLUTION_TOO_HIGH"
-    assert "512x512" in verdict["error"] and "900 x 2" in verdict["error"]
-
-    # unchanged: still carrying exactly the colour group
-    after = client.get(base + f"/objects/{oid}", headers=h).json()["object"]
-    assert [g["group_id"] for g in after["material_groups"]] == [colour["id"]]
-
-
-def test_precheck_ignores_the_duplicate_type_rule(client):
-    """THE TRAP. At pre-check time the material being replaced still occupies the
-    Visualiser slot, so running the full assign validation would 409 on a
-    conflict the caller is about to resolve by displacing it. Reusing that
-    validation passes every other test here and fails only this one."""
-    if not helios_ctx.PYHELIOS_AVAILABLE:
-        pytest.skip("native PyHelios unavailable")
-    h, pid, sid = _setup(client)
-    base = f"/api/geometry/project/{pid}/scenario/{sid}"
     a = _mk(client, h, COLOUR)
     b = _mk(client, h, TEXTURED)
-
     oid = _ground(client, h, pid, sid, resolution_x=100, resolution_y=2)
-    r = client.post(base + f"/objects/{oid}/material-groups",
-                    json={"group_id": a["id"], "sync": True}, headers=h)
-    assert r.status_code == 201, r.text
 
-    # The conflict is real: assigning B right now really would be refused...
-    r = client.post(base + f"/objects/{oid}/material-groups",
-                    json={"group_id": b["id"], "sync": True}, headers=h)
-    assert r.status_code == 409
-    assert r.json()["detail"]["code"] == "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT"
+    assert _assign(client, h, pid, sid, oid, a["id"]).status_code == 201
+    assert _assigned(client, h, pid, sid, oid) == [a["id"]]
 
-    # ...but the caller is about to resolve it by displacing A, so the answer
-    # the pre-check owes is yes.
-    assert _check(client, h, pid, sid, oid, b["id"]) == {"ok": True}
+    assert _assign(client, h, pid, sid, oid, b["id"]).status_code == 201
+    assert _assigned(client, h, pid, sid, oid) == [b["id"]]
 
 
-def test_precheck_allows_what_it_cannot_judge(client):
-    """Colour mode has no cap, and an unreadable file is simply unknown. Neither
-    is a reason to say no, and a false no would strand a legal assignment."""
+def test_a_refused_texture_leaves_the_old_material_in_place(client):
+    """THE BUG. The texture check runs BEFORE anything is displaced, so a
+    refusal changes nothing — previously the client had already deleted A by
+    this point and the ground was left bare."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    h, pid, sid = _setup(client)
+    colour = _mk(client, h, COLOUR)
+    tex = _mk(client, h, TEXTURED)
+    oid = _ground_past_the_cap(client, h, pid, sid, colour)
+
+    r = _assign(client, h, pid, sid, oid, tex["id"])
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["code"] == "RESOLUTION_TOO_HIGH"
+    assert "512x512" in detail["error"] and "900 x 2" in detail["error"]
+
+    # still carrying exactly the colour group
+    assert _assigned(client, h, pid, sid, oid) == [colour["id"]]
+
+
+def test_replacing_works_where_the_texture_fits(client):
+    """repeat 2 lifts the cap to 1024, so 600 subdivisions take the 512px
+    texture — the assignment goes through and replaces."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    h, pid, sid = _setup(client)
+    colour = _mk(client, h, COLOUR)
+    tex = _mk(client, h, TEXTURED)
+    oid = _ground(client, h, pid, sid, resolution_x=600, resolution_y=2,
+                  texture_x=2)
+
+    assert _assign(client, h, pid, sid, oid, colour["id"]).status_code == 201
+    assert _assign(client, h, pid, sid, oid, tex["id"]).status_code == 201
+    assert _assigned(client, h, pid, sid, oid) == [tex["id"]]
+
+
+def test_colour_replaces_on_a_ground_past_the_texture_cap(client):
+    """Colour mode has no resolution cap, so a ground too fine for any texture
+    still takes a colour material — and one colour still replaces another.
+
+    (Whether an UNREADABLE texture blocks the check is covered directly by
+    test_silent_when_it_cannot_answer; it cannot be asserted through the
+    assignment, because the engine then fails the build on the missing file.)
+    """
     if not helios_ctx.PYHELIOS_AVAILABLE:
         pytest.skip("native PyHelios unavailable")
     h, pid, sid = _setup(client)
     colour = _mk(client, h, COLOUR)
     oid = _ground_past_the_cap(client, h, pid, sid, colour)
 
-    other_colour = _mk(client, h, {**COLOUR, "color_r": 200, "color_g": 10})
-    assert _check(client, h, pid, sid, oid, other_colour["id"]) == {"ok": True}
-
-    missing = _mk(client, h, {"texture_toggle": True,
-                              "texture_file": "/nowhere/missing.png"})
-    assert _check(client, h, pid, sid, oid, missing["id"]) == {"ok": True}
+    other = _mk(client, h, {**COLOUR, "color_r": 200, "color_g": 10})
+    assert _assign(client, h, pid, sid, oid, other["id"]).status_code == 201
+    assert _assigned(client, h, pid, sid, oid) == [other["id"]]
 
 
-def test_precheck_404s_on_an_unknown_group(client):
+def test_reassigning_the_same_group_is_still_a_409(client):
+    """Displacing is for a DIFFERENT group holding the type. Re-posting the group
+    the geometry already carries is a client bug, not a replacement."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    h, pid, sid = _setup(client)
+    colour = _mk(client, h, COLOUR)
+    oid = _ground(client, h, pid, sid, resolution_x=100, resolution_y=2)
+
+    assert _assign(client, h, pid, sid, oid, colour["id"]).status_code == 201
+    r = _assign(client, h, pid, sid, oid, colour["id"])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_ALREADY_ASSIGNED"
+    assert _assigned(client, h, pid, sid, oid) == [colour["id"]]
+
+
+def test_assigning_an_unknown_group_is_a_404(client):
     h, pid, sid = _setup(client)
     oid = _ground(client, h, pid, sid)
-    r = client.get(f"/api/geometry/project/{pid}/scenario/{sid}"
-                   f"/objects/{oid}/material-groups/999999/check", headers=h)
+    r = _assign(client, h, pid, sid, oid, 999999)
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NOT_FOUND"

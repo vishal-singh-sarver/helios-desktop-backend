@@ -288,6 +288,12 @@ def assign_material_group(
     session_id: str = Depends(get_session_id),
     db: Session = Depends(get_db),
 ):
+    """Assign a material group, REPLACING whatever holds the same material types.
+
+    One request, one transaction: the client does not delete the old material
+    first. A refusal (422 for a texture the geometry cannot be rebuilt with)
+    leaves the old material in place, so the geometry is never left bare.
+    """
     return svc.assign_material_group(db, session_id, project_id, scenario_id,
                                      object_id, body)
 
@@ -301,24 +307,6 @@ def list_assignments(
     db: Session = Depends(get_db),
 ):
     return svc.list_assignments(db, session_id, project_id, scenario_id, object_id)
-
-
-@router.get(_BASE + "/objects/{object_id}/material-groups/{group_id}/check")
-def check_group_assignment(
-    project_id: str,
-    scenario_id: str,
-    object_id: int,
-    group_id: int,
-    session_id: str = Depends(get_session_id),
-    db: Session = Depends(get_db),
-):
-    """Would this group assign cleanly to this geometry? Changes nothing.
-
-    Always 200; the body is {"ok": true} or {"ok": false, "error", "code"}.
-    Callable while the geometry still holds the material this one would replace.
-    """
-    return svc.check_group_assignment(db, session_id, project_id, scenario_id,
-                                      object_id, group_id)
 
 
 @router.patch(_BASE + "/objects/{object_id}/material-groups/{group_id}")

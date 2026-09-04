@@ -303,6 +303,24 @@ def list_assignments(
     return svc.list_assignments(db, session_id, project_id, scenario_id, object_id)
 
 
+@router.get(_BASE + "/objects/{object_id}/material-groups/{group_id}/check")
+def check_group_assignment(
+    project_id: str,
+    scenario_id: str,
+    object_id: int,
+    group_id: int,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Would this group assign cleanly to this geometry? Changes nothing.
+
+    Always 200; the body is {"ok": true} or {"ok": false, "error", "code"}.
+    Callable while the geometry still holds the material this one would replace.
+    """
+    return svc.check_group_assignment(db, session_id, project_id, scenario_id,
+                                      object_id, group_id)
+
+
 @router.patch(_BASE + "/objects/{object_id}/material-groups/{group_id}")
 def update_group_assignment(
     project_id: str,

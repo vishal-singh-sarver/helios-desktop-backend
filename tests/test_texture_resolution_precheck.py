@@ -5,6 +5,8 @@
 material is applied, and as a GREEN SUCCESS TOAST when a texture is changed
 under a material already applied — the reconcile path turns the 422 into a 200.
 """
+from uuid import uuid4
+
 import pytest
 
 from app.helios import context as helios_ctx
@@ -89,3 +91,165 @@ def test_reading_the_size_does_not_touch_the_engine():
     for _ in range(5):
         assert ma._texture_pixels(ma._DEFAULT_GROUND_TEXTURE) == (512, 512)
     assert ctx.getPrimitiveCount() == before
+
+
+# ── the pre-check endpoint ───────────────────────────────────────────────────
+#
+# The client must DELETE the ground's current material before it can POST a new
+# one, and those are two requests: if the POST fails the DELETE has already
+# committed and the ground is left bare. This endpoint is asked first, so the
+# DELETE is never issued when the answer is no.
+
+GROUND = {
+    "length": 10, "breadth": 10,
+    "resolution_x": 100, "resolution_y": 100,
+    "position_x": 0, "position_y": 0, "position_z": 0,
+    "rotation_z": 0,
+    "texture_x": 1, "texture_y": 1,
+}
+
+# The stock soil texture is 512x512, so repeat 1 caps the subdivision at 511.
+TEXTURED = {"texture_toggle": True, "texture_file": ma._DEFAULT_GROUND_TEXTURE}
+COLOUR = {"texture_toggle": False, "color_r": 10, "color_g": 200, "color_b": 10,
+          "opacity": 100}
+
+
+def _setup(client):
+    """One project, one scenario. Returns (headers, pid, sid)."""
+    h = {"session-id": f"session_{uuid4().hex[:8]}"}
+    r = client.post("/api/project/create", json={
+        "name": f"Precheck_{uuid4().hex[:8]}", "latitude": 28.6, "longitude": 77.2,
+    }, headers=h)
+    assert r.status_code == 201, r.text
+    return h, r.json()["project_id"], r.json()["main_scenario_id"]
+
+
+def _mk(client, h, props):
+    """A one-member Visualiser group — the only member that decides the tile."""
+    vt = next(m["id"] for m in client.get("/api/catalog/material-types").json()
+              ["material_types"] if m["materialtype"] == "Visualiser")
+    r = client.post("/api/materials/library/groups", json={
+        "materials": [{"material_type_id": vt, "properties": props}]}, headers=h)
+    assert r.status_code == 201, r.text
+    return r.json()["group"]
+
+
+def _ground(client, h, pid, sid, **props):
+    ot = next(o["id"] for o in client.get("/api/catalog/object-types").json()
+              ["object_types"] if o["object"] == "Ground")
+    r = client.post(f"/api/geometry/project/{pid}/scenario/{sid}/objects", json={
+        "object_type_id": ot, "properties": {**GROUND, **props}}, headers=h)
+    assert r.status_code == 201, r.text
+    return r.json()["object"]["id"]
+
+
+def _check(client, h, pid, sid, oid, gid):
+    r = client.get(f"/api/geometry/project/{pid}/scenario/{sid}"
+                   f"/objects/{oid}/material-groups/{gid}/check", headers=h)
+    assert r.status_code == 200, r.text     # always 200 — the verdict is the body
+    return r.json()
+
+
+def _ground_past_the_cap(client, h, pid, sid, colour):
+    """A ground carrying `colour` at a subdivision no 512px texture can serve.
+
+    It cannot simply be created that way: a bare ground already wears the stock
+    soil texture, so the create is refused by the very cap under test. Assign a
+    COLOUR material first — that takes the texture off the tile — and only then
+    raise the resolution.
+    """
+    base = f"/api/geometry/project/{pid}/scenario/{sid}"
+    oid = _ground(client, h, pid, sid, resolution_x=100, resolution_y=2)
+    r = client.post(base + f"/objects/{oid}/material-groups",
+                    json={"group_id": colour["id"], "sync": True}, headers=h)
+    assert r.status_code == 201, r.text
+    r = client.patch(base + f"/objects/{oid}",
+                     json={"properties": {"resolution_x": 900}}, headers=h)
+    assert r.status_code == 200, r.text
+    return oid
+
+
+def test_precheck_says_yes_when_the_texture_fits(client):
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    h, pid, sid = _setup(client)
+    tex = _mk(client, h, TEXTURED)
+
+    # repeat 2 lifts the cap to 1024, so 600 subdivisions fit
+    oid = _ground(client, h, pid, sid, resolution_x=600, resolution_y=2,
+                  texture_x=2)
+    assert _check(client, h, pid, sid, oid, tex["id"]) == {"ok": True}
+
+
+def test_precheck_says_no_without_touching_anything(client):
+    """The whole point: a no must leave the ground exactly as it was."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    h, pid, sid = _setup(client)
+    base = f"/api/geometry/project/{pid}/scenario/{sid}"
+    colour = _mk(client, h, COLOUR)
+    tex = _mk(client, h, TEXTURED)
+    oid = _ground_past_the_cap(client, h, pid, sid, colour)
+
+    verdict = _check(client, h, pid, sid, oid, tex["id"])
+    assert verdict["ok"] is False
+    assert verdict["code"] == "RESOLUTION_TOO_HIGH"
+    assert "512x512" in verdict["error"] and "900 x 2" in verdict["error"]
+
+    # unchanged: still carrying exactly the colour group
+    after = client.get(base + f"/objects/{oid}", headers=h).json()["object"]
+    assert [g["group_id"] for g in after["material_groups"]] == [colour["id"]]
+
+
+def test_precheck_ignores_the_duplicate_type_rule(client):
+    """THE TRAP. At pre-check time the material being replaced still occupies the
+    Visualiser slot, so running the full assign validation would 409 on a
+    conflict the caller is about to resolve by displacing it. Reusing that
+    validation passes every other test here and fails only this one."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    h, pid, sid = _setup(client)
+    base = f"/api/geometry/project/{pid}/scenario/{sid}"
+    a = _mk(client, h, COLOUR)
+    b = _mk(client, h, TEXTURED)
+
+    oid = _ground(client, h, pid, sid, resolution_x=100, resolution_y=2)
+    r = client.post(base + f"/objects/{oid}/material-groups",
+                    json={"group_id": a["id"], "sync": True}, headers=h)
+    assert r.status_code == 201, r.text
+
+    # The conflict is real: assigning B right now really would be refused...
+    r = client.post(base + f"/objects/{oid}/material-groups",
+                    json={"group_id": b["id"], "sync": True}, headers=h)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "DUPLICATE_MATERIAL_TYPE_ASSIGNMENT"
+
+    # ...but the caller is about to resolve it by displacing A, so the answer
+    # the pre-check owes is yes.
+    assert _check(client, h, pid, sid, oid, b["id"]) == {"ok": True}
+
+
+def test_precheck_allows_what_it_cannot_judge(client):
+    """Colour mode has no cap, and an unreadable file is simply unknown. Neither
+    is a reason to say no, and a false no would strand a legal assignment."""
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        pytest.skip("native PyHelios unavailable")
+    h, pid, sid = _setup(client)
+    colour = _mk(client, h, COLOUR)
+    oid = _ground_past_the_cap(client, h, pid, sid, colour)
+
+    other_colour = _mk(client, h, {**COLOUR, "color_r": 200, "color_g": 10})
+    assert _check(client, h, pid, sid, oid, other_colour["id"]) == {"ok": True}
+
+    missing = _mk(client, h, {"texture_toggle": True,
+                              "texture_file": "/nowhere/missing.png"})
+    assert _check(client, h, pid, sid, oid, missing["id"]) == {"ok": True}
+
+
+def test_precheck_404s_on_an_unknown_group(client):
+    h, pid, sid = _setup(client)
+    oid = _ground(client, h, pid, sid)
+    r = client.get(f"/api/geometry/project/{pid}/scenario/{sid}"
+                   f"/objects/{oid}/material-groups/999999/check", headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NOT_FOUND"

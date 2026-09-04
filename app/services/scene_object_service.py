@@ -1617,6 +1617,76 @@ def _type_conflict_409(db: Session, so: ScenarioObject,
     )
 
 
+def _check_group_texture(db: Session, so: ScenarioObject, members: list) -> None:
+    """Raise 422 if this group's texture is too fine for the ground's resolution.
+
+    Only the Visualiser member decides what the tile is built with, and a group
+    holds at most one, so it is the only member that can make an assignment
+    impossible.
+
+    Shared by the assignment itself and by `check_group_assignment` — they must
+    agree on WHICH texture applies, or the pre-check tells the user something the
+    write then contradicts.
+    """
+    winner = next((pm for pm in members
+                   if (mt := db.get(MaterialType, pm.material_type_id)) is not None
+                   and mt.materialtype == material_apply._PRECEDENCE_TYPE), None)
+    if winner is None:
+        return
+    vals = {prop: decode_value(value, dt) for prop, value, dt in (
+        db.query(PropertyType.property, MaterialData.value, Datatype.name)
+        .join(MaterialData, MaterialData.property_type_id == PropertyType.id)
+        .join(Datatype, Datatype.id == PropertyType.datatype_id)
+        .filter(MaterialData.project_material_id == winner.id).all())}
+    if not material_apply._is_texture_mode(vals):
+        return
+    props = _intrinsic_native(db, so.id)
+    material_apply.check_resolution(
+        (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
+        (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
+        material_apply.resolve_texture_path(vals.get("texture_file")),
+        so.name)
+
+
+def check_group_assignment(db: Session, session_id: str, project_id: str,
+                           scenario_id: str, object_id: int, group_id: int) -> dict:
+    """Would assigning this group to this ground succeed? Changes nothing.
+
+    Exists because the client must DISPLACE the ground's current material before
+    it can assign a new one, and those are two separate requests: if the second
+    fails the first has already committed, leaving the ground with no material at
+    all. Asking first means the delete is never issued when the answer is no.
+
+    ONLY the texture rule is evaluated. The duplicate-material-type rule is
+    deliberately NOT checked here: at pre-check time the material being replaced
+    still occupies that type, so running it would report a conflict the caller is
+    about to resolve by displacing — a false no that would block a legitimate
+    assignment.
+
+    Answers with a verdict rather than raising: the check ran, and "no" is its
+    answer, not a failed request. The caller reads a field instead of depending
+    on error handling.
+    """
+    _resolve_scope(db, session_id, project_id, scenario_id)
+    so = _object_or_404(db, scenario_id, object_id)
+    grp = db.get(MaterialGroup, group_id)
+    if grp is None:
+        raise api_error(404, "MATERIAL_GROUP_NOT_FOUND",
+                        f"Material group {group_id} not found")
+
+    members = (
+        db.query(ProjectMaterial)
+        .filter(ProjectMaterial.material_group_id == grp.id)
+        .all()
+    )
+    try:
+        _check_group_texture(db, so, members)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
+        return {"ok": False, **detail}
+    return {"ok": True}
+
+
 def assign_material_group(db: Session, session_id: str, project_id: str,
                           scenario_id: str, object_id: int, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
@@ -1648,23 +1718,8 @@ def assign_material_group(db: Session, session_id: str, project_id: str,
 
     # Before the row is written: refuse a texture this ground cannot be rebuilt
     # with, rather than letting the engine discover it after the assignment
-    # stands. Only the Visualiser member decides what the tile is built with.
-    winner = next((pm for pm in members
-                   if (mt := db.get(MaterialType, pm.material_type_id)) is not None
-                   and mt.materialtype == material_apply._PRECEDENCE_TYPE), None)
-    if winner is not None:
-        vals = {prop: decode_value(value, dt) for prop, value, dt in (
-            db.query(PropertyType.property, MaterialData.value, Datatype.name)
-            .join(MaterialData, MaterialData.property_type_id == PropertyType.id)
-            .join(Datatype, Datatype.id == PropertyType.datatype_id)
-            .filter(MaterialData.project_material_id == winner.id).all())}
-        if material_apply._is_texture_mode(vals):
-            props = _intrinsic_native(db, so.id)
-            material_apply.check_resolution(
-                (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
-                (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
-                material_apply.resolve_texture_path(vals.get("texture_file")),
-                so.name)
+    # stands.
+    _check_group_texture(db, so, members)
 
     db.add(ObjectMaterialGroup(scenario_object_id=so.id, material_group_id=grp.id,
                                sync=1 if body.sync else 0))

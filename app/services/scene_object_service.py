@@ -1647,38 +1647,6 @@ def _check_group_texture(db: Session, so: ScenarioObject, members: list) -> None
         so.name)
 
 
-def _displace_conflicting_groups(db: Session, so: ScenarioObject,
-                                 type_ids: list[int]) -> list[int]:
-    """Remove whatever already occupies these material types on this geometry.
-
-    A geometry carries ONE material per type, so an incoming group has to take
-    those slots from whoever holds them. Doing it here, inside the assignment's
-    own transaction, is what stops the geometry from ever being momentarily
-    bare: the client used to have to DELETE first, and when the assignment was
-    then refused nothing put the old material back.
-
-    Whole groups go, not just the contested rows — a group stripped of one
-    member would keep its assignment row and paint a partial material.
-
-    Returns the type ids left vacant: slots the displaced groups held that the
-    incoming group does not fill, whose labels the repaint has to clear.
-    """
-    blockers = sync_svc.find_type_blockers(db, [so.id], type_ids)
-    vacated: set[int] = set()
-    for group_id in {om.material_group_id for om in blockers}:
-        for om in sync_svc.group_member_rows(db, so.id, group_id):
-            vacated.add(om.material_type_id)
-            db.delete(om)     # snapshot rows cascade via the composite FK
-        omg = db.get(ObjectMaterialGroup, (so.id, group_id))
-        if omg is not None:
-            db.delete(omg)
-    # The deletes must land before the incoming rows, or the incoming member
-    # trips UNIQUE(scenario_object_id, material_type_id) against the row it is
-    # replacing.
-    db.flush()
-    return sorted(vacated - set(type_ids))
-
-
 def assign_material_group(db: Session, session_id: str, project_id: str,
                           scenario_id: str, object_id: int, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
@@ -1709,8 +1677,26 @@ def assign_material_group(db: Session, session_id: str, project_id: str,
     # This assignment REPLACES whatever holds the types the group wants, rather
     # than 409ing and making the client delete first. Reads object_material
     # directly so STALE rows are displaced too.
-    cleared = _displace_conflicting_groups(
-        db, so, [pm.material_type_id for pm in members])
+    #
+    # Same row removal as `unassign_material_group`, but WITHOUT its commit and
+    # repaint: those run with the old material gone and the new one not yet in,
+    # so the repaint would rebuild on the default texture — and on a ground too
+    # fine for it, fail, leaving the geometry bare. Staying in this transaction
+    # means a failure below rolls the removal back with it.
+    type_ids = [pm.material_type_id for pm in members]
+    blockers = sync_svc.find_type_blockers(db, [so.id], type_ids)
+    vacated: set[int] = set()
+    for old_id in {om.material_group_id for om in blockers}:
+        rows = sync_svc.group_member_rows(db, so.id, old_id)
+        vacated.update(om.material_type_id for om in rows)
+        for om in rows:
+            db.delete(om)   # snapshot rows cascade via the composite FK
+        old = db.get(ObjectMaterialGroup, (so.id, old_id))
+        if old is not None:
+            db.delete(old)
+    # Types the displaced groups held that this group does not fill — their
+    # labels have to be cleared on the repaint, or they keep painting.
+    cleared = sorted(vacated - set(type_ids))
 
     db.add(ObjectMaterialGroup(scenario_object_id=so.id, material_group_id=grp.id,
                                sync=1 if body.sync else 0))
@@ -1731,8 +1717,6 @@ def assign_material_group(db: Session, session_id: str, project_id: str,
         raise _type_conflict_409(db, so, blockers)
     db.commit()
 
-    # `cleared` are the displaced groups' other types — the incoming group does
-    # not fill them, so their labels have to go or they keep painting.
     _apply_assignment_change(db, sctx, so, cleared_type_ids=cleared)
     omg = db.get(ObjectMaterialGroup, (so.id, grp.id))
     return {"success": True, "assignment": _group_assignment_payload(db, so, omg)}

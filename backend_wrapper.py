@@ -4,7 +4,8 @@ Entry point for the packaged HeliosGUI backend executable.
 PyInstaller bundles this script as the standalone executable.
 The Electron backend-manager spawns it with: --port=<port>
 
-It may also hand us a pipe on stdin as a liveness signal — see _watch_parent_pipe.
+It may also hand us a pipe on stdin as a liveness signal — see _start_parent_watchdog
+(_watch_parent_pipe on POSIX, _watch_parent_handle on Windows).
 """
 
 import argparse
@@ -84,6 +85,73 @@ def _watch_parent_pipe() -> None:
     os._exit(0)
 
 
+def _watch_parent_handle(pid: int) -> None:
+    """Exit when the parent process object becomes signalled. Windows only.
+
+    Same contract as _watch_parent_pipe: block until the app is gone, then
+    leave. Different mechanism, because on Windows the pipe read DEADLOCKS.
+
+    THE DEADLOCK, measured, not theorised. _watch_parent_pipe blocks in
+    os.read(0, 1) on fd 0. main() armed it immediately before uvicorn.run(),
+    which is what imports app.main and therefore loads libhelios.dll. A thread
+    parked in a blocking CRT read on fd 0 and a main thread loading that DLL
+    deadlock: the backend printed its optix line and then nothing, forever, and
+    the app died on the 30s readiness timeout with the process still alive.
+
+    Three runs, one variable, packaged build spawned from node:
+        stdio[0]='ignore'          -> gate never arms   -> ready in 1.58s
+        stdio[0]='pipe', fed bytes -> read never blocks -> ready in 1.57s
+        stdio[0]='pipe', idle      -> read BLOCKS       -> hung past 40s
+    Feeding the pipe is what proves it: the pipe is not the problem, being
+    BLOCKED IN THE READ during the DLL load is.
+
+    So on Windows we wait on the parent's process object instead. It never
+    touches fd 0, so it cannot contend with the loader or the CRT's stdio
+    locks, and WaitForSingleObject is exactly the primitive for "tell me when
+    that process ends" — no polling, no timer.
+
+    Pid reuse, the reason the module docstring rejected pid-based approaches,
+    does not apply: OpenProcess happens ONCE, here, at startup while the app is
+    demonstrably alive. The HANDLE pins that specific process object, so a
+    later pid reuse cannot make us wait on a stranger. What was unsafe was
+    RE-RESOLVING a recorded pid later, which this never does.
+
+    Failure to open the handle is NOT treated as death — same rule as the
+    OSError branch in _watch_parent_pipe. An ambiguous signal means stay alive.
+    """
+    import ctypes
+
+    SYNCHRONIZE = 0x00100000
+    INFINITE = 0xFFFFFFFF
+    WAIT_OBJECT_0 = 0x00000000
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    if not handle:
+        _say(
+            f"[backend] cannot open parent pid {pid} "
+            f"(error {ctypes.get_last_error()}) — not watching"
+        )
+        return
+
+    try:
+        # Releases the GIL for the whole wait, so this costs one idle thread.
+        if kernel32.WaitForSingleObject(ctypes.c_void_p(handle), INFINITE) != WAIT_OBJECT_0:
+            _say("[backend] parent wait ended abnormally — not exiting")
+            return
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+    _say("[backend] parent process ended — exiting")
+    os._exit(0)
+
+
 def _start_parent_watchdog() -> None:
     """Arm the watchdog ONLY when stdin is really a pipe.
 
@@ -113,8 +181,27 @@ def _start_parent_watchdog() -> None:
     except OSError:
         # No usable stdin at all (closed fd, detached service). Nothing to watch.
         return
+
+    # The gate above stays the authority on WHETHER to watch: a piped stdin is
+    # still what says "a parent is supervising us". Windows only changes HOW we
+    # wait, because reading fd 0 there deadlocks the DLL load — see
+    # _watch_parent_handle. Keep the gate first so a manual run or CI, which
+    # gets a character device, arms nothing on any platform.
+    target, args = _watch_parent_pipe, ()
+    if sys.platform == "win32":
+        raw_pid = os.environ.get("HELIOS_PARENT_PID")
+        try:
+            parent_pid = int(raw_pid)
+        except (TypeError, ValueError):
+            # Piped by something that did not identify itself. Reading fd 0 here
+            # is the one thing we must not do, so watch nothing and stay alive
+            # rather than deadlock the whole backend at startup.
+            _say(f"[backend] no usable HELIOS_PARENT_PID ({raw_pid!r}) — not watching")
+            return
+        target, args = _watch_parent_handle, (parent_pid,)
+
     threading.Thread(
-        target=_watch_parent_pipe, name="parent-watchdog", daemon=True,
+        target=target, args=args, name="parent-watchdog", daemon=True,
     ).start()
 
 

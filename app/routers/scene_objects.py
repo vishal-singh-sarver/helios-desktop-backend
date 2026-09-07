@@ -133,6 +133,23 @@ async def get_object_geometry_binary(
     return Response(content=content, media_type="application/octet-stream")
 
 
+@router.get(_BASE + "/objects/{object_id}/geometry/gpu")
+async def get_object_geometry_gpu(
+    project_id: str,
+    scenario_id: str,
+    object_id: int,
+    session_id: str = Depends(get_session_id),
+    db: Session = Depends(get_db),
+):
+    """Wire format v2 — GPU-ready typed arrays for one object (see the service
+    docstring). The scenario-scoped replacement for the never-working legacy
+    route in objects.py."""
+    content = await asyncio.to_thread(
+        svc.get_object_geometry_gpu, db, session_id, project_id, scenario_id, object_id
+    )
+    return Response(content=content, media_type="application/octet-stream")
+
+
 @router.get(_BASE + "/geometry/binary")
 async def get_scene_geometry_binary(
     request: Request,

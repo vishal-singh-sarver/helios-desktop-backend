@@ -1363,6 +1363,41 @@ def get_object_geometry_binary(db: Session, session_id: str, project_id: str,
         return pack_primitives_binary(helios_ctx.get_context(sctx), uuids)
 
 
+def get_object_geometry_gpu(db: Session, session_id: str, project_id: str,
+                            scenario_id: str, object_id: int) -> bytes:
+    """Wire format v2 — GPU-ready buffers for the stored UUIDs.
+
+    Same contract as get_object_geometry_binary above (rebuild-first, read lock
+    around the pack alone); only the packer differs. Where v1 walks the
+    primitives in Python and emits a per-primitive record, this is a single C++
+    pass that returns contiguous typed arrays the renderer can hand to
+    BufferGeometry without decoding anything.
+
+    Measured on a 500x500 textured ground: 160 B/patch against v1's 201, packed
+    in 0.24 s against 2.93 s, for 76 MB of process growth against 168 MB. The
+    renderer-side difference is larger still — v1 has to build a JS object per
+    vertex, and those live in V8's 4 GB pointer-compression cage, while these
+    arrays are external memory.
+
+    The legacy unscoped route for this (objects.py) has never worked: it calls
+    reg.get_all_objects() with no project context and raises TypeError. This is
+    the scenario-scoped replacement.
+    """
+    _resolve_scope(db, session_id, project_id, scenario_id)
+    sctx = _sctx(session_id, project_id, scenario_id)
+    ensure_hydrated(db, sctx, scenario_id)
+    so = _object_or_404(db, scenario_id, object_id)
+    if not helios_ctx.PYHELIOS_AVAILABLE:
+        raise api_error(503, "PYHELIOS_UNAVAILABLE", "PyHelios not available")
+    if so.id not in sctx.persisted_objects:
+        _build(db, sctx, so)
+    uuids = json.loads(so.helios_uuids or "[]")
+    if not uuids:
+        return b""
+    with sctx.lock.read():
+        return helios_ctx.get_context(sctx).packGPUBuffers(uuids)
+
+
 def get_scene_geometry_binary(db: Session, session_id: str, project_id: str,
                               scenario_id: str, cancelled=None) -> bytes:
     """Whole-scene binary for one scenario's persisted objects (spec §12.3

@@ -288,7 +288,9 @@ def _upsert_intrinsic(db: Session, so_id: int, canonical: dict[str, str | None],
 
 def _winner_surface(db: Session, so: ScenarioObject) -> tuple[str, str | None]:
     """Decide the object's BUILD surface from the precedence-winning assignment:
-        ('soil', None)    -> no Visualiser member: an unstyled ground reads as soil
+        ('soil', None)    -> no Visualiser member: an unstyled ground reads as
+                             soil — unless it is subdivided too finely to carry
+                             that texture, when it falls back to colour below.
         ('texture', path) -> texture mode: bake this texture (UVs)
         ('colour', None)  -> colour mode: an UNTEXTURED tile (solid colour painted
                              via the per-object material label). No texture means
@@ -302,6 +304,22 @@ def _winner_surface(db: Session, so: ScenarioObject) -> tuple[str, str | None]:
     )
     winner = material_apply._winning_assignment(db, assignments)
     if winner is None:
+        # An unstyled ground is built with the default soil texture — but a
+        # texture caps the subdivision, and a ground finer than that could then
+        # not be built AT ALL: assigning ANY material (even a type with no
+        # bearing on the surface), unassigning, or editing the resolution all
+        # end in a repaint that lands here, the engine refuses, and the ground
+        # is stuck rejecting everything. The cap belongs to the texture the user
+        # CHOSE, not to a ground that has no material — so drop the soil texture
+        # for a plain colour tile, which has no cap.
+        props = _intrinsic_native(db, so.id)
+        try:
+            material_apply.check_resolution(
+                (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
+                (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
+                material_apply._DEFAULT_GROUND_TEXTURE, so.name)
+        except HTTPException:
+            return ("colour", reg.DEFAULT_MATERIAL_COLOR)
         return ("soil", None)
     values = material_apply._assignment_snapshot_native(db, so.id, winner.project_material_id)
     if material_apply._is_texture_mode(values):
@@ -647,9 +665,16 @@ def _apply_intrinsic_change(db: Session, sctx, so: ScenarioObject,
         try:
             ctx.setTileObjectSubdivisionCount(ctx_object_id, int2(rx, ry))
         except HeliosRuntimeError:
-            # helios caps subdivisions at the ground texture's pixel resolution
-            # (subdiv < repeat * texture_px); above it the engine raises. Surface
-            # a clean validation error instead of a raw 500.
+            # helios caps subdivisions at the TEXTURE's pixel resolution
+            # (subdiv < repeat * texture_px), and the tile carries whatever it
+            # was built with. That cap only belongs to a texture the user CHOSE:
+            # a ground with no texture material is wearing the default soil
+            # texture as a stand-in, and _winner_surface drops it for a plain
+            # colour tile above the cap. Rebuild so the new surface takes
+            # effect; only a real texture material is genuinely capped.
+            if _winner_surface(db, so)[0] != "texture":
+                _rebuild(db, sctx, so)
+                return
             raise api_error(422, "RESOLUTION_TOO_HIGH",
                             "Ground resolution is too high for the ground texture. "
                             "Lower the resolution and try again.")
@@ -1709,29 +1734,29 @@ def assign_material_group(db: Session, session_id: str, project_id: str,
     # request — on a refusal the geometry still carries the material it had.
     _check_group_texture(db, so, members)
 
-    # This assignment REPLACES whatever holds the types the group wants, rather
-    # than 409ing and making the client delete first. Reads object_material
-    # directly so STALE rows are displaced too.
+    # A geometry carries ONE material group — a group already bundles every
+    # material type it needs — so this REPLACES whatever is on the geometry,
+    # rather than 409ing and making the client DELETE first. Reads
+    # object_material directly, so STALE rows go too.
     #
     # Same row removal as `unassign_material_group`, but WITHOUT its commit and
-    # repaint: those run with the old material gone and the new one not yet in,
-    # so the repaint would rebuild on the default texture — and on a ground too
-    # fine for it, fail, leaving the geometry bare. Staying in this transaction
-    # means a failure below rolls the removal back with it.
-    type_ids = [pm.material_type_id for pm in members]
-    blockers = sync_svc.find_type_blockers(db, [so.id], type_ids)
-    vacated: set[int] = set()
-    for old_id in {om.material_group_id for om in blockers}:
-        rows = sync_svc.group_member_rows(db, so.id, old_id)
-        vacated.update(om.material_type_id for om in rows)
-        for om in rows:
-            db.delete(om)   # snapshot rows cascade via the composite FK
-        old = db.get(ObjectMaterialGroup, (so.id, old_id))
-        if old is not None:
-            db.delete(old)
+    # repaint: those would run with the old material gone and the new one not
+    # yet in, so the repaint would rebuild on a surface neither describes.
+    # Staying in this transaction rolls the removal back with any failure below.
+    rows = (
+        db.query(ObjectMaterial)
+        .filter(ObjectMaterial.scenario_object_id == so.id)
+        .all()
+    )
+    vacated = {om.material_type_id for om in rows}
+    for om in rows:
+        db.delete(om)   # snapshot rows cascade via the composite FK
+    for old in (db.query(ObjectMaterialGroup)
+                .filter(ObjectMaterialGroup.scenario_object_id == so.id).all()):
+        db.delete(old)
     # Types the displaced groups held that this group does not fill — their
     # labels have to be cleared on the repaint, or they keep painting.
-    cleared = sorted(vacated - set(type_ids))
+    cleared = sorted(vacated - {pm.material_type_id for pm in members})
 
     db.add(ObjectMaterialGroup(scenario_object_id=so.id, material_group_id=grp.id,
                                sync=1 if body.sync else 0))
@@ -1864,7 +1889,19 @@ def unassign_material_group(db: Session, session_id: str, project_id: str,
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
-    omg = _group_assignment_or_404(db, so.id, group_id)
+
+    # IDEMPOTENT: the caller asked for this group not to be on this geometry,
+    # and it already is not. A 404 here turned a no-op into a hard failure for
+    # the client, which issues these DELETEs as a BATCH before assigning a new
+    # material — one 404 aborted the whole batch, so the assignment that
+    # followed never ran, and the geometry could take no material at all until
+    # the app was reloaded. The client's view of what is assigned can legitimately
+    # be stale (an earlier request failed part-way); it should not be able to
+    # lock the geometry out on that basis.
+    omg = db.get(ObjectMaterialGroup, (so.id, group_id))
+    if omg is None:
+        return {"success": True, "object_id": object_id, "group_id": group_id,
+                "already_absent": True}
 
     # Works on STALE assignments too (group possibly gone from the library) —
     # rows are found via the attribution column, not a library join.

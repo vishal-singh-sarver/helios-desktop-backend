@@ -695,8 +695,14 @@ def test_group_assignment_sync_freeze_lifecycle(client):
     assert r.status_code == 201, r.text
     assert _assigned_ids(client, h, obj_url) == [grass["id"]]
 
-    # A disjoint TYPE set is fine — assign frozen Energy Balance group
-    r = client.post(obj_url + "/material-groups",
+    # A geometry carries ONE group, so the frozen assignment goes on a SECOND
+    # ground — synced and frozen can no longer coexist on one geometry, but
+    # every rule below is per-assignment and unchanged.
+    obj2 = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+    }, headers=h).json()["object"]
+    obj2_url = _base(pid, sid) + f"/objects/{obj2['id']}"
+    r = client.post(obj2_url + "/material-groups",
                     json={"group_id": soil["id"], "sync": False}, headers=h)
     assert r.status_code == 201
     a = r.json()["assignment"]
@@ -710,13 +716,13 @@ def test_group_assignment_sync_freeze_lifecycle(client):
                        "properties": {"wind_speed": 9}}],
     }, headers=h)
     assert r.status_code == 200, r.text
-    r = client.get(obj_url + "/material-groups", headers=h)
-    groups = r.json()["material_groups"]
-    frozen = next(g for g in groups if g["group_id"] == soil["id"])
+    frozen = next(g for g in client.get(obj2_url + "/material-groups", headers=h)
+                  .json()["material_groups"] if g["group_id"] == soil["id"])
     m = _grp_member(frozen, "Energy Balance")
     assert m["properties"]["wind_speed"] == 3.5
     assert m.get("library_drift") is True
-    synced = next(g for g in groups if g["group_id"] == grass["id"])
+    synced = next(g for g in client.get(obj_url + "/material-groups", headers=h)
+                  .json()["material_groups"] if g["group_id"] == grass["id"])
     assert synced["source"] == "library"
 
     # Editing a synced assignment's values is rejected
@@ -729,17 +735,17 @@ def test_group_assignment_sync_freeze_lifecycle(client):
     # Edit frozen per-member values (validated against the catalog; addressed
     # by material type).
     eb_type = _mt_id(client, "Energy Balance")
-    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={
+    r = client.patch(obj2_url + f"/material-groups/{soil['id']}", json={
         "materials": [{"material_type_id": eb_type,
                        "properties": {"wind_speed": 4.2}}]}, headers=h)
     assert r.status_code == 200, r.text
     assert _grp_member(r.json()["assignment"], "Energy Balance")["properties"]["wind_speed"] == 4.2
-    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={
+    r = client.patch(obj2_url + f"/material-groups/{soil['id']}", json={
         "materials": [{"material_type_id": eb_type,
                        "properties": {"wind_speed": 999}}]}, headers=h)
     assert r.status_code == 400        # range 0-60
     # A type this group does not apply here → 404
-    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={
+    r = client.patch(obj2_url + f"/material-groups/{soil['id']}", json={
         "materials": [{"material_type_id": _mt_id(client, "Radiation"),
                        "properties": {"reflectivity": 0.1}}]}, headers=h)
     assert r.status_code == 404
@@ -750,30 +756,34 @@ def test_group_assignment_sync_freeze_lifecycle(client):
     assert _grp_member(r.json()["group"], "Energy Balance")["properties"]["wind_speed"] == 9
 
     # Unfreeze → re-snapshots and follows the library again
-    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={"sync": True}, headers=h)
+    r = client.patch(obj2_url + f"/material-groups/{soil['id']}", json={"sync": True}, headers=h)
     assert r.status_code == 200
     a = r.json()["assignment"]
     assert a["source"] == "library"
     assert _grp_member(a, "Energy Balance")["properties"]["wind_speed"] == 9
 
     # Freeze-and-edit in one call
-    r = client.patch(obj_url + f"/material-groups/{soil['id']}", json={
+    r = client.patch(obj2_url + f"/material-groups/{soil['id']}", json={
         "sync": False,
         "materials": [{"material_type_id": eb_type, "properties": {"wind_speed": 1.5}}],
     }, headers=h)
     assert r.status_code == 200
     assert _grp_member(r.json()["assignment"], "Energy Balance")["properties"]["wind_speed"] == 1.5
 
-    # Unassign drops the group's applied rows
-    r = client.delete(obj_url + f"/material-groups/{soil['id']}", headers=h)
-    assert r.json() == {"success": True, "object_id": obj["id"], "group_id": soil["id"]}
-    r = client.get(obj_url + "/material-groups", headers=h)
-    assert [g["group_id"] for g in r.json()["material_groups"]] == [grass["id"]]
+    # Unassign drops the group's applied rows (soil lives on the second ground)
+    r = client.delete(obj2_url + f"/material-groups/{soil['id']}", headers=h)
+    assert r.json() == {"success": True, "object_id": obj2["id"], "group_id": soil["id"]}
+    assert _assigned_ids(client, h, obj2_url) == []
+    assert _assigned_ids(client, h, obj_url) == [grass["id"]]
 
-    # Unknown assignment
-    r = client.delete(obj_url + f"/material-groups/{soil['id']}", headers=h)
-    assert r.status_code == 404
-    assert r.json()["detail"]["code"] == "ASSIGNMENT_NOT_FOUND"
+    # Unassigning a group that is NOT assigned is a no-op, not an error: the
+    # requested end state already holds. The client sends these DELETEs as a
+    # batch before assigning a new material, so a 404 on one aborted the batch
+    # and left the geometry unable to take any material until a reload.
+    r = client.delete(obj2_url + f"/material-groups/{soil['id']}", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["already_absent"] is True
+    assert _assigned_ids(client, h, obj2_url) == []
 
 
 def test_group_delete_keeps_applied_state_until_sync(client):
@@ -1096,9 +1106,14 @@ def test_assign_empty_group(client):
 
 
 def test_colour_mode_escapes_resolution_cap(client):
-    """Edge #3: a colour-mode Visualiser ground builds an UNTEXTURED tile, so it
-    has no texture-pixel cap — a resolution that a textured/soil ground rejects
-    with RESOLUTION_TOO_HIGH is accepted here."""
+    """A ground with no texture on it has no texture-pixel cap.
+
+    Only a texture the user CHOSE caps the subdivision. An UNSTYLED ground is
+    drawn with the default soil texture merely as a stand-in, so rather than
+    refuse the resolution it drops that texture for a plain colour tile — which
+    has no cap. A colour-mode Visualiser ground is untextured for the same
+    reason. Both accept a resolution far past the 512px soil texture.
+    """
     if not helios_ctx.PYHELIOS_AVAILABLE:
         pytest.skip("native PyHelios unavailable")
     session_id, pid, sid = _setup(client)
@@ -1106,14 +1121,14 @@ def test_colour_mode_escapes_resolution_cap(client):
     url = _base(pid, sid) + "/objects"
     low = {**GROUND_PROPS, "resolution_x": 2, "resolution_y": 2,
            "texture_x": 1, "texture_y": 1}
-    high = {"properties": {"resolution_x": 1000, "resolution_y": 1000}}
+    high = {"properties": {"resolution_x": 600, "resolution_y": 600}}
 
-    # Unstyled ground = soil texture (dirt.jpg, 512px) -> resolution is capped.
+    # Unstyled ground: the stand-in soil texture gives way to a colour tile.
     soil = client.post(url, json={"object_type_id": _ot_id(client),
                                   "properties": low}, headers=h).json()["object"]
     r = client.patch(f"{url}/{soil['id']}", json=high, headers=h)
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "RESOLUTION_TOO_HIGH"
+    assert r.status_code == 200, r.text
+    assert r.json()["object"]["properties"]["resolution_x"] == 600
 
     # Colour-mode Visualiser ground = untextured -> the same resolution is fine.
     grp = _mk_group(client, h, [("Visualiser", {
@@ -1124,7 +1139,7 @@ def test_colour_mode_escapes_resolution_cap(client):
         "materials": [{"group_id": grp["id"], "sync": True}]}, headers=h).json()["object"]
     r = client.patch(f"{url}/{colour['id']}", json=high, headers=h)
     assert r.status_code == 200, r.text
-    assert r.json()["object"]["properties"]["resolution_x"] == 1000
+    assert r.json()["object"]["properties"]["resolution_x"] == 600
 
 
 def _texture_repeat(pid, sid, session_id, object_id, subdiv):
@@ -1194,10 +1209,16 @@ def test_resolution_change_preserves_texture_tiling(client):
 
 
 @pytest.mark.skipif(not helios_ctx.PYHELIOS_AVAILABLE, reason="needs the engine")
-def test_resolution_too_high_is_422_on_both_paths(client):
-    """helios caps subdivisions at the ground texture's pixel resolution. That is
-    a user-fixable input error, so both the create and the update path answer 422
-    — create used to bury it in a generic 500 BUILD_FAILED."""
+def test_an_unstyled_ground_has_no_resolution_cap(client):
+    """A subdivision past the soil texture's pixel resolution is NOT an error on
+    a ground carrying no texture material — on both the create and the update
+    path. The stand-in soil texture gives way to a plain colour tile instead.
+
+    It used to 422 on both, which left a ground that had lost its material
+    unable to take a new one: every assignment ends in a repaint through this
+    same surface, so the engine refused them all, whatever material type was
+    being assigned.
+    """
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     url = _base(pid, sid) + "/objects"
@@ -1205,13 +1226,12 @@ def test_resolution_too_high_is_422_on_both_paths(client):
              "position_z": 0, "rotation_z": 0, "texture_x": 5, "texture_y": 5}
 
     r = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
-        **props, "resolution_x": 5000, "resolution_y": 5000}}, headers=h)
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "RESOLUTION_TOO_HIGH"
+        **props, "resolution_x": 600, "resolution_y": 600}}, headers=h)
+    assert r.status_code == 201, r.text
 
     obj = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
         **props, "resolution_x": 10, "resolution_y": 10}}, headers=h).json()["object"]
     r = client.patch(f"{url}/{obj['id']}",
-                     json={"properties": {"resolution_x": 5000, "resolution_y": 5000}}, headers=h)
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "RESOLUTION_TOO_HIGH"
+                     json={"properties": {"resolution_x": 600, "resolution_y": 600}}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["object"]["properties"]["resolution_x"] == 600

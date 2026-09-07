@@ -770,10 +770,16 @@ def test_group_assignment_sync_freeze_lifecycle(client):
     r = client.get(obj_url + "/material-groups", headers=h)
     assert [g["group_id"] for g in r.json()["material_groups"]] == [grass["id"]]
 
-    # Unknown assignment
+    # Unassigning a group that is NOT assigned is a no-op, not an error: the
+    # requested end state already holds. The client sends these DELETEs as a
+    # batch before assigning a new material, so a 404 on one aborted the batch
+    # and left the geometry unable to take any material until a reload.
     r = client.delete(obj_url + f"/material-groups/{soil['id']}", headers=h)
-    assert r.status_code == 404
-    assert r.json()["detail"]["code"] == "ASSIGNMENT_NOT_FOUND"
+    assert r.status_code == 200, r.text
+    assert r.json()["already_absent"] is True
+    assert [g["group_id"] for g in
+            client.get(obj_url + "/material-groups", headers=h)
+            .json()["material_groups"]] == [grass["id"]]
 
 
 def test_group_delete_keeps_applied_state_until_sync(client):

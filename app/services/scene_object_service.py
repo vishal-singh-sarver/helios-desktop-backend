@@ -1829,7 +1829,19 @@ def unassign_material_group(db: Session, session_id: str, project_id: str,
     sctx = _sctx(session_id, project_id, scenario_id)
     ensure_hydrated(db, sctx, scenario_id)
     so = _object_or_404(db, scenario_id, object_id)
-    omg = _group_assignment_or_404(db, so.id, group_id)
+
+    # IDEMPOTENT: the caller asked for this group not to be on this geometry,
+    # and it already is not. A 404 here turned a no-op into a hard failure for
+    # the client, which issues these DELETEs as a BATCH before assigning a new
+    # material — one 404 aborted the whole batch, so the assignment that
+    # followed never ran, and the geometry could take no material at all until
+    # the app was reloaded. The client's view of what is assigned can legitimately
+    # be stale (an earlier request failed part-way); it should not be able to
+    # lock the geometry out on that basis.
+    omg = db.get(ObjectMaterialGroup, (so.id, group_id))
+    if omg is None:
+        return {"success": True, "object_id": object_id, "group_id": group_id,
+                "already_absent": True}
 
     # Works on STALE assignments too (group possibly gone from the library) —
     # rows are found via the attribution column, not a library join.

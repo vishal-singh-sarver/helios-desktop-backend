@@ -20,6 +20,7 @@ passes or fails on machine speed, which is worse than no test.
 """
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -39,9 +40,20 @@ def _scenario(session: str, project: str, scenario: str) -> ScenarioContext:
 
 @pytest.fixture(autouse=True)
 def _clean():
-    yield
+    # The autosave submit is debounced (persistence._DEBOUNCE_SECONDS), and
+    # these tests need a save to be RUNNING before they can assert anything
+    # about a second scenario. Shortened here so "A's save started" happens
+    # inside TIMEOUT — the debounce is incidental to what is under test, which
+    # is cross-scenario lock contention.
+    with patch.object(persistence, "_DEBOUNCE_SECONDS", 0.05):
+        yield
     for s in ("user-A", "user-B"):
         registry._scenarios.pop(s, None)
+    for timer in list(persistence._PENDING_TIMERS.values()):
+        timer.cancel()
+    persistence._PENDING_TIMERS.clear()
+    persistence._PENDING_SCTX.clear()
+    persistence._PENDING_FUTURES.clear()
 
 
 def test_a_long_save_does_not_block_another_scenario():

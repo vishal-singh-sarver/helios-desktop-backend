@@ -268,7 +268,7 @@ _POOLS_LOCK = threading.Lock()
 # we leave it alone): it may predate the newest mutation, so it has to finish
 # and the newer state gets its own save. mutation_seq/saved_seq still decide
 # what is dirty, exactly as before.
-_DEBOUNCE_SECONDS = 1.5
+_DEBOUNCE_SECONDS = 30
 
 # scenario_id -> the timer that has not submitted yet (cancelling it is free)
 _PENDING_TIMERS: dict[str, threading.Timer] = {}

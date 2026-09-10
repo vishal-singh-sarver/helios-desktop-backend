@@ -1174,16 +1174,29 @@ def test_resolution_change_preserves_texture_tiling(client):
     5 divides both 10 and 20 on purpose: addTileObject walks the repeat DOWN to
     a divisor of the subdivision count (Context_object.cpp), so a non-dividing
     pair would be adjusted by the engine and prove nothing either way.
+
+    The grounds are given a TEXTURE material explicitly. A ground carries no
+    texture until one is assigned, so an unstyled tile has no UVs at all and
+    there is no tiling to preserve — this test only means anything once there
+    is a texture on the ground.
     """
+    from app.services import material_apply as ma
+
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     url = _base(pid, sid) + "/objects"
     props = {"length": 10, "breadth": 10, "position_x": 0, "position_y": 0,
              "position_z": 0, "rotation_z": 0}
+    tex = _mk_group(client, h, [("Visualiser", {
+        "texture_toggle": True, "texture_file": ma._DEFAULT_GROUND_TEXTURE})],
+        name="Tiled Soil")
 
     tiled = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
         **props, "resolution_x": 10, "resolution_y": 10,
         "texture_x": 5, "texture_y": 5}}, headers=h).json()["object"]
+    r = client.post(_base(pid, sid) + f"/objects/{tiled['id']}/material-groups",
+                    json={"group_id": tex["id"]}, headers=h)
+    assert r.status_code == 201, r.text
     built_id, built_repeat = _texture_repeat(pid, sid, session_id, tiled["id"], 10)
     assert built_repeat == 5
 
@@ -1199,6 +1212,9 @@ def test_resolution_change_preserves_texture_tiling(client):
     plain = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
         **props, "resolution_x": 10, "resolution_y": 10,
         "texture_x": 1, "texture_y": 1}}, headers=h).json()["object"]
+    r = client.post(_base(pid, sid) + f"/objects/{plain['id']}/material-groups",
+                    json={"group_id": tex["id"]}, headers=h)
+    assert r.status_code == 201, r.text
     plain_id, _ = _texture_repeat(pid, sid, session_id, plain["id"], 10)
     r = client.patch(f"{url}/{plain['id']}",
                      json={"properties": {"resolution_x": 20, "resolution_y": 20}}, headers=h)

@@ -304,23 +304,18 @@ def _winner_surface(db: Session, so: ScenarioObject) -> tuple[str, str | None]:
     )
     winner = material_apply._winning_assignment(db, assignments)
     if winner is None:
-        # An unstyled ground is built with the default soil texture — but a
-        # texture caps the subdivision, and a ground finer than that could then
-        # not be built AT ALL: assigning ANY material (even a type with no
-        # bearing on the surface), unassigning, or editing the resolution all
-        # end in a repaint that lands here, the engine refuses, and the ground
-        # is stuck rejecting everything. The cap belongs to the texture the user
-        # CHOSE, not to a ground that has no material — so drop the soil texture
-        # for a plain colour tile, which has no cap.
-        props = _intrinsic_native(db, so.id)
-        try:
-            material_apply.check_resolution(
-                (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
-                (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
-                material_apply._DEFAULT_GROUND_TEXTURE, so.name)
-        except HTTPException:
-            return ("colour", reg.DEFAULT_MATERIAL_COLOR)
-        return ("soil", None)
+        # PLAIN: a ground with no material gets no texture AND no colour of
+        # ours — addTileObject is called with neither, so the tile is whatever
+        # the engine makes it.
+        #
+        # It used to be built with the bundled soil image, which meant a
+        # brand-new ground arrived wearing a texture nobody had chosen, and
+        # inherited that texture's pixel cap on the subdivision — so a fresh
+        # ground could be refused a resolution for a surface the user never
+        # asked for. An untextured tile has no cap, which is why the resolution
+        # check that guarded this branch is gone rather than relaxed: there is
+        # no longer a texture to check against.
+        return ("plain", None)
     values = material_apply._assignment_snapshot_native(db, so.id, winner.project_material_id)
     if material_apply._is_texture_mode(values):
         path = material_apply.resolve_texture_path(values.get("texture_file"))
@@ -352,7 +347,10 @@ def _loaded_surface_signature(ctx, uuids: list, desired: str) -> str:
     the FIRST primitive is inspected — a tile object is homogeneous, and a
     1000x1000 ground must not pay for a scan to answer this.
     """
-    if desired == "colour" or not uuids:
+    # 'plain' joins 'colour' here: both are built by addTileObject WITHOUT a
+    # texturefile and therefore carry no UVs, so the check below would read them
+    # as 'colour' and force a rebuild on every hydration of an unstyled ground.
+    if desired in ("colour", "plain") or not uuids:
         return desired
     try:
         _, offsets = ctx.getPrimitiveTextureUV(uuids[:1])
@@ -443,6 +441,14 @@ def _build(db: Session, sctx, so: ScenarioObject, *, autosave: bool = True) -> l
             ctx_object_id = ctx.addTileObject(
                 center=center, size=size, rotation=rotation, subdiv=subdiv,
                 color=RGBcolor(*texture_path[:3]),
+            )
+        elif surface_kind == "plain":
+            # No material: neither a texture nor a colour is passed, so the tile
+            # is whatever the engine defaults to. Nothing repaints it either —
+            # reapply_all_materials skips the colour label when there is no
+            # winner, which is what leaves the decision with the engine.
+            ctx_object_id = ctx.addTileObject(
+                center=center, size=size, rotation=rotation, subdiv=subdiv,
             )
         else:   # soil — an unstyled ground
             ctx_object_id = ctx.addTileObject(

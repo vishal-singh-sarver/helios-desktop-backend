@@ -35,7 +35,7 @@ import shutil
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -249,6 +249,35 @@ def trigger_scenario_autosave(sctx) -> None:
 _SAVE_POOLS: dict[str, ThreadPoolExecutor] = {}
 _POOLS_LOCK = threading.Lock()
 
+# ── Coalescing ───────────────────────────────────────────────────────────────
+#
+# A save used to be submitted the instant a mutation happened, and it holds
+# sctx.lock.read() for the whole write — so the NEXT mutation waited for it.
+# Creating a second 1000x1000 ground therefore sat behind the first ground's
+# ~215 MB write before it could even start building, and the scene was then
+# serialised twice: 215 MB, then 430 MB.
+#
+# The submit is delayed a moment instead. A mutation arriving inside that window
+# cancels the pending save before it ever runs, so a burst of edits costs ONE
+# write of the final scene rather than one per edit. What makes this sound is
+# that trigger_scenario_autosave serialises the LIVE context when it runs, not a
+# snapshot taken at submit time — the surviving save contains every coalesced
+# mutation by construction.
+#
+# A save already RUNNING is never cancelled (Future.cancel() returns False and
+# we leave it alone): it may predate the newest mutation, so it has to finish
+# and the newer state gets its own save. mutation_seq/saved_seq still decide
+# what is dirty, exactly as before.
+_DEBOUNCE_SECONDS = 30
+
+# scenario_id -> the timer that has not submitted yet (cancelling it is free)
+_PENDING_TIMERS: dict[str, threading.Timer] = {}
+# scenario_id -> the context that timer will save. Held alongside so a
+# whole-process flush can reach it without unpacking the timer's arguments.
+_PENDING_SCTX: dict[str, object] = {}
+# scenario_id -> the submitted save (cancellable only until the worker picks it up)
+_PENDING_FUTURES: dict[str, Future] = {}
+
 
 def _pool_for(scenario_id: str) -> ThreadPoolExecutor:
     """This scenario's save queue, created on first use.
@@ -271,6 +300,44 @@ def _pool_for(scenario_id: str) -> ThreadPoolExecutor:
         return pool
 
 
+def _submit_save(sctx, timer: threading.Timer | None = None) -> None:
+    """Hand this scenario's save to its worker.
+
+    Called by the debounce timer when it fires, and directly by `_flush_pending`
+    when a caller cannot wait out the window.
+
+    `timer` is the one whose firing led here, and it is the claim ticket: the
+    entry in `_PENDING_TIMERS` is removed by whoever acts first, under the lock.
+    A timer that fires while a flush is already holding the lock therefore finds
+    its own entry gone and returns, instead of submitting a second save for the
+    same state. `None` means the caller already claimed it.
+    """
+    def _run() -> None:
+        # This scenario's own lock, not a process-wide one, and taken INSIDE
+        # the queued work rather than around the submit: held at submit time it
+        # would be released before the write ran, letting writeXML serialise a
+        # context mid-mutation.
+        with sctx.lock.read():
+            trigger_scenario_autosave(sctx)
+
+    sid = sctx.scenario_id
+    # Resolved BEFORE taking _POOLS_LOCK: _pool_for takes that same lock to
+    # create a scenario's pool on first use, and threading.Lock is not
+    # reentrant — calling it from inside the block deadlocks the first save of
+    # every scenario.
+    pool = _pool_for(sid)
+    with _POOLS_LOCK:
+        if timer is not None:
+            if _PENDING_TIMERS.get(sid) is not timer:
+                # Superseded by a newer mutation, or already claimed by a
+                # flush. Either way this save is not ours to make.
+                return
+            _PENDING_TIMERS.pop(sid, None)
+            _PENDING_SCTX.pop(sid, None)
+        _PENDING_FUTURES[sid] = pool.submit(_run)
+    logger.debug("[save]    queued    scenario=%s", sid[:8])
+
+
 def queue_scenario_autosave(sctx) -> None:
     """QUEUE a context.xml save — the caller does NOT wait for the write.
 
@@ -278,6 +345,13 @@ def queue_scenario_autosave(sctx) -> None:
     session state, weather from the live context), so making a mutation wait on
     writeXML was pure latency — and on a 1000x1000 ground that is a million
     primitives serialized while the user watches a spinner.
+
+    DEBOUNCED (see the Coalescing note above): the submit is delayed briefly and
+    a mutation arriving inside that window replaces the pending save, so a burst
+    of edits costs one write of the final scene instead of one write each. The
+    delay is invisible to callers — nothing reads context.xml, and every path
+    that needs the file on disk goes through `wait_for_scenario_saves`, which
+    flushes first.
 
     The lock is taken INSIDE the queued work, not around the submit: held at
     submit time it would be released before the write ran, letting writeXML
@@ -289,18 +363,56 @@ def queue_scenario_autosave(sctx) -> None:
     # Every mutation site calls this immediately after mutating, so it is the
     # one place that reliably means "the context no longer matches disk".
     # /discard reads the counters to decide whether it can skip its writeXML.
+    # Bumped BEFORE anything is cancelled below: a coalesced-away save must
+    # still leave the scenario dirty, or the write would be skipped entirely.
     sctx.mutation_seq += 1
 
-    def _run() -> None:
-        # This scenario's own lock, not a process-wide one, and taken INSIDE
-        # the queued work rather than around the submit: held at submit time it
-        # would be released before the write ran, letting writeXML serialise a
-        # context mid-mutation.
-        with sctx.lock.read():
-            trigger_scenario_autosave(sctx)
+    sid = sctx.scenario_id
+    with _POOLS_LOCK:
+        timer = _PENDING_TIMERS.pop(sid, None)
+        if timer is not None:
+            timer.cancel()      # never submitted; nothing was spent on it
+        pending = _PENDING_FUTURES.get(sid)
+        if pending is not None and pending.cancel():
+            # Only reached when the worker had not started it. A RUNNING save
+            # returns False here and is deliberately left alone: it may predate
+            # this mutation, so it has to finish and this state gets its own.
+            _PENDING_FUTURES.pop(sid, None)
+        # The timer is passed its own handle so that when it fires it can check
+        # whether it is still the pending one (see _submit_save). Registered
+        # BEFORE start() so a very short window cannot fire against an empty
+        # table and decline its own save.
+        holder: list[threading.Timer] = []
+        timer = threading.Timer(
+            _DEBOUNCE_SECONDS, lambda: _submit_save(sctx, holder[0]))
+        holder.append(timer)
+        timer.daemon = True     # must never hold the process open at shutdown
+        _PENDING_TIMERS[sid] = timer
+        _PENDING_SCTX[sid] = sctx
+        timer.start()
 
-    logger.debug("[save]    queued    scenario=%s", sctx.scenario_id[:8])
-    _pool_for(sctx.scenario_id).submit(_run)
+
+def _flush_pending(sctx) -> None:
+    """Submit this scenario's debounced save NOW instead of waiting out the
+    window. No-op when nothing is pending.
+
+    Load-bearing for `wait_for_scenario_saves`: a debounced save has not reached
+    the pool yet, so draining the pool without this would return before the
+    write happened — and /discard would release the context believing it was on
+    disk. Every caller that needs the file present goes through here.
+    """
+    with _POOLS_LOCK:
+        # Claiming the entry is what makes this safe: a timer that fires now
+        # finds its own entry gone and declines to submit, so the save happens
+        # exactly once whichever of us gets here first.
+        timer = _PENDING_TIMERS.pop(sctx.scenario_id, None)
+        _PENDING_SCTX.pop(sctx.scenario_id, None)
+    if timer is None:
+        return              # nothing debounced; anything queued is on the pool
+    # Returns None whether or not it was still waiting — the claim above is the
+    # thing that decides, not this call.
+    timer.cancel()
+    _submit_save(sctx)
 
 
 def wait_for_scenario_saves(sctx=None) -> None:
@@ -313,10 +425,17 @@ def wait_for_scenario_saves(sctx=None) -> None:
     Passing the scenario matters on the paths that block a user: /discard
     waiting on every scenario in the process would reintroduce exactly the
     cross-scenario stall this change removes.
+
+    Flushes the debounce first — a pending save is not on the pool yet, so
+    draining alone would report success before it had been written.
     """
     if sctx is not None:
+        _flush_pending(sctx)
         _pool_for(sctx.scenario_id).submit(lambda: None).result()
         return
+    # Snapshotted: _flush_pending mutates these dicts as it goes.
+    for pending in list(_PENDING_SCTX.values()):
+        _flush_pending(pending)
     for pool in list(_SAVE_POOLS.values()):
         pool.submit(lambda: None).result()
 

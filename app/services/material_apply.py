@@ -195,27 +195,44 @@ def _texture_pixels(path: str) -> tuple[int, int] | None:
         return None
 
 
+def texture_too_fine(subdiv: tuple[int, int], repeat: tuple[int, int],
+                     texture_path: str | None) -> tuple[int, int] | None:
+    """The texture's pixel size when it is TOO SMALL for this subdivision, else None.
+
+    addTileObject refuses `subdiv >= snapped_repeat * texture_pixels` on either
+    axis (Context_object.cpp:377-380) — note `>=`, so a 512px texture caps the
+    subdivision at 511.
+
+    None when it cannot answer — no texture, colour mode, headless, or an
+    unreadable file. We would rather let the engine refuse a build than block
+    one it would have accepted.
+
+    The predicate behind check_resolution, split out for the callers that need
+    to DECIDE on the answer rather than fail on it (create_object skips its
+    default material instead of refusing a resolution the user did choose).
+    """
+    if not texture_path:
+        return None
+    px = _texture_pixels(texture_path)
+    if px is None:
+        return None
+    if not any(int(s) >= _snap(int(s), int(r)) * p
+               for s, r, p in zip(subdiv, repeat, px)):
+        return None
+    return px
+
+
 def check_resolution(subdiv: tuple[int, int], repeat: tuple[int, int],
                      texture_path: str | None, ground_name: str) -> None:
     """Raise if this ground cannot be built with this texture.
 
-    addTileObject refuses `subdiv >= snapped_repeat * texture_pixels` on either
-    axis (Context_object.cpp:377-380) — note `>=`, so a 512px texture caps the
-    subdivision at 511. Called before a material is applied and before a
-    texture is changed under grounds already using it, so the user is told
-    instead of the write landing and the repaint silently failing.
-
-    Silent when it cannot answer — no texture, colour mode, headless, or an
-    unreadable file. We would rather let the engine refuse a build than block
-    one it would have accepted.
+    Called before a material is applied and before a texture is changed under
+    grounds already using it, so the user is told instead of the write landing
+    and the repaint silently failing. Silent whenever texture_too_fine cannot
+    answer.
     """
-    if not texture_path:
-        return
-    px = _texture_pixels(texture_path)
+    px = texture_too_fine(subdiv, repeat, texture_path)
     if px is None:
-        return
-    if not any(int(s) >= _snap(int(s), int(r)) * p
-               for s, r, p in zip(subdiv, repeat, px)):
         return
 
     raise api_error(

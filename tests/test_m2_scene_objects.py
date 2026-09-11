@@ -86,7 +86,12 @@ def test_create_ground_auto_name_and_shape(client):
     assert obj["visibility"]["render"] is True
     assert len(obj["visibility"]["models"]) == 6
     assert all(v is True for v in obj["visibility"]["models"].values())
-    assert obj["material_groups"] == []
+    # A new ground is born wearing the app's default soil texture, carried by
+    # its own library group named after the ground.
+    assert [g["name"] for g in obj["material_groups"]] == ["mtl.Ground.001"]
+    vis = _grp_member(obj["material_groups"][0], "Visualiser")
+    assert vis["properties"]["texture_toggle"] is True
+    assert vis["properties"]["texture_file"].endswith("assets/dirt.jpg")
     assert isinstance(obj["helios_uuids"], list)
     if helios_ctx.PYHELIOS_AVAILABLE:
         assert obj["helios_uuids"], "build should produce primitives"
@@ -308,8 +313,16 @@ def test_list_objects_carries_assigned_group_ids(client):
         "object_type_id": ot, "properties": GROUND_PROPS}, headers=h).json()["object"]
 
     grp = _mk_group(client, h, [("Radiation", None)], name="Rad")
+    # Assignment REPLACES what the geometry carries, so this displaces the
+    # default material the create gave it.
     client.post(_base(pid, sid) + f"/objects/{assigned['id']}/material-groups",
                 json={"group_id": grp["id"]}, headers=h)
+    # Every ground is created with a default material, so making one genuinely
+    # bare means dropping that assignment.
+    default_id = bare["material_groups"][0]["group_id"]
+    r = client.delete(_base(pid, sid) + f"/objects/{bare['id']}"
+                      f"/material-groups/{default_id}", headers=h)
+    assert r.status_code == 200, r.text
 
     listed = {o["id"]: o for o in
               client.get(_base(pid, sid) + "/objects", headers=h).json()["objects"]}
@@ -839,6 +852,140 @@ def test_group_delete_eager_scenario_cleans_immediately(client):
     assert r.json()["material_groups"] == []
 
 
+# ── The default material a ground is created with ────────────────────────────
+
+
+def test_default_ground_material_is_a_real_library_group(client):
+    """The group the create makes is an ordinary global library entry — it shows
+    up in GET /library/groups and can be opened, edited and deleted like any
+    other. Nothing about it is special-cased."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    obj = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS}, headers=h,
+    ).json()["object"]
+    gid = obj["material_groups"][0]["group_id"]
+
+    rows = client.get("/api/materials/library/groups", headers=h).json()["groups"]
+    row = next(g for g in rows if g["id"] == gid)
+    assert row["name"] == "mtl.Ground.001"
+    assert row["material_types"] == ["Visualiser"]
+    assert row["preview"]["texture_file"].endswith("assets/dirt.jpg")
+
+    full = client.get(f"/api/materials/library/groups/{gid}", headers=h).json()["group"]
+    assert [m["material_type"] for m in full["materials"]] == ["Visualiser"]
+    assert client.delete(f"/api/materials/library/groups/{gid}",
+                         headers=h).status_code == 200
+
+
+def test_default_ground_material_name_follows_the_ground(client):
+    """'mtl.<ground name>', with a numeric suffix when the name is taken. Group
+    names are GLOBAL while ground names are unique only per scenario, so a
+    second scenario's 'Ground.001' collides as a matter of course."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    r = client.post(f"/api/project/{pid}/scenarios/create",
+                    json={"name": "Fork"}, headers=h)
+    assert r.status_code == 201, r.text
+    sid_b = r.json()["scenario_id"]
+
+    def _make(scenario_id, **body):
+        return client.post(_base(pid, scenario_id) + "/objects", json={
+            "object_type_id": _ot_id(client), "properties": GROUND_PROPS, **body,
+        }, headers=h).json()["object"]["material_groups"][0]["name"]
+
+    assert _make(sid) == "mtl.Ground.001"
+    assert _make(sid_b) == "mtl.Ground.001.1"          # same ground name, taken
+    assert _make(sid, name="South Field") == "mtl.South Field"
+
+
+def test_default_ground_material_name_fits_the_column(client):
+    """material_group.name is CHECK(length BETWEEN 1 AND 20), and a ground name
+    may itself be 20 characters — so the name is truncated to fit rather than
+    failing the create on a label."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    long_name = "Twenty Chars Exactly"
+    assert len(long_name) == 20
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "name": long_name,
+        "properties": GROUND_PROPS}, headers=h)
+    assert r.status_code == 201, r.text
+    name = r.json()["object"]["material_groups"][0]["name"]
+    assert name == "mtl.Twenty Chars Exa" and len(name) == 20
+
+
+def test_default_ground_material_skipped_when_texture_too_small(client):
+    """The 512px soil caps the subdivision, so a resolution past it would make
+    the ground unbuildable with that texture. The RESOLUTION the user asked for
+    wins: the ground is created bare rather than refused over a texture nobody
+    chose."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client),
+        "properties": {**GROUND_PROPS, "resolution_x": 1000, "resolution_y": 1000,
+                       "texture_x": 1, "texture_y": 1},
+    }, headers=h)
+    assert r.status_code == 201, r.text
+    assert r.json()["object"]["material_groups"] == []
+    assert not [g for g in client.get("/api/materials/library/groups", headers=h)
+                .json()["groups"] if g["name"].startswith("mtl.")]
+
+
+def test_failed_build_takes_the_default_material_with_it(client, monkeypatch):
+    """A create whose build fails is compensated — and the material it made on
+    the way has no life without the ground, so it must not be left behind in
+    the global library."""
+    from app.services import scene_object_service as sos
+
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    before = {g["id"] for g in
+              client.get("/api/materials/library/groups", headers=h).json()["groups"]}
+
+    def _boom(*a, **kw):
+        raise sos.api_error(500, "BUILD_FAILED", "Unable to create geometry.")
+
+    monkeypatch.setattr(sos, "_build", _boom)
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS}, headers=h)
+    assert r.status_code == 500
+    assert r.json()["detail"]["code"] == "BUILD_FAILED"
+
+    assert client.get(_base(pid, sid) + "/objects", headers=h).json()["objects"] == []
+    after = {g["id"] for g in
+             client.get("/api/materials/library/groups", headers=h).json()["groups"]}
+    assert after == before
+
+
+def test_supplied_visualiser_group_wins_over_the_default(client):
+    """The Visualiser member owns the single colour/texture channel. A create
+    that brings its own gets exactly that one — a second Visualiser would be a
+    DUPLICATE_MATERIAL_TYPE_ASSIGNMENT — while a create bringing a group of
+    OTHER types still gets the default alongside it."""
+    session_id, pid, sid = _setup(client)
+    h = {"session-id": session_id}
+    grp = _mk_group(client, h, [
+        ("Visualiser", {"texture_toggle": False, "color_r": 10, "color_g": 20,
+                        "color_b": 30, "opacity": 100})], name="Mine")
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+        "materials": [{"group_id": grp["id"], "sync": True}]}, headers=h)
+    assert r.status_code == 201, r.text
+    assert [g["name"] for g in r.json()["object"]["material_groups"]] == ["Mine"]
+
+    rad = _mk_group(client, h, [("Radiation", None)], name="Rad Only")
+    r = client.post(_base(pid, sid) + "/objects", json={
+        "object_type_id": _ot_id(client), "properties": GROUND_PROPS,
+        "materials": [{"group_id": rad["id"], "sync": True}]}, headers=h)
+    assert r.status_code == 201, r.text
+    # Requested groups first, then the default (deterministic despite the
+    # second-granularity created_at they share).
+    assert [g["name"] for g in r.json()["object"]["material_groups"]] == [
+        "Rad Only", "mtl.Ground.002"]
+
+
 def test_group_assignment_in_create_call(client):
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
@@ -888,7 +1035,9 @@ def test_create_materials_field_takes_group_assignments(client):
         "materials": [],
     }, headers=h)
     assert r.status_code == 201, r.text
-    assert r.json()["object"]["material_groups"] == []
+    # An empty `materials` asks for no LIBRARY group; the ground still gets the
+    # default material the create gives every ground, and nothing else.
+    assert [g["name"] for g in r.json()["object"]["material_groups"]] == ["mtl.Ground.001"]
 
     r = client.post(_base(pid, sid) + "/objects", json={
         "object_type_id": _ot_id(client),
@@ -1108,11 +1257,11 @@ def test_assign_empty_group(client):
 def test_colour_mode_escapes_resolution_cap(client):
     """A ground with no texture on it has no texture-pixel cap.
 
-    Only a texture the user CHOSE caps the subdivision. An UNSTYLED ground is
-    drawn with the default soil texture merely as a stand-in, so rather than
-    refuse the resolution it drops that texture for a plain colour tile — which
-    has no cap. A colour-mode Visualiser ground is untextured for the same
-    reason. Both accept a resolution far past the 512px soil texture.
+    The cap belongs to the texture, so it applies to a ground that HAS one —
+    including the default soil material every ground is created with. Dropping
+    that material makes the ground untextured and lifts the cap, and a
+    colour-mode Visualiser ground is untextured for the same reason. Both then
+    accept a resolution far past the 512px soil texture.
     """
     if not helios_ctx.PYHELIOS_AVAILABLE:
         pytest.skip("native PyHelios unavailable")
@@ -1123,9 +1272,17 @@ def test_colour_mode_escapes_resolution_cap(client):
            "texture_x": 1, "texture_y": 1}
     high = {"properties": {"resolution_x": 600, "resolution_y": 600}}
 
-    # Unstyled ground: the stand-in soil texture gives way to a colour tile.
+    # The default soil material is a real texture and does cap the subdivision.
     soil = client.post(url, json={"object_type_id": _ot_id(client),
                                   "properties": low}, headers=h).json()["object"]
+    r = client.patch(f"{url}/{soil['id']}", json=high, headers=h)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "RESOLUTION_TOO_HIGH"
+
+    # Unassign it and the ground is untextured again -> no cap.
+    r = client.delete(f"{url}/{soil['id']}/material-groups/"
+                      f"{soil['material_groups'][0]['group_id']}", headers=h)
+    assert r.status_code == 200, r.text
     r = client.patch(f"{url}/{soil['id']}", json=high, headers=h)
     assert r.status_code == 200, r.text
     assert r.json()["object"]["properties"]["resolution_x"] == 600
@@ -1174,16 +1331,29 @@ def test_resolution_change_preserves_texture_tiling(client):
     5 divides both 10 and 20 on purpose: addTileObject walks the repeat DOWN to
     a divisor of the subdivision count (Context_object.cpp), so a non-dividing
     pair would be adjusted by the engine and prove nothing either way.
+
+    The grounds are given a TEXTURE material explicitly. A ground carries no
+    texture until one is assigned, so an unstyled tile has no UVs at all and
+    there is no tiling to preserve — this test only means anything once there
+    is a texture on the ground.
     """
+    from app.services import material_apply as ma
+
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
     url = _base(pid, sid) + "/objects"
     props = {"length": 10, "breadth": 10, "position_x": 0, "position_y": 0,
              "position_z": 0, "rotation_z": 0}
+    tex = _mk_group(client, h, [("Visualiser", {
+        "texture_toggle": True, "texture_file": ma._DEFAULT_GROUND_TEXTURE})],
+        name="Tiled Soil")
 
     tiled = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
         **props, "resolution_x": 10, "resolution_y": 10,
         "texture_x": 5, "texture_y": 5}}, headers=h).json()["object"]
+    r = client.post(_base(pid, sid) + f"/objects/{tiled['id']}/material-groups",
+                    json={"group_id": tex["id"]}, headers=h)
+    assert r.status_code == 201, r.text
     built_id, built_repeat = _texture_repeat(pid, sid, session_id, tiled["id"], 10)
     assert built_repeat == 5
 
@@ -1199,6 +1369,9 @@ def test_resolution_change_preserves_texture_tiling(client):
     plain = client.post(url, json={"object_type_id": _ot_id(client), "properties": {
         **props, "resolution_x": 10, "resolution_y": 10,
         "texture_x": 1, "texture_y": 1}}, headers=h).json()["object"]
+    r = client.post(_base(pid, sid) + f"/objects/{plain['id']}/material-groups",
+                    json={"group_id": tex["id"]}, headers=h)
+    assert r.status_code == 201, r.text
     plain_id, _ = _texture_repeat(pid, sid, session_id, plain["id"], 10)
     r = client.patch(f"{url}/{plain['id']}",
                      json={"properties": {"resolution_x": 20, "resolution_y": 20}}, headers=h)

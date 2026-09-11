@@ -304,23 +304,18 @@ def _winner_surface(db: Session, so: ScenarioObject) -> tuple[str, str | None]:
     )
     winner = material_apply._winning_assignment(db, assignments)
     if winner is None:
-        # An unstyled ground is built with the default soil texture — but a
-        # texture caps the subdivision, and a ground finer than that could then
-        # not be built AT ALL: assigning ANY material (even a type with no
-        # bearing on the surface), unassigning, or editing the resolution all
-        # end in a repaint that lands here, the engine refuses, and the ground
-        # is stuck rejecting everything. The cap belongs to the texture the user
-        # CHOSE, not to a ground that has no material — so drop the soil texture
-        # for a plain colour tile, which has no cap.
-        props = _intrinsic_native(db, so.id)
-        try:
-            material_apply.check_resolution(
-                (int(props.get("resolution_x") or 1), int(props.get("resolution_y") or 1)),
-                (int(props.get("texture_x") or 1), int(props.get("texture_y") or 1)),
-                material_apply._DEFAULT_GROUND_TEXTURE, so.name)
-        except HTTPException:
-            return ("colour", reg.DEFAULT_MATERIAL_COLOR)
-        return ("soil", None)
+        # PLAIN: a ground with no material gets no texture AND no colour of
+        # ours — addTileObject is called with neither, so the tile is whatever
+        # the engine makes it.
+        #
+        # It used to be built with the bundled soil image, which meant a
+        # brand-new ground arrived wearing a texture nobody had chosen, and
+        # inherited that texture's pixel cap on the subdivision — so a fresh
+        # ground could be refused a resolution for a surface the user never
+        # asked for. An untextured tile has no cap, which is why the resolution
+        # check that guarded this branch is gone rather than relaxed: there is
+        # no longer a texture to check against.
+        return ("plain", None)
     values = material_apply._assignment_snapshot_native(db, so.id, winner.project_material_id)
     if material_apply._is_texture_mode(values):
         path = material_apply.resolve_texture_path(values.get("texture_file"))
@@ -352,7 +347,10 @@ def _loaded_surface_signature(ctx, uuids: list, desired: str) -> str:
     the FIRST primitive is inspected — a tile object is homogeneous, and a
     1000x1000 ground must not pay for a scan to answer this.
     """
-    if desired == "colour" or not uuids:
+    # 'plain' joins 'colour' here: both are built by addTileObject WITHOUT a
+    # texturefile and therefore carry no UVs, so the check below would read them
+    # as 'colour' and force a rebuild on every hydration of an unstyled ground.
+    if desired in ("colour", "plain") or not uuids:
         return desired
     try:
         _, offsets = ctx.getPrimitiveTextureUV(uuids[:1])
@@ -443,6 +441,14 @@ def _build(db: Session, sctx, so: ScenarioObject, *, autosave: bool = True) -> l
             ctx_object_id = ctx.addTileObject(
                 center=center, size=size, rotation=rotation, subdiv=subdiv,
                 color=RGBcolor(*texture_path[:3]),
+            )
+        elif surface_kind == "plain":
+            # No material: neither a texture nor a colour is passed, so the tile
+            # is whatever the engine defaults to. Nothing repaints it either —
+            # reapply_all_materials skips the colour label when there is no
+            # winner, which is what leaves the decision with the engine.
+            ctx_object_id = ctx.addTileObject(
+                center=center, size=size, rotation=rotation, subdiv=subdiv,
             )
         else:   # soil — an unstyled ground
             ctx_object_id = ctx.addTileObject(
@@ -1012,11 +1018,16 @@ def _group_assignment_payload(db: Session, so: ScenarioObject,
 
 
 def _object_material_groups(db: Session, so: ScenarioObject) -> list[dict]:
-    """The object's assigned material-group payloads, oldest-assigned first."""
+    """The object's assigned material-group payloads, oldest-assigned first.
+
+    created_at is second-granularity datetime('now'), so groups assigned in the
+    same request tie — and callers do index material_groups[0]. group_id breaks
+    the tie by insertion order (a create's default group is made last and so
+    sorts after the groups the caller asked for)."""
     assignments = (
         db.query(ObjectMaterialGroup)
         .filter(ObjectMaterialGroup.scenario_object_id == so.id)
-        .order_by(ObjectMaterialGroup.created_at)
+        .order_by(ObjectMaterialGroup.created_at, ObjectMaterialGroup.material_group_id)
         .all()
     )
     return [_group_assignment_payload(db, so, omg) for omg in assignments]
@@ -1053,6 +1064,48 @@ def serialize_object(db: Session, sctx, so: ScenarioObject,
 # ── Geometry endpoints (spec §5) ─────────────────────────────────────────────
 
 
+def _default_ground_group(db: Session, ot: ObjectType, name: str,
+                          native: dict, seen_types: dict[int, int],
+                          project_id: str, scenario_id: str):
+    """The default material group for a ground being created, or None.
+
+    The three reasons to decline, all of them "create the ground anyway":
+
+    * not a Ground — nothing else has a soil surface to default;
+    * the request already brought a Visualiser — that group owns the single
+      colour/texture channel, and a second one would hit
+      UNIQUE(scenario_object_id, material_type_id) as a 409;
+    * the default texture is too small for the requested resolution. The engine
+      caps subdiv at the texture's pixel size, so attaching a 512px soil to a
+      1000x1000 ground would refuse a resolution the user DID choose over a
+      texture they never asked for. That is exactly why the old implicit soil
+      build was replaced by 'plain' (see _winner_surface) — so here the material
+      is skipped and the ground is built plain, as it is today.
+
+    Creation itself is material_library_service's; this only decides.
+    """
+    if ot.object != "Ground":
+        return None
+    from app.services import material_library_service as mls   # local: cycle
+
+    vis = (db.query(MaterialType)
+           .filter(MaterialType.materialtype == material_apply._PRECEDENCE_TYPE)
+           .first())
+    if vis is None or vis.id in seen_types:
+        return None
+    too_fine = material_apply.texture_too_fine(
+        (int(native.get("resolution_x") or 1), int(native.get("resolution_y") or 1)),
+        (int(native.get("texture_x") or 1), int(native.get("texture_y") or 1)),
+        mls.default_ground_texture_path(),
+    )
+    if too_fine is not None:
+        logger.info("[geometry] %r at %sx%s is too fine for the default %sx%s "
+                    "texture — created without a default material", name,
+                    native.get("resolution_x"), native.get("resolution_y"), *too_fine)
+        return None
+    return mls.create_default_ground_group(db, name, project_id, scenario_id)
+
+
 def create_object(db: Session, session_id: str, project_id: str,
                   scenario_id: str, body) -> dict:
     _resolve_scope(db, session_id, project_id, scenario_id)
@@ -1071,11 +1124,9 @@ def create_object(db: Session, session_id: str, project_id: str,
         body.properties, defs, type_label=ot.object,
         required=REQUIRED_OBJECT_PROPERTIES.get(ot.object),
     )
-    validate_cross_field(
-        {n: decode_value(v, defs[n].datatype)
-         for n, v in canonical.items() if v is not None},
-        ot.object,
-    )
+    native = {n: decode_value(v, defs[n].datatype)
+              for n, v in canonical.items() if v is not None}
+    validate_cross_field(native, ot.object)
 
     taken = _object_names_lower(db, scenario_id)
     if body.name is None:
@@ -1132,6 +1183,17 @@ def create_object(db: Session, session_id: str, project_id: str,
     _upsert_intrinsic(db, so.id, canonical, defs)
     if body.visibility is not None:
         _apply_visibility(db, so, body.visibility)
+
+    # A new ground is born wearing the app's default soil texture, carried by
+    # its own library group. ONE helper + this one call site — change or drop
+    # the behaviour there and nothing else in create_object moves. It joins
+    # this transaction (no commit of its own), so the compensation below and
+    # the IntegrityError rollback above both take it with them.
+    auto_group = _default_ground_group(db, ot, name, native, seen_types,
+                                       project_id, scenario_id)
+    if auto_group is not None:
+        group_assignments.append((auto_group[0], auto_group[1], True))
+
     for grp, members, sync in group_assignments:
         db.add(ObjectMaterialGroup(scenario_object_id=so.id, material_group_id=grp.id,
                                    sync=1 if sync else 0))
@@ -1147,6 +1209,10 @@ def create_object(db: Session, session_id: str, project_id: str,
         # Compensate: a create whose build failed must not leave a
         # DB-only object behind (user story: "Unable to create geometry").
         db.delete(so)
+        if auto_group is not None:
+            # The default group has no life without the ground it was made for.
+            # FK cascade takes its member + values (PRAGMA foreign_keys=ON).
+            db.delete(auto_group[0])
         db.commit()
         raise
     logger.info("[geometry] created   scenario=%s object=%s name=%r %d primitives",

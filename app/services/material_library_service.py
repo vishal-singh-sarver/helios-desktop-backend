@@ -51,6 +51,7 @@ from app.services import material_apply
 from app.services import material_sync_service as sync_svc
 from app.services.eav_validation import (
     VISUALISATION_PROPERTIES,
+    _NAME_MAX,
     api_error,
     decode_value,
     load_type_properties,
@@ -71,6 +72,10 @@ _FILE_PROPERTY_EXTENSIONS = {
     "spectral_data": {".xml"},
 }
 _PRECEDENCE_TYPE = "Visualiser"   # list preview mirrors the viewport winner
+
+# The material a new ground is born with (see create_default_ground_group).
+_AUTO_PREFIX = "mtl."
+_DEFAULT_GROUND_TEXTURE_FILE = "dirt.jpg"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -540,6 +545,106 @@ def create_group(db: Session, session_id: str, body) -> dict:
         db.rollback()
         raise api_error(500, "MATERIAL_CREATE_FAILED",
                         "Unable to create material. Please try again")
+
+
+# ── The material a new ground is born with ───────────────────────────────────
+#
+# A ground used to arrive with no material at all (scene_object_service builds
+# it 'plain'). It now arrives wearing the app's default soil texture, carried by
+# a REAL library group — global, renameable, deletable, editable, exactly like
+# one the user made. Everything specific to that behaviour lives in this
+# section, and create_default_ground_group has a single call site
+# (scene_object_service.create_object), so the whole thing can be changed or
+# dropped without unpicking the create path.
+
+
+def default_ground_texture_path() -> str | None:
+    """Absolute path to the app's default ground texture (assets/dirt.jpg), or
+    None when the file is missing (a stripped build / bare test fixture).
+
+    Resolved through default_textures_dir() rather than hardcoded, so it is the
+    repo's assets/ folder in dev and the packaged _internal/assets/ folder in
+    the installed app. That folder is already inside the /api/textures/serve
+    allowlist, so the frontend can render it with no extra plumbing.
+
+    NOT the same file as material_apply._DEFAULT_GROUND_TEXTURE, which is
+    PyHelios' own bundled soil used by the legacy 'soil' build branch.
+    """
+    from app.services.material_service import default_textures_dir   # local: cycle
+
+    path = default_textures_dir() / _DEFAULT_GROUND_TEXTURE_FILE
+    return str(path) if path.is_file() else None
+
+
+def _auto_group_name(taken_lower: set[str], ground_name: str) -> str:
+    """'mtl.<ground name>', then '.1', '.2', … while the name is taken.
+
+    Names are GLOBAL while ground names are only unique per scenario, so the
+    collision is routine rather than exotic: every scenario's first ground is
+    'Ground.001' and wants 'mtl.Ground.001'.
+
+    material_group.name is CHECK(length(name) BETWEEN 1 AND 20) (migration
+    022), so the ground name is truncated to leave room for the prefix and for
+    whatever suffix this attempt needs.
+    """
+    budget = _NAME_MAX - len(_AUTO_PREFIX)
+    base = ground_name.strip()[:budget]
+    candidate = f"{_AUTO_PREFIX}{base}"
+    if candidate.lower() not in taken_lower:
+        return candidate
+    for n in range(1, 10000):
+        suffix = f".{n}"
+        candidate = f"{_AUTO_PREFIX}{base[:budget - len(suffix)]}{suffix}"
+        if candidate.lower() not in taken_lower:
+            return candidate
+    # Pathological: 10k groups sharing one truncated stem. Fall back to the
+    # house auto-name rather than fail a ground create over a label.
+    return next_default_name(taken_lower, _NAME_PREFIX)
+
+
+def create_default_ground_group(
+    db: Session, ground_name: str,
+    project_id: str | None, scenario_id: str | None,
+) -> tuple[MaterialGroup, list[ProjectMaterial]] | None:
+    """The default material for a newly created ground: a group named
+    'mtl.<ground name>' holding a single Visualiser member in texture mode on
+    the app's default soil texture.
+
+    Does NOT commit — the rows join the CALLER's create transaction, so a create
+    that fails or is compensated takes this group down with it.
+
+    Returns (group, [member]) for the caller to assign, or None when the
+    behaviour cannot apply: no Visualiser type in the catalog, or no default
+    texture on disk. A missing default is not an error — the ground is created
+    without it, exactly as it was before this existed.
+    """
+    path = default_ground_texture_path()
+    if not path:
+        logger.warning("[material] no default ground texture (%s) — ground %r "
+                       "created without one", _DEFAULT_GROUND_TEXTURE_FILE, ground_name)
+        return None
+    mt = (db.query(MaterialType)
+          .filter(MaterialType.materialtype == _PRECEDENCE_TYPE).first())
+    if mt is None:
+        return None
+
+    # Through the normal member validator, so the member is a complete, valid
+    # texture-mode Visualiser (texture_toggle set, colour fields correctly
+    # absent) rather than hand-rolled EAV rows.
+    _, defs, canonical = _validate_member_entry(
+        db, mt.id, {"texture_toggle": True, "texture_file": path})
+
+    grp = MaterialGroup(project_id=project_id, scenario_id=scenario_id,
+                        name=_auto_group_name(_group_names_lower(db), ground_name))
+    db.add(grp)
+    db.flush()
+    pm = ProjectMaterial(material_group_id=grp.id, material_type_id=mt.id)
+    db.add(pm)
+    db.flush()
+    _upsert_values(db, pm.id, canonical, defs, replace=True)
+    # No _propagate_shared: a single member has nothing to propagate to.
+    logger.info("[material] default ground group  id=%s name=%r", grp.id, grp.name)
+    return grp, [pm]
 
 
 def list_groups(db: Session, session_id: str,

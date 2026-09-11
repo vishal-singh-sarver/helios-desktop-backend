@@ -195,27 +195,44 @@ def _texture_pixels(path: str) -> tuple[int, int] | None:
         return None
 
 
+def texture_too_fine(subdiv: tuple[int, int], repeat: tuple[int, int],
+                     texture_path: str | None) -> tuple[int, int] | None:
+    """The texture's pixel size when it is TOO SMALL for this subdivision, else None.
+
+    addTileObject refuses `subdiv >= snapped_repeat * texture_pixels` on either
+    axis (Context_object.cpp:377-380) — note `>=`, so a 512px texture caps the
+    subdivision at 511.
+
+    None when it cannot answer — no texture, colour mode, headless, or an
+    unreadable file. We would rather let the engine refuse a build than block
+    one it would have accepted.
+
+    The predicate behind check_resolution, split out for the callers that need
+    to DECIDE on the answer rather than fail on it (create_object skips its
+    default material instead of refusing a resolution the user did choose).
+    """
+    if not texture_path:
+        return None
+    px = _texture_pixels(texture_path)
+    if px is None:
+        return None
+    if not any(int(s) >= _snap(int(s), int(r)) * p
+               for s, r, p in zip(subdiv, repeat, px)):
+        return None
+    return px
+
+
 def check_resolution(subdiv: tuple[int, int], repeat: tuple[int, int],
                      texture_path: str | None, ground_name: str) -> None:
     """Raise if this ground cannot be built with this texture.
 
-    addTileObject refuses `subdiv >= snapped_repeat * texture_pixels` on either
-    axis (Context_object.cpp:377-380) — note `>=`, so a 512px texture caps the
-    subdivision at 511. Called before a material is applied and before a
-    texture is changed under grounds already using it, so the user is told
-    instead of the write landing and the repaint silently failing.
-
-    Silent when it cannot answer — no texture, colour mode, headless, or an
-    unreadable file. We would rather let the engine refuse a build than block
-    one it would have accepted.
+    Called before a material is applied and before a texture is changed under
+    grounds already using it, so the user is told instead of the write landing
+    and the repaint silently failing. Silent whenever texture_too_fine cannot
+    answer.
     """
-    if not texture_path:
-        return
-    px = _texture_pixels(texture_path)
+    px = texture_too_fine(subdiv, repeat, texture_path)
     if px is None:
-        return
-    if not any(int(s) >= _snap(int(s), int(r)) * p
-               for s, r, p in zip(subdiv, repeat, px)):
         return
 
     raise api_error(
@@ -308,13 +325,19 @@ def _is_texture_mode(values: dict) -> bool:
 
 def _winner_texture(db: Session, so_id: int, winner) -> str:
     """Texture string for the object's material, decided by the precedence winner:
-        no material          -> the default soil (an unstyled ground reads as soil)
+        no material          -> "" (no texture; a ground carries none until one
+                                is assigned)
         texture-mode winner  -> that texture's resolved path (soil if missing)
         colour-mode winner   -> "" (cleared, so the winner's solid colour shows)
     Fed to setMaterialTexture: a path renders the image, "" renders the colour
-    (geometry_pack keys off getPrimitiveTextureFile being non-empty vs empty)."""
+    (geometry_pack keys off getPrimitiveTextureFile being non-empty vs empty).
+
+    Must agree with `_winner_surface` (scene_object_service) about the no-material
+    case: naming a texture on a tile that was built without one writes a textured
+    tile into context.xml that the engine then refuses to load back.
+    """
     if winner is None:
-        return _DEFAULT_GROUND_TEXTURE
+        return ""
     values = _assignment_snapshot_native(db, so_id, winner.project_material_id)
     if _is_texture_mode(values):
         return resolve_texture_path(values.get("texture_file")) or _DEFAULT_GROUND_TEXTURE
@@ -406,9 +429,15 @@ def reapply_all_materials(db: Session, sctx, so) -> None:
         _apply_model_data(ctx, uuids, defs, values)
 
     winner = _winning_assignment(db, assignments)
-    _set_color_label(ctx, uuids, _color_label(so),
-                     _winner_color(db, so.id, winner),
-                     _winner_texture(db, so.id, winner))
+    if winner is not None:
+        _set_color_label(ctx, uuids, _color_label(so),
+                         _winner_color(db, so.id, winner),
+                         _winner_texture(db, so.id, winner))
+    # With NO winner the object is left exactly as the engine built it — no
+    # material label, no colour, no texture. Painting a default here would put
+    # our colour back on a tile that _winner_surface deliberately built as
+    # 'plain'. Nothing stale is left behind: losing a Visualiser material
+    # changes the surface signature, so that path rebuilds rather than repaints.
 
     invalidate_geometry_caches(sctx)
 

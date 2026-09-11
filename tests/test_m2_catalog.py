@@ -112,12 +112,12 @@ def test_visualiser_colour_fields_are_required(client):
 def test_material_types_parameter_groups(client):
     """Migration 027: params nest into `groups` (Farquhar + stomatal selector
     sub-models); grouped props leave the flat `properties` list and carry display
-    labels. Migration 031 gates the Farquhar group on a `submodel` selector."""
+    labels. Migration 033 gates the Farquhar group on a `submodel` selector."""
     r = client.get("/api/catalog/material-types")
     assert r.status_code == 200
     by_name = {mt["materialtype"]: mt for mt in r.json()["material_types"]}
 
-    # Photosynthesis: one selector-gated sub-model group (migration 031).
+    # Photosynthesis: one selector-gated sub-model group (migration 033).
     photo = by_name["Photosynthesis"]
     top = {p["property"] for p in photo["properties"]}
     assert "vcmax25" not in top  # moved into the Farquhar group

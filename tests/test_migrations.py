@@ -25,6 +25,39 @@ def temp_engine(tmp_path, monkeypatch):
     eng.dispose()
 
 
+def test_migration_versions_are_unique():
+    """No two migration files may share a version prefix.
+
+    `run_migrations` keys on that integer and reads the applied set ONCE before
+    its loop, so two files at one number behave differently depending on when a
+    database was first migrated: a fresh one runs BOTH (the set is stale for the
+    whole loop), while one that already recorded the number runs NEITHER —
+    silently, with no error and no log line. That happened: 031 was claimed by
+    031_radiation_spectrum_labels (2026-08-10) and again by
+    031_photosynthesis_submodel_selector (2026-08-18), and every database
+    migrated in between is missing the Photosynthesis selector. The second file
+    is now 033.
+
+    This fails at MR time, which is the only place it is cheap to fix. Do NOT
+    turn it into a runtime check — the duplicate that prompted it would have
+    bricked startup for every existing install instead of one test run.
+    """
+    mig_dir = Path(database.__file__).parent / "migrations"
+    owners: dict[int, list[str]] = {}
+    for f in sorted(mig_dir.glob("*.sql")):
+        try:
+            owners.setdefault(int(f.stem.split("_")[0]), []).append(f.name)
+        except ValueError:
+            pytest.fail(f"migration {f.name} has no integer version prefix")
+
+    clashes = {v: names for v, names in owners.items() if len(names) > 1}
+    assert not clashes, (
+        "two migrations share a version — the runner will silently skip one of "
+        "them on any database that already recorded it: "
+        + "; ".join(f"{v}: {', '.join(names)}" for v, names in sorted(clashes.items()))
+    )
+
+
 def _versions(eng):
     with eng.begin() as conn:
         return {r[0] for r in conn.execute(text("SELECT version FROM schema_migrations"))}
@@ -459,16 +492,30 @@ def test_025_visualiser_texture_toggle(temp_engine):
         )).scalar() == "0"
 
 
-def test_031_photosynthesis_submodel_selector(temp_engine):
-    """031 adds the `submodel` enum to Photosynthesis (only) and gates the
+def test_033_photosynthesis_submodel_selector(temp_engine):
+    """033 adds the `submodel` enum to Photosynthesis (only) and gates the
     Farquhar group on it. The selector must stay TOP-LEVEL and editable — if it
     landed in a group or was withheld, the catalog would drop it and the group
     would be permanently invisible.
 
-    Stops at 31: the backfill assertion below reads Default Photosyn, which
-    migration 032 removes."""
-    _apply_through(temp_engine, 31)
-    assert 31 in _versions(temp_engine)
+    Runs the whole chain: this migration used to be numbered 031 and stop short
+    of 032, because the backfill assertion below read 'Default Photosyn' — a
+    seeded group 032 deletes. It now seeds its own Photosynthesis member instead,
+    so the assertion no longer depends on where this file sits in the order."""
+    _apply_through(temp_engine, 32)
+    with temp_engine.begin() as c:
+        photo = c.execute(text(
+            "SELECT id FROM material_type WHERE materialtype='Photosynthesis'")).scalar()
+        # Provenance-carrying, so 032's name+NULL-provenance sweep spares it.
+        c.execute(text("INSERT INTO projects(id,session_id,name) VALUES('p9','s9','P9')"))
+        c.execute(text("INSERT INTO scenarios(id,project_id,name) VALUES('sc9','p9','Main')"))
+        c.execute(text("INSERT INTO material_group(id,project_id,scenario_id,name) "
+                       "VALUES (930,'p9','sc9','OwnPhoto')"))
+        c.execute(text("INSERT INTO project_material(id,material_group_id,material_type_id) "
+                       "VALUES (930,930,:p)"), {"p": photo})
+
+    _apply_through(temp_engine, 33)
+    assert 33 in _versions(temp_engine)
 
     with temp_engine.begin() as c:
         assert c.execute(text(
@@ -503,20 +550,21 @@ def test_031_photosynthesis_submodel_selector(temp_engine):
             "  AND mpt.selector_value = 'farquhar_model'"
         )).scalar()
         assert gated == 14
-        # The seeded default member selects Farquhar, so its group is not hidden.
+        # The existing member was backfilled to select Farquhar, so its group is
+        # not hidden.
         assert c.execute(text(
             "SELECT md.value FROM material_data md "
             "JOIN property_type pt ON pt.id = md.property_type_id "
             "JOIN project_material pm ON pm.id = md.project_material_id "
             "JOIN material_group mg ON mg.id = pm.material_group_id "
-            "WHERE pt.property = 'submodel' AND mg.name = 'Default Photosyn'"
+            "WHERE pt.property = 'submodel' AND mg.name = 'OwnPhoto'"
         )).scalar() == "farquhar_model"
 
 
-def test_031_backfills_existing_members_and_frozen_snapshots(temp_engine):
+def test_033_backfills_existing_members_and_frozen_snapshots(temp_engine):
     """The upgrade case, and the only thing that catches a broken backfill.
 
-    A pre-031 database has Photosynthesis members with saved Farquhar values and
+    A pre-033 database has Photosynthesis members with saved Farquhar values and
     no `submodel`. Once the group is gated, an unmatched selector makes
     member_property_values drop those 14 keys, the form blanks them, and the next
     full-replacement PUT deletes them — silent data loss. The frozen per-object
@@ -544,8 +592,8 @@ def test_031_backfills_existing_members_and_frozen_snapshots(temp_engine):
         c.execute(text("INSERT INTO object_property_data(scenario_object_id,project_material_id,property_type_id,value) "
                        "VALUES (900,900,:v,'100')"), {"v": vcmax})
 
-    database.run_migrations()   # applies 031 on the populated DB
-    assert 31 in _versions(temp_engine)
+    database.run_migrations()   # applies 033 on the populated DB
+    assert 33 in _versions(temp_engine)
 
     with temp_engine.begin() as c:
         # The pre-existing coefficient is untouched...

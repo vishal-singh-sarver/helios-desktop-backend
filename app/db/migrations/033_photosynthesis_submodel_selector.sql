@@ -1,4 +1,4 @@
--- Migration 031 — PHOTOSYNTHESIS SUBMODEL: gate the Farquhar parameter group
+-- Migration 033 — PHOTOSYNTHESIS SUBMODEL: gate the Farquhar parameter group
 -- behind a `submodel` enum selector.
 --
 -- Story: Photosynthesis rendered its 14 Farquhar coefficients as a plain
@@ -87,4 +87,4 @@ FROM object_material om
 JOIN material_type mt ON mt.id = om.material_type_id
 WHERE mt.materialtype = 'Photosynthesis';
 
-INSERT OR IGNORE INTO schema_migrations(version) VALUES (31);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (33);

@@ -5,9 +5,8 @@ from uuid import uuid4
 
 BASE = "/api/materials/library"
 
-# Every fresh DB carries 7 default groups: the 6 wrapped mig-019 defaults plus
-# the mig-024 "Default Visualiser" group.
-DEFAULT_GROUP_COUNT = 7
+# A fresh DB carries NO groups at all: migration 032 removes the seven defaults
+# that 019/024 seeded, so the library starts empty.
 
 
 def _setup(client):
@@ -190,9 +189,8 @@ def test_list_groups_preview_filter_search(client):
 
     r = client.get(BASE + "/groups", headers=h)
     rows = r.json()["groups"]
-    # Newest first; the default groups trail the created groups.
-    assert [g["name"] for g in rows[:2]] == ["Soil EB", "Grass Set"]
-    assert len(rows) == 2 + DEFAULT_GROUP_COUNT
+    # Newest first, and nothing else — the library seeds no groups of its own.
+    assert [g["name"] for g in rows] == ["Soil EB", "Grass Set"]
     grass = rows[1]
     assert set(grass["material_type_ids"]) == {vis, eb}
     assert set(grass["material_types"]) == {"Visualiser", "Energy Balance"}
@@ -748,13 +746,6 @@ def test_preview_winner_visualiser_and_none_fallback(client):
     assert rows["Has Viz"]["preview"]["color_r"] == 10
     # No Visualiser member -> empty preview (all viz keys null).
     assert all(v is None for v in rows["No Viz"]["preview"].values())
-
-    # Seeded defaults: Default Visualiser carries grey 128 + opacity 100; the
-    # model defaults preview empty — their orphaned mig-019 colour is NOT
-    # surfaced because colour is owned solely by Visualiser.
-    assert rows["Default Visualiser"]["preview"]["color_r"] == 128
-    assert rows["Default Visualiser"]["preview"]["opacity"] == 100
-    assert all(v is None for v in rows["Default Radiation"]["preview"].values())
 # ── Group rename: PATCH /groups/{id}/rename ──────────────────────────────────
 # Name-only; members untouched (which the full-replacement PUT cannot promise).
 
@@ -800,8 +791,8 @@ def test_rename_group_happy_path_members_untouched(client):
 
 
 def test_rename_group_duplicate_name_global_and_case_insensitive(client):
-    """The namespace is GLOBAL: colliding with another SESSION's group — or with
-    a seeded mig-019 default — is 409 in any casing, and writes nothing."""
+    """The namespace is GLOBAL: colliding with another SESSION's group is 409 in
+    any casing, and writes nothing."""
     s1, p1, _ = _setup(client)
     s2, p2, _ = _setup(client)
     rad = _mt_id(client, "Radiation")
@@ -809,7 +800,7 @@ def test_rename_group_duplicate_name_global_and_case_insensitive(client):
     mine = _mk_group(client, {"session-id": s2}, [{"material_type_id": rad}], name="Soil Set")
     h2 = {"session-id": s2}
 
-    for taken in ("Grass Set", "GRASS set", "grass set", "default radiation"):
+    for taken in ("Grass Set", "GRASS set", "grass set"):
         r = _rename(client, h2, mine["id"], taken)
         assert r.status_code == 409, taken
         assert r.json()["detail"]["code"] == "MATERIAL_GROUP_NAME_EXISTS"
@@ -909,9 +900,9 @@ def test_rename_group_visible_in_get_and_list(client):
     assert _rename(client, h, grass["id"], "Meadow Set").status_code == 200
 
     rows = client.get(BASE + "/groups", headers=h).json()["groups"]
-    assert len(rows) == 2 + DEFAULT_GROUP_COUNT           # renamed, not created
+    assert len(rows) == 2                                 # renamed, not created
     # Newest-first is by created_at, which a rename does not touch.
-    assert [g["name"] for g in rows[:2]] == ["Soil EB", "Meadow Set"]
+    assert [g["name"] for g in rows] == ["Soil EB", "Meadow Set"]
     assert set(rows[1]["material_type_ids"]) == {rad, eb}  # membership intact
 
     hits = client.get(BASE + "/groups?search=Meadow", headers=h).json()["groups"]
@@ -999,19 +990,10 @@ def test_rename_empty_group(client):
     assert r.json()["group"]["materials"] == []
 
 
-def test_rename_seeded_default_group(client):
-    """The 6 mig-019 defaults are ordinary global groups — nothing protects them,
-    and renaming one is not a create/delete."""
+def test_library_starts_empty(client):
+    """Nothing is seeded into the library any more: migration 032 removed the
+    seven "Default …" groups 019/024 used to plant, so a fresh install opens on
+    an empty Materials panel and the first group a user sees is one they made."""
     session_id, pid, sid = _setup(client)
     h = {"session-id": session_id}
-    rows = client.get(BASE + "/groups", headers=h).json()["groups"]
-    default = next(g for g in rows if g["name"] == "Default Radiation")
-    before = client.get(BASE + f"/groups/{default['id']}", headers=h).json()["group"]
-
-    assert _rename(client, h, default["id"], "House Radiation").status_code == 200
-
-    after = client.get(BASE + f"/groups/{default['id']}", headers=h).json()["group"]
-    assert after["name"] == "House Radiation"
-    assert after["materials"] == before["materials"]
-    assert len(client.get(BASE + "/groups",
-                          headers=h).json()["groups"]) == DEFAULT_GROUP_COUNT
+    assert client.get(BASE + "/groups", headers=h).json()["groups"] == []

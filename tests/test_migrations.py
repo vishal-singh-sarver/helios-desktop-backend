@@ -212,11 +212,14 @@ def test_022_wraps_materials_into_groups(temp_engine):
             "SELECT project_id, scenario_id, name FROM material_group WHERE id=100"
         )).fetchone()
         assert grp == ("p1", "sc1", "KeepMe")
-        # The six mig-019 defaults are wrapped, plus mig-024 seeds a 7th global
-        # "Default Visualiser" group (all NULL-project).
+        # This runs the FULL chain, so migration 032 has since deleted all seven
+        # seeded defaults (the 6 wrapped mig-019 ones + mig-024's Default
+        # Visualiser) — none of the NULL-provenance groups survive. That 022
+        # wrapped them in the first place is covered by
+        # test_032_removes_seeded_default_groups, which observes them at 31.
         assert c.execute(text(
             "SELECT count(*) FROM material_group WHERE project_id IS NULL"
-        )).scalar() == 7
+        )).scalar() == 0
         # Member reshaped, values preserved.
         assert c.execute(text(
             "SELECT material_group_id FROM project_material WHERE id=100")).scalar() == 100
@@ -358,8 +361,11 @@ def test_024_visualiser_material_type(temp_engine):
     """024 adds the 7th material type 'Visualiser' as the SOLE owner of the
     visualisation props (color_r/g/b, opacity, texture_file), removes them from
     the other 6 types, adds NO model_type row, and seeds a global Default
-    Visualiser group (grey-128 colour + opacity 100)."""
-    database.run_migrations()
+    Visualiser group (grey-128 colour + opacity 100).
+
+    Stops at 31 on purpose: migration 032 deletes the seeded default groups, and
+    what is under test here is what 024 itself put there."""
+    _apply_through(temp_engine, 31)
     assert 24 in _versions(temp_engine)
 
     VIZ = {"color_r", "color_g", "color_b", "opacity", "texture_file", "texture_toggle"}
@@ -423,8 +429,10 @@ def test_024_visualiser_material_type(temp_engine):
 
 def test_025_visualiser_texture_toggle(temp_engine):
     """025 adds the boolean `texture_toggle` mode selector to Visualiser (only)
-    and seeds the Default Visualiser member to colour mode (toggle = false)."""
-    database.run_migrations()
+    and seeds the Default Visualiser member to colour mode (toggle = false).
+
+    Stops at 31: 032 removes the default group this backfill targets."""
+    _apply_through(temp_engine, 31)
     assert 25 in _versions(temp_engine)
 
     with temp_engine.begin() as c:
@@ -455,8 +463,11 @@ def test_031_photosynthesis_submodel_selector(temp_engine):
     """031 adds the `submodel` enum to Photosynthesis (only) and gates the
     Farquhar group on it. The selector must stay TOP-LEVEL and editable — if it
     landed in a group or was withheld, the catalog would drop it and the group
-    would be permanently invisible."""
-    database.run_migrations()
+    would be permanently invisible.
+
+    Stops at 31: the backfill assertion below reads Default Photosyn, which
+    migration 032 removes."""
+    _apply_through(temp_engine, 31)
     assert 31 in _versions(temp_engine)
 
     with temp_engine.begin() as c:
@@ -553,3 +564,101 @@ def test_031_backfills_existing_members_and_frozen_snapshots(temp_engine):
             "AND project_material_id=900 "
             "AND property_type_id=(SELECT id FROM property_type WHERE property='submodel')"
         )).scalar() == "farquhar_model"
+
+
+DEFAULT_GROUP_NAMES = {
+    "Default Radiation", "Default Energy Bal", "Default Solar Pos",
+    "Default Photosyn", "Default Boundary Lyr", "Default Stomatal",
+    "Default Visualiser",
+}
+
+
+def test_032_removes_seeded_default_groups(temp_engine):
+    """032 deletes the seven seeded defaults — library rows AND anything a
+    geometry had applied from them.
+
+    The applied side is the part that matters: deleting only the library rows is
+    what the app's DELETE /groups/{id} does, and it leaves the assignment behind
+    as STALE, still painting and still owning its material-type slot until the
+    scenario syncs. A migration nobody watches run must not leave that.
+
+    Note temp_engine has no PRAGMA foreign_keys=ON (the app engine's listener is
+    bound to its own Engine), so nothing here cascades — this passes only
+    because 032 deletes every table explicitly.
+    """
+    _apply_through(temp_engine, 31)
+
+    with temp_engine.begin() as c:
+        # All seven are present at 31, which is also where the 019 -> 022 wrap
+        # of the original six is observable.
+        seeded = {r[0] for r in c.execute(text(
+            "SELECT name FROM material_group "
+            "WHERE project_id IS NULL AND scenario_id IS NULL"
+        ))}
+        assert seeded == DEFAULT_GROUP_NAMES, seeded ^ DEFAULT_GROUP_NAMES
+
+        viz_grp = c.execute(text(
+            "SELECT id FROM material_group WHERE name='Default Visualiser'")).scalar()
+        viz_mem = c.execute(text(
+            "SELECT id FROM project_material WHERE material_group_id=:g"), {"g": viz_grp}).scalar()
+        viz_type = c.execute(text(
+            "SELECT id FROM material_type WHERE materialtype='Visualiser'")).scalar()
+        cr = c.execute(text("SELECT id FROM property_type WHERE property='color_r'")).scalar()
+        grd = c.execute(text("SELECT id FROM object_types WHERE object='Ground'")).scalar()
+
+        # A ground wearing Default Visualiser: assignment + applied row + a
+        # frozen snapshot of its colour.
+        c.execute(text("INSERT INTO projects(id,session_id,name) VALUES('p1','s1','P1')"))
+        c.execute(text("INSERT INTO scenarios(id,project_id,name) VALUES('sc1','p1','Main')"))
+        c.execute(text("INSERT INTO scenario_object(id,scenario_id,project_id,name,object_type_id,helios_uuids) "
+                       "VALUES (900,'sc1','p1','Ground.001',:g,'[]')"), {"g": grd})
+        c.execute(text("INSERT INTO object_material_group(scenario_object_id,material_group_id,sync) "
+                       "VALUES (900,:g,1)"), {"g": viz_grp})
+        c.execute(text("INSERT INTO object_material(scenario_object_id,project_material_id,"
+                       "material_group_id,material_type_id) VALUES (900,:m,:g,:t)"),
+                  {"m": viz_mem, "g": viz_grp, "t": viz_type})
+        c.execute(text("INSERT INTO object_property_data(scenario_object_id,project_material_id,property_type_id,value) "
+                       "VALUES (900,:m,:p,'128')"), {"m": viz_mem, "p": cr})
+        # A default the user RENAMED is theirs now — 032 matches on the seeded
+        # name, so it must survive even though its provenance is still NULL.
+        c.execute(text(
+            "UPDATE material_group SET name='My Stomatal' WHERE name='Default Stomatal'"))
+        # Renaming freed the name, so a user group can now take it. Group names
+        # are GLOBALLY unique, which is why this is the only way such a
+        # collision exists at all. It carries provenance, so the guard spares it.
+        c.execute(text("INSERT INTO material_group(id,project_id,scenario_id,name) "
+                       "VALUES (901,'p1','sc1','Default Stomatal')"))
+
+    database.run_migrations()   # applies 032 on the populated DB
+    assert 32 in _versions(temp_engine)
+
+    with temp_engine.begin() as c:
+        # Every still-named seed is gone; the renamed one is all that is left
+        # holding NULL provenance.
+        assert {r[0] for r in c.execute(text(
+            "SELECT name FROM material_group "
+            "WHERE project_id IS NULL AND scenario_id IS NULL"
+        ))} == {"My Stomatal"}
+        assert c.execute(text(
+            "SELECT count(*) FROM project_material WHERE material_group_id=:g"
+        ), {"g": viz_grp}).scalar() == 0
+        assert c.execute(text(
+            "SELECT count(*) FROM material_data WHERE project_material_id=:m"
+        ), {"m": viz_mem}).scalar() == 0
+
+        # ...and so is everything the ground had applied from it.
+        assert c.execute(text(
+            "SELECT count(*) FROM object_material_group WHERE material_group_id=:g"
+        ), {"g": viz_grp}).scalar() == 0
+        assert c.execute(text(
+            "SELECT count(*) FROM object_material WHERE scenario_object_id=900"
+        )).scalar() == 0
+        assert c.execute(text(
+            "SELECT count(*) FROM object_property_data WHERE project_material_id=:m"
+        ), {"m": viz_mem}).scalar() == 0
+        # The ground itself survives — it just has no material now.
+        assert c.execute(text(
+            "SELECT name FROM scenario_object WHERE id=900")).scalar() == "Ground.001"
+        # The user's same-named group, which carries provenance, is untouched.
+        assert c.execute(text(
+            "SELECT name FROM material_group WHERE id=901")).scalar() == "Default Stomatal"
